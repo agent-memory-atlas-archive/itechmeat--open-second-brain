@@ -155,6 +155,17 @@ That is the day-to-day picture. The full capability surface, every CLI verb, and
 - Secrets are not supposed to live in the vault. Daily logs and config exports run through a best-effort redactor, `$secret:NAME` references resolve from the local environment and are never stored, and Brain redaction strips `<private>...</private>` regions before storage.
 - Automatically surfaced Brain context passes through a deterministic prompt-injection guard; filtered output returns a placeholder with a reason code and the source Markdown is never rewritten. Opt into `untrusted_source_delimiting` for language-agnostic structural containment instead: an untrusted span is wrapped in a provenance-carrying `<untrusted_source path sha256>` delimiter and neutralized by structure (invisible/control characters, delimiter breakouts) rather than a per-language word list, losslessly and identically for every language.
 - Context receipts and recall telemetry are opt-in and store redacted metadata, hashes, and counters rather than raw prompt text.
+- Optional decision models (a typed judgment model such as Jev, used to rerank search candidates) are off by default. They run only when the machine config enables them and the named key variable is set; while active, shadow and enforce both send masked, clipped, redacted candidate text to the configured endpoint, and private pages and `<private>` regions never leave. See [`docs/decision-models.md`](docs/decision-models.md).
+
+## Optional decision models
+
+An optional decision model (a typed judgment model such as Jev) can rerank the head of the search results. It is off by default: until you enable it, nothing changes and nothing is sent. To turn it on:
+
+1. Export a key from a supported provider as an environment variable, for example `TYPESAFE_API_KEY`.
+2. In the machine config set `decision_model_enabled: "true"`, `decision_model_provider: typesafe`, `decision_model_env_key: TYPESAFE_API_KEY` (the variable's name, never the key), `decision_model_uses: "rerank:shadow"`, `search_rerank_enabled: "true"`, `search_rerank_kind: decision-model` and `search_rerank_top_k: "30"`.
+3. Run `o2b decision-model check --ping`.
+
+It pays off only with a semantic lane (`embedding_provider` configured, `local` is enough). Moving from shadow to enforce, measuring, what is sent, the cost gate and the per-vault opt-out: [`docs/decision-models.md`](docs/decision-models.md).
 
 ## Updating
 
@@ -181,6 +192,7 @@ change to hooks/launcher/install must keep) lives in
 | Hermes cron jobs (daily digest, discipline report) | [`docs/hermes-cron.md`](docs/hermes-cron.md)                     |
 | Cross-project pointer (multi-host vaults)          | [`docs/cross-project-pointer.md`](docs/cross-project-pointer.md) |
 | Observability contract (events, gates, payloads)   | [`docs/observability.md`](docs/observability.md)                 |
+| Optional decision models (off by default)          | [`docs/decision-models.md`](docs/decision-models.md)             |
 | Metrics layer (the dashboard data contract)        | [`docs/metrics.md`](docs/metrics.md)                             |
 | Frozen-surface and stability policy                | [`docs/stability.md`](docs/stability.md)                         |
 | Architecture                                       | [`docs/architecture.md`](docs/architecture.md)                   |

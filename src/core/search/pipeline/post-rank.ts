@@ -8,7 +8,11 @@
  * rank-adjustment sink that emits the trust receipts.
  */
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { emitGatedTelemetry } from "../../brain/continuity/emit.ts";
+import { privateRegionTexts } from "../../redactor.ts";
 import {
   buildMemoryTrustAssessment,
   buildRetrievalDecisionTrace,
@@ -19,9 +23,12 @@ import { resolvedTransportReach } from "../../graph/transport-reach.ts";
 import { applyRankAdjusters, type RankAdjuster } from "../rank-adjust.ts";
 import { applyReinforceBoost, loadReinforceStrengths } from "../reinforce.ts";
 import { applyCrossEncoderRerank } from "../rerank/index.ts";
+import type { DecisionRerankExtras } from "../rerank/decision-model.ts";
+import { pageVisibility } from "../../graph/visibility.ts";
 import {
   applyReachFilter,
   readCachedFrontmatter,
+  readCachedFrontmatterEntry,
   supersedeFadeAdjuster,
   type FrontmatterCache,
 } from "../result-filters.ts";
@@ -55,6 +62,20 @@ export interface PostRankOutcome {
   /** Null on the default path, where the outcome shape stays unchanged. */
   readonly trustReceipts: TrustReceipts | null;
   readonly warnings: string[];
+  /**
+   * Extra decision-model answers carried by the rerank request (issue
+   * #213, Part 2). Present only when rerank kind `decision-model` ran,
+   * the `answerable` use is not `off` and a valid answer arrived; absent
+   * everywhere else, so the outcome shape is unchanged by default.
+   */
+  readonly decisionModel?: DecisionRerankExtras;
+  /**
+   * True when rerank kind `decision-model` returned the heuristic order in
+   * place of the configured one (degraded, not active, or skipped on a
+   * hook surface). Such an outcome must not be written to the query cache,
+   * or a later search would be served the fallback as the enforced order.
+   */
+  readonly decisionFallback?: boolean;
 }
 
 export async function applyPostRankPhases(input: PostRankInput): Promise<PostRankOutcome> {
@@ -112,11 +133,41 @@ export async function applyPostRankPhases(input: PostRankInput): Promise<PostRan
   // endpoint error degrades to the heuristic ordering and records one
   // fail-open telemetry warning. Runs over the widened pool so a deep
   // candidate can be promoted into the final `limit` window below.
+  let decisionExtras: DecisionRerankExtras | undefined;
+  let decisionFallback = false;
+  const regionsByPath = new Map<string, ReadonlyArray<string> | null>();
   const reranked = await applyCrossEncoderRerank(reinforced, input.query, config.rerank, {
     onTelemetry: (event) =>
       emitGatedTelemetry(event.status === "error", () => {
         warnings.push(`rerank_degraded: ${event.reason ?? "endpoint error"}`);
       }),
+    // Decision-model kind only: a candidate leaves the machine only when
+    // its page's visibility resolves and does not carry `private`.
+    resolveVisibility: (path) => {
+      const entry = readCachedFrontmatterEntry(frontmatterCache, config.vault, path);
+      return entry.unreadable ? null : pageVisibility(entry.meta);
+    },
+    // The index keeps a page's text whole, and a long `<private>` region
+    // can be split across chunks, so the page's own regions are read to
+    // tell whether a chunk carries part of one. Unreadable: null, withheld.
+    resolvePrivateRegions: (path) => {
+      if (regionsByPath.has(path)) return regionsByPath.get(path)!;
+      let regions: ReadonlyArray<string> | null;
+      try {
+        regions = privateRegionTexts(readFileSync(join(config.vault, path), "utf8"));
+      } catch {
+        regions = null;
+      }
+      regionsByPath.set(path, regions);
+      return regions;
+    },
+    skipDecisionModel: opts.skipDecisionModelRerank === true,
+    onDecisionFallback: () => {
+      decisionFallback = true;
+    },
+    onDecisionExtras: (extras) => {
+      decisionExtras = extras;
+    },
   });
   // Kernel 1 (t_5f61130a): the deterministic rank-adjustment sink between
   // ranking and result emission, mounted on BOTH the semantic and the
@@ -156,5 +207,11 @@ export async function applyPostRankPhases(input: PostRankInput): Promise<PostRan
       }
     : null;
 
-  return { results: adjusted.results, trustReceipts, warnings };
+  return {
+    results: adjusted.results,
+    trustReceipts,
+    warnings,
+    ...(decisionExtras !== undefined ? { decisionModel: decisionExtras } : {}),
+    ...(decisionFallback ? { decisionFallback: true } : {}),
+  };
 }

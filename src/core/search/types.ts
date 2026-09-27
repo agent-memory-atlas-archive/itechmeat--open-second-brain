@@ -13,6 +13,7 @@
  * before is still exported from this path.
  */
 
+import type { ResolvedDecisionModelConfig } from "../decision-model/config-types.ts";
 import type { TransportReach } from "../graph/transport-reach.ts";
 import type { DegradationNotice } from "../integrity/degradation.ts";
 import type { StampMismatch } from "../integrity/stamp.ts";
@@ -998,6 +999,13 @@ export interface SearchOptions {
    * index surfaces as a per-origin warning instead.
    */
   readonly selfHeal?: boolean;
+  /**
+   * Skip rerank kind `decision-model` for this call. Set by the hook
+   * surfaces (recall inject), whose time budget is shorter than a decision
+   * request, until a hook-specific decision use exists. The skipped call
+   * returns the heuristic order and is never written to the query cache.
+   */
+  readonly skipDecisionModelRerank?: boolean;
 }
 
 export interface SearchOutcome {
@@ -1237,8 +1245,11 @@ export interface ResolvedRerankConfig {
    * "openai-compat" (default) resolves a remote `/rerank` endpoint;
    * "local" uses the bundled offline deterministic reranker, which needs
    * no base_url / model / key and never touches the network.
+   * "decision-model" asks the optional decision model (one relevance
+   * probability per candidate) through the core decision config; the
+   * `search_rerank_base_url` / `_model` / `_env_key` keys are ignored.
    */
-  readonly kind: "openai-compat" | "local";
+  readonly kind: "openai-compat" | "local" | "decision-model";
   /** OpenAI-compatible base URL (trailing slashes stripped) or null. */
   readonly baseUrl: string | null;
   readonly model: string | null;
@@ -1262,6 +1273,12 @@ export interface ResolvedRerankConfig {
    * 0 promotes every candidate a non-negative-scoring endpoint returns.
    */
   readonly minScore: number;
+  /**
+   * The resolved decision-model config. Present only when `kind` is
+   * "decision-model"; `enabled` is false unless that config is active and
+   * its `rerank` use is not `off`.
+   */
+  readonly decisionModel?: ResolvedDecisionModelConfig;
 }
 
 /**

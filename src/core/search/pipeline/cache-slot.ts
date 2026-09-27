@@ -65,6 +65,25 @@ function configFingerprint(config: ResolvedSearchConfig): string {
     rrkModel: config.rerank.model,
     rrkTopK: config.rerank.topK,
     rrkMin: config.rerank.minScore,
+    // The decision-model kind: its mode decides whether the order changes.
+    // Present only for that kind, so every other key is unchanged.
+    ...(config.rerank.kind === "decision-model"
+      ? {
+          rrkKind: config.rerank.kind,
+          // Route identity without the credential: provider, endpoint,
+          // pinned model and mode each change what an enforced order is,
+          // and so do the state budget (how many candidates are sent) and
+          // the answerable mode (an extra question in the same request).
+          rrkDm: [
+            config.rerank.decisionModel?.provider ?? "",
+            config.rerank.decisionModel?.baseUrl ?? "",
+            config.rerank.decisionModel?.model ?? "",
+            config.rerank.decisionModel?.uses.rerank ?? "off",
+            String(config.rerank.decisionModel?.maxStateTokens ?? ""),
+            config.rerank.decisionModel?.uses.answerable ?? "off",
+          ].join("|"),
+        }
+      : {}),
     // Trigram prefilter augments the candidate pool, so a toggle or
     // selectivity change must invalidate cached rows.
     tri: r.trigramPrefilterEnabled,
