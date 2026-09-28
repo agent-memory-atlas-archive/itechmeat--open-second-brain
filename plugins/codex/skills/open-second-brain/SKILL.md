@@ -37,10 +37,16 @@ Name the surface a question is shaped for, and route to it explicitly:
 
 - **Generic recall** - `brain_search` runs hybrid keyword + semantic search over raw chunks. Use it for open-ended, topical, or exploratory questions.
 - **Summary surface** - for a question that targets a specific source or an artifact kind (a summary, digest, or other declared `schema.page_types` type), reach for the summary surface: search by source or filter by artifact kind rather than running a generic search over raw chunks. `brain_search` detects this structurally and returns `surface: "summary"` on the response as an advisory route hint; a source-targeted query uses a `source:<path>` token and an artifact-kind query uses a `kind:<type>`/`type:<type>` token whose value is a declared page type. The hint never changes ranking - it names the intended surface so the agent asks the right way.
+- **Answerable signal** - when `brain_search` returns `decision_model.answerable`, pass its `probability` to `brain_recall_gate` or `brain_context_pack` as `decision_answerable` together with the scores and `match_quality`. `decision_answerable.disagrees: true` on the verdict means search again with other words, or say the vault may not cover the question; the level and action stay as they are.
+- **Skill offers** - `skills_attach` offers skills for the current turn; when the operator configured the optional `skills` decision-model use it may be decision-model assisted (the result then carries a `decision_model` field). Cite its `offer_id` on `get_skill` either way.
 
 ## Safety
 
 If a write operation might affect anything outside the `Brain/` directory, ask for explicit confirmation. When in doubt, prefer `Brain/`.
+
+Decision-model verdicts (`decision_model` on `brain_hygiene scan` dedup findings, doctor alias candidates and `brain_tension verify`) are advisory only: merges, dismissals and resolutions still need an explicit action.
+
+To label a note, call `brain_labels suggest` before `assign`; `suggest` never assigns, and a null suggestion means no confident value.
 
 ## See also
 

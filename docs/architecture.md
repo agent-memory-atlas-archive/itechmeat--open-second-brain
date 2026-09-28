@@ -358,12 +358,32 @@ embedding and rerank calls do: a decision model returns probabilities over
 candidates this code produced and never text, the deterministic result stays
 canonical and is returned on every failure, and no decision writes to the
 vault. It is active only when the operator enables it in machine config AND
-the named key variable is set; otherwise every code path is the one without
+the named key variable is set (a self-hosted `laya` or `openjev` server on
+loopback needs no key); otherwise every code path is the one without
 it. Every use goes through `runDecision` (`run.ts`), which owns the modes
 (`off`, `shadow`, `enforce`), the daily cost gate and the
-`decision_model_call` accounting record. The first use is the rerank kind
-`decision-model` (`src/core/search/rerank/decision-model.ts`). See
+`decision_model_call` accounting record. The uses are the rerank kind
+`decision-model` (`src/core/search/rerank/decision-model.ts`, which also
+carries the advisory `answerable` question), `skills`
+(`src/core/surface/skill-attach-decision.ts`), `extract_prefilter`
+(`src/core/brain/extract-signals-prefilter.ts`), `dedup` and `tension`
+(`pair-verdict.ts`), `labels` (`src/core/brain/label-suggest.ts`) and `recall_inject`
+(`src/core/brain/recall-inject-decision.ts`); each use's evaluation report
+lives in `reports/` and is registered in `reports/index.ts`. See
 [`docs/decision-models.md`](decision-models.md).
+
+Decision adapters, all behind `makeDecisionProvider` (`provider.ts`, `null`
+unless active, loaded lazily) and the shared transport rules in
+`transport.ts`: `systemone.ts` (TypeSafe, OpenRouter, Vercel compatible
+route, OpenCode Zen, any compatible server, and the self-hosted `laya` and
+`openjev` presets on loopback), `vercel-evaluate.ts` (the Vercel AI Gateway
+`/v1/evaluate` variant, a field mapping over `systemone.ts`), and
+`llm-emulation.ts` (an OpenAI-compatible chat model asked for probabilities
+only, registry id `decision-model-llm-emulation`: the one uncalibrated,
+generative route, used only when named explicitly and refused in `enforce`
+without `decision_model_allow_uncalibrated`). Threshold profiles per model
+family live in `questions.ts`; see
+[`docs/decision-models/providers.md`](decision-models/providers.md).
 
 Ownership is a boundary only where something writes it. With
 `integrity.owner_scope_delivery` on, every production preference writer stamps
@@ -398,12 +418,12 @@ new files, not a count in any response.
 
 The enforcement lives in `tests/mcp/agent-scope-matrix.test.ts`, and its shape
 is the point rather than its size. One hundred and one classified tools carry
-231 call recipes - one per mode, view or operation, because one executed view
+233 call recipes - one per mode, view or operation, because one executed view
 is not an executed classification. Every recipe runs TWICE against the same
 two-owner fixture, once with the gate closed and once with it open, and the
 classification decides what the open run must show: the 32 recipes classified
 as reaching owner-taggable content must surface the marker with the gate off,
-which is what stops the closed run from passing vacuously. The other 199 carry
+which is what stops the closed run from passing vacuously. The other 201 carry
 a claim of unreachability, and that claim is executed directly - the marker
 must be absent even where nothing is hidden. The first version of this probe
 asserted only the closed half, and 81 of its entries were driven against

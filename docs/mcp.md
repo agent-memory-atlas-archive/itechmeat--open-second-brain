@@ -227,7 +227,7 @@ flags for a narrower per-process full server.
 | `brain_agenda`              | Stateless agenda synthesis over caller-provided calendar events (the host fetches them; the Brain never calls a calendar API): overlap conflicts, free focus blocks (optionally clipped to a workday window), and events organised outside the operator's own email domain(s). No vault writes. | `events`                                       |
 | `brain_context_presets`     | Show, suggest, or diff read-only context budget presets (`tight-context`, `long-context`) without writing config.                              | `operation`                                    |
 | `brain_pre_compact_extract` | Extract decision/commitment/outcome/rule/open-question records from bounded text into continuity storage.                                      | `session_id`, `turn_start`, `turn_end`, `text` |
-| `brain_hygiene`             | Memory hygiene: `scan` findings (conflicts, dedup, freshness, usefulness), `apply` selected ids, `refresh` stale pages. Resolver command comes from `_brain.yaml` only. | `mode`                                         |
+| `brain_hygiene`             | Memory hygiene: `scan` findings (conflicts, dedup, freshness, usefulness), `apply` selected ids, `refresh` stale pages. Resolver command comes from `_brain.yaml` only. With the optional `dedup` decision-model use in enforce, `scan` dedup findings carry an advisory `decision_model` verdict; `apply` never reads it. | `mode`                                         |
 | `brain_anticipatory_context` | Turn-specific context bundle kept warm by lifecycle hooks, keyed by the session's lineage root; reports `cache_state` warm / stale / miss.   | `session_id`                                   |
 | `brain_session_grep`        | Search imported session recall raw turns and deterministic summary nodes.                                                                      | `query`                                        |
 | `brain_session_describe`    | Describe raw-turn counts and summary depths for one imported session recall DAG.                                                               | `session_id`                                   |
@@ -359,6 +359,21 @@ to its owning vault at the configuration level. `brain_idea_lineage` accepts `id
 `max_count`.
 `brain_recall_gate` accepts optional `previous_prompt` and
 `explicit`; `explicit: true` always returns `retrieve: true`.
+
+Optional decision-model `answerable` signal (see
+[decision-models/answerable.md](decision-models/answerable.md)): with rerank
+kind `decision-model` and the `answerable` use in `shadow` or `enforce`,
+`brain_search` adds `decision_model: { answerable: { probability, model,
+calibrated } }`; the field is absent when the use is off, for any other kind
+and when the request degraded. `brain_recall_gate` and `brain_context_pack`
+accept that probability as `decision_answerable` (a number in [0,1]), only
+together with the scores and `match_quality` pair (`dependentRequired`;
+alone it is `INVALID_PARAMS`). With the use on, the `adequacy` verdict gains
+`decision_answerable: { probability, disagrees }`, where `disagrees` is true
+for `sufficient` below 0.3 or `insufficient` above 0.8; `level` and `action`
+never change. The context-pack receipt stores the field next to its verdict.
+With the use off the argument is ignored and the response carries one
+`warnings` entry saying so.
 
 > **Date format note.** Brain tools use ISO 8601 `YYYY-MM-DD`
 > throughout; the `Brain/log/<date>.md` subdirectory layout shares that
@@ -798,6 +813,12 @@ number prints as `from_offer=` on `o2b brain skill-proposals usage`. It
 counts the invocations of that skill which cited an offer, out of
 `invocationCount` total. The remainder are not unattributed by error - most
 runtimes' skill calls follow no offer at all.
+
+When the optional `skills` decision-model use is `shadow` or `enforce`,
+`skills_attach` also returns `decision_model: { mode, applied, degraded?, model? }`
+and, in `enforce`, may offer a subset or reorder of the BM25 shortlist chosen
+by two decision requests. The field is absent while the use is `off`, the
+default. See [Skill selection](decision-models/skills.md).
 
 `skills_attach` additionally applies a discriminating-term floor: a
 candidate whose entire match rests on terms more than half the descriptor
@@ -1510,3 +1531,32 @@ log line is machine-composed rather than authored.
   skipped create (`if_exists: "skip"`) authored no bytes, so it carries no
   `write_id` at all. `brain_writes` reads the record back. One new tool - the
   surface moves from 113 to 114.
+- With the optional decision-model turn pre-filter (`extract_prefilter`, see
+  [`decision-models/extract-prefilter.md`](decision-models/extract-prefilter.md)),
+  the `brain_extract_signals` plan may additively carry `turns_dropped` (turn
+  ids left out of the envelope; `turns_mined` then lists the kept turns),
+  `skipped: { reason: "decision_model_prefilter", turns_dropped }` with
+  `llm_step: null` when every turn scored below the threshold (nothing to
+  mine, distinct from the no-user-turns refusal), and
+  `decision_model: { degraded }` when a request failed and every turn was
+  sent. With the use `off` none of these fields appears. Commit items accept
+  an optional string `source_turn` naming the plan turn a rule came from.
+- Advisory decision-model fields (optional, see
+  [decision-models/dedup-tension.md](decision-models/dedup-tension.md) and
+  [decision-models/labels.md](decision-models/labels.md)). All of them are
+  absent, and every output is byte-identical, while the use is off. With the
+  `dedup` use in enforce, `brain_hygiene scan` dedup findings and
+  `brain_doctor` `entity-alias-candidate` warnings gain
+  `decision_model: { verdict, probabilities, model, calibrated }`
+  (`same | related | different`); a confident `different` is listed last with
+  `decision_model_low_priority: true`, never hidden. `brain_tension` gains the
+  read-only `verify` action (`slug` optional; without it every unresolved
+  tension) returning `available`, `mode` or `reason`, and the rows with the
+  same field (`contradicts | compatible | unrelated`; a confident `compatible`
+  or `unrelated` is listed last). `brain_labels` gains the read-only `suggest`
+  operation (`path`, optional `dimensions`) returning per dimension
+  `{ dimension, suggestion, probabilities, confidence, current, model,
+  calibrated }`, `suggestion: null` in shadow, for `none` and below the
+  confidence threshold; `{ available: false, reason: "decision_model_off" }`
+  while the use is off, and a private note is refused. None of these writes to
+  the vault, and `suggest` never assigns.
