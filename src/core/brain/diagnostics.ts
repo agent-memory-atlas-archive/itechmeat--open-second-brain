@@ -272,6 +272,14 @@ export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map
         autoRepairable: false,
       },
       {
+        // GitHub #216. The automatic managed-file upgrade failed and is
+        // backing off; the dry run shows the pending change and the error.
+        code: "self-heal-upgrade-failed",
+        issueClass: "automatic Brain upgrade failed",
+        nextCommand: "o2b brain upgrade --dry-run",
+        autoRepairable: false,
+      },
+      {
         code: "doctor-warnings",
         issueClass: "doctor warnings",
         nextCommand: "o2b brain doctor",
@@ -513,6 +521,17 @@ export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map
         code: "payload-orphan",
         issueClass: "payload file referenced by nothing in the vault",
         nextCommand: "o2b brain payload gc",
+        autoRepairable: false,
+      },
+      {
+        // Inbox signals that left the contradiction window unconsumed
+        // (issue #195). Spelled as a literal for the same reason
+        // `vault-frozen` above is. The exit is the pass that archives
+        // them; `autoRepairable` stays false because the doctor's repair
+        // planner does not run dream, the operator does.
+        code: "inbox-archivable",
+        issueClass: "inbox signals that can no longer become candidates",
+        nextCommand: "o2b brain dream",
         autoRepairable: false,
       },
       {

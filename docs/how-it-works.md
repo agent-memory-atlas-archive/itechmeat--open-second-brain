@@ -36,7 +36,8 @@ caller names and can move a note to a second top-level directory,
 │   ├── active.md                   # derived: confirmed + quarantine + recently retired
 │   ├── inbox/                      # raw taste signals
 │   │   ├── sig-<date>-<slug>.md
-│   │   └── processed/              # signals already folded into rules
+│   │   ├── processed/              # signals already folded into rules
+│   │   └── archived/               # unconsumed signals past the contradiction window
 │   ├── preferences/                # active rules
 │   │   └── pref-<slug>.md          # status: unconfirmed | confirmed | quarantine
 │   ├── retired/                    # archived rules
@@ -277,6 +278,7 @@ flowchart TD
         A12 --> A14
         A13 --> A14
         A14[Move consumed signals to processed/]
+        A14 --> A15[Archive unconsumed signals older than the window to archived/]
     end
 
     Apply --> LogEvent["Append dream event to log/today.md"]
@@ -291,6 +293,29 @@ Key rules baked into the pipeline:
   created only when `candidate_threshold` (default 3) **same-sign**
   signals on one topic appear within `contradiction_window_days`.
   Mixed signals cancel and the rule does not form.
+- **Inbox archive.** A signal outside `contradiction_window_days` counts
+  toward nothing, and never will again, so a signal the run did not
+  consume and that is older than the window moves byte for byte to
+  `Brain/inbox/archived/` (`archived_signals` in the summary and the log
+  event; `--dry-run` previews it). A stale file stays in the inbox only
+  when it is tombstoned, does not parse as a signal (including an
+  unparseable `created_at`), or its name is already taken in `archived/`
+  (a warning names it); a past `expiration_date` does not archive a
+  signal still inside the window, because the pass still counts it. The
+  rule runs against the earlier of `--now` and the real time, so a pass
+  with a future `--now` archives nothing still inside the window today. A
+  staged bundle does not treat newly archivable signals as drift.
+  Archived signals stay readable: the pass reads them as history (a
+  preference evidenced by one keeps its sign), and query, backlinks,
+  sources, expiration, forget, the claim graph and the doctor record
+  checks include them.
+  They also stay in the capture dedup index, so re-importing an old
+  session does not re-create them. `dream.archive_stale_signals: false`
+  keeps them in the inbox; raising `contradiction_window_days` later does
+  not bring archived signals back, move them by hand if that is wanted.
+  `o2b brain doctor` reports `inbox-archivable` while a pass is due,
+  counting the signals the pass selects for the archive (a `--dry-run`
+  archives the same set less any signal it consumes instead).
 - **Intent review is audit data.** Each run computes `intent_reviews`
   before mutation so operators can see topics that are ready, weak, or
   conflicted. The review is exposed by `dream`, `brain_review_candidates`,
@@ -542,7 +567,7 @@ are mirrored in MCP; destructive operations are CLI-only by design.
 | Toggle pin                 | `o2b brain pin / unpin`                             | — (CLI-only)           | flips `pinned` field; regenerates `Brain/active.md`                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Protect Brain/             | `o2b brain protect / unprotect`                     | — (CLI-only)           | machine-enforced deny rules for `claudecode` / `codex` runtimes; sidecar manifest at `.open-second-brain/protect.lock.json`                                                                                                                                                                                                                                                                                                                                                                                    |
 | Restore snapshot           | `o2b brain rollback`                                | — (CLI-only)           | overwrites Brain/ from snapshot; from v0.10.6 aborts on drift unless `--force-rollback`, see [Snapshots and rollback](#snapshots-and-rollback)                                                                                                                                                                                                                                                                                                                                                                 |
-| Upgrade managed files      | `o2b brain upgrade`                                 | — (CLI-only)           | migrates the three release-owned files (`_brain.yaml`, `_BRAIN.md`, `_OPEN_SECOND_BRAIN.md`) forward. `_brain.yaml` is text-merged additively (user values, comments, and ordering preserved); the other two are byte-compared and overwritten. `--dry-run` prints a per-file plan; `--check` exits 2 on pending updates (CI-friendly); `--apply --yes` takes an `upgrade-<ts>` snapshot before rewriting.                                                                                                     |
+| Upgrade managed files      | `o2b brain upgrade`                                 | — (CLI-only)           | migrates the three release-owned files (`_brain.yaml`, `_BRAIN.md`, `_OPEN_SECOND_BRAIN.md`) forward. `_brain.yaml` is text-merged additively (user values, comments, and ordering preserved); the other two are byte-compared and overwritten. `--dry-run` prints a per-file plan; `--check` exits 2 on pending updates (CI-friendly); `--apply --yes` takes an `upgrade-<ts>` snapshot before rewriting. After a plugin update the MCP server and the `SessionStart` hook run the same upgrade in a detached worker, off the start-up path, and back off after a failure (see `docs/updating.md`).                                                                                                     |
 | Export active prefs        | `o2b brain export --format json\|llms-txt`          | — (CLI-only)           | read-only dump of `confirmed \| unconfirmed \| quarantine` preferences from `Brain/preferences/`. `--out <path>` writes a file (refuses to overwrite without `--force`); default sink is stdout. Retired and signal artifacts are deliberately excluded.                                                                                                                                                                                                                                                       |
 | Export a transcript corpus | `o2b brain export --format transcripts-jsonl --transcripts <file\|dir>` | — (CLI-only) | since v1.50.0: one JSON object per line, one per CONVERSATION, built from recorded session logs. Reads no vault. Messages carry role, text and the NAMES of the tools a turn called, never the tool inputs. `--runtime` filters by adapter; `--since`/`--until` select whole conversations by their start. Guarded record by record; a secret-shaped identifier refuses the whole export and writes nothing. Full contract in [`cli-reference.md`](cli-reference.md).                                          |
 | Force-directed explorer    | `o2b brain explorer [--port \| --export]`           | — (CLI-only)           | live HTTP on `127.0.0.1` (default `:7777`) or single-file HTML at `<path>`; renders preferences + retired as a graph; zero backend. Keyboard-accessible `<ul role="listbox">` mirror of visible nodes (ArrowUp/Down/Home/End/Enter/Escape); layout + filter state persisted to `localStorage` under `osb-explorer-layout:<vault_basename>`; "Reset layout" button clears the key.                                                                                                                              |
@@ -595,6 +620,15 @@ any snapshots taken after this one, the second because it is TTL'd MCP
 tool output documented as never backed up (archiving and hashing it
 made unrelated cache churn trip the drift gate). Retention defaults to
 ten newest archives.
+
+The archive is streamed: tar writes a staging file and the compressor
+reads it, so the size of `Brain/` sets no memory ceiling. The compressor
+writes a partial file in `.snapshots/`, and the archive appears under its
+final `<run_id>.tar.zst` name only once it is complete, published by an
+exclusive hard link that refuses a name already taken; the manifest is
+written after that. A snapshot interrupted during compression therefore
+leaves no recovery point behind, only a `<run_id>.tar.zst.partial-*` file
+that nothing lists; retention removes it once it is a day old.
 
 From v0.10.6 every snapshot ships with a SHA-256 sidecar manifest
 (`Brain/.snapshots/<run_id>.manifest.json`) listing every regular
@@ -900,7 +934,7 @@ differs:
 ```mermaid
 graph LR
     Hermes -- "mcp_servers.yaml" --> Stdio["o2b mcp (stdio)"]
-    ClaudeCode["Claude Code"] -- "bundled .mcp.json" --> Stdio
+    ClaudeCode["Claude Code"] -- "plugin.json mcpServers" --> Stdio
     Codex -- "codex mcp add" --> Stdio
     GrokBuild["Grok Build"] -- "config.toml [mcp_servers]" --> Stdio
     OpenClaw -- "native JS plugin" --> InProc["in-process tools"]
@@ -913,7 +947,8 @@ graph LR
   `brain-memory` skill enabled in the active profile (via
   `hermes-skills-sync enable <profile> brain-memory`) so the LLM
   recognises preference triggers in conversation.
-- **Claude Code** picks up the bundled `.mcp.json` and the
+- **Claude Code** picks up the `mcpServers` declared in the bundled
+  `.claude-plugin/plugin.json` and the
   plugin-shipped `brain-memory/SKILL.md` automatically.
 - **Codex** registers the MCP server with `codex mcp add`; the same
   skill bundle is loaded automatically.

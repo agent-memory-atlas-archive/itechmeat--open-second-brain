@@ -114,6 +114,25 @@ passed, so a caller reads the same three-way answer the exit code carries;
 `ok` is read off that exit code, and being two-valued it means only "not
 established as healthy" when false.
 
+### The automatic Brain upgrade check
+
+`o2b doctor` reports `self_heal_upgrade`. After a plugin update the
+full-scope `o2b mcp` server and the `SessionStart` hook bring a stale
+`_brain.yaml` / `_BRAIN.md` current in a detached worker
+(`o2b brain upgrade --self-heal`, not an operator flag). A failed attempt
+is recorded per device in `.open-second-brain/self-heal-upgrade.json`, and
+the check then fails with the error, the time of the last attempt, the
+number of consecutive failures and the time from which the next automatic
+attempt is due; its fix is `o2b brain upgrade --dry-run`. The same record
+appears in `o2b brain status` as the `self-heal-upgrade-failed` problem
+and at the end of `o2b brain upgrade --dry-run` / `--check` output (JSON:
+`self_heal_failure`).
+
+The next automatic attempt waits a cooldown of one hour, doubling with
+each consecutive failure up to 24 hours, instead of repeating the same
+failing upgrade on every start. `o2b brain upgrade --apply --yes` ignores
+the cooldown and clears the record once nothing is pending.
+
 ### The codegraph partner check
 
 `o2b doctor` consults the optional [codegraph](https://github.com/colbymchenry/codegraph)
@@ -354,7 +373,7 @@ o2b brain unprotect           (CLI-only) Remove the Open-Second-Brain-managed de
 o2b brain snapshot log        (CLI-only) Newest-first listing of every recovery point: run id, created_at, typed reason, size, manifest presence, derived-store coverage; --reason filters (unregistered value exits 2), --limit caps, --json
 o2b brain snapshot diff       (CLI-only) Read-only diff between two snapshots, or snapshot vs live Brain/
 o2b brain rollback            (CLI-only) Restore Brain/ from a snapshot (--dry-run previews; drift abort vs --force-rollback); --list, the prompt and --json name the snapshot reason ('unknown' when the sidecar records none)
-o2b brain upgrade             (CLI-only) Migrate release-owned files forward (_brain.yaml, _BRAIN.md, _OPEN_SECOND_BRAIN.md); --dry-run / --check / --apply --yes
+o2b brain upgrade             (CLI-only) Migrate release-owned files forward (_brain.yaml, _BRAIN.md, _OPEN_SECOND_BRAIN.md); --dry-run / --check / --apply --yes; --dry-run and --check also print the last failed automatic upgrade
 o2b brain export              Read-only dump of active preferences, or (since v1.50.0) a session-transcript dataset: --format json|llms-txt|transcripts-jsonl [--out <path>] [--force]; the transcript form takes --transcripts <file|dir> and reads no vault at all (see "The transcript corpus" below). Since v1.49.0 the preference bytes pass the shared egress redactor (stderr carries a notice when anything was removed), and a `pref-*.md` the parser cannot read is REFUSED, not skipped: exit 1 naming every unreadable file in one run rather than exit 0 over a shorter list. `o2b brain doctor` reports the same files
 o2b brain bank-export         (CLI-only) One-file backup bundle: preferences, the page graph, page contracts, the sources dashboard. Redacted on the way out; refuses with exit 1 on an unreadable `pref-*.md` (since v1.49.0)
 o2b brain bank-import         (CLI-only) Restore a bank bundle (--mode skip|overwrite|merge) [--trusted-restore]. Preference rows restore UNTRUSTED by default: every row lands `unconfirmed`, unpinned, at low confidence, on a fresh trial window dated from the restore - including a row the bundle already marked unconfirmed - and the run names each row it reset; `--trusted-restore` keeps the carried status, confidence, pin and window verbatim, for a backup you vouch for. A malformed preference already in the DESTINATION does not abort the import: the rows restore and the run prints `topic-key check incomplete: <path>` for each rule the topic-collision scan could not read, because that list is then a partial answer (since v1.49.0)
@@ -643,6 +662,20 @@ the `ignore_warnings` array (`source`, `line`, `pattern`, `reason` per entry)
 under `--json`; `line` is 0 for a warning about no single pattern line,
 which covers both a `--src-subpath` warning and an ignore file that could
 not be read.
+
+Parallel ingest workers share the content manifest, the plan checkpoint,
+the session ledger and the git record store, and each write to one of them
+waits for a file lock. The wait is 5 000 ms by default; set
+`OPEN_SECOND_BRAIN_LOCK_WAIT_MS` (a whole number of milliseconds, `0` means
+one attempt) to give a slow host (antivirus scanning, network or synced
+folders) a longer one. A value that is not a whole number is an error, not
+the default. The variable does not change the one-second wait of
+interactive commands such as the architect run. Waiters take turns: a
+writer that releases a lock someone is waiting on hands it over before it
+takes it again. A write that still cannot get the lock is refused with
+`ELOCKED` and `lock busy: <lock file>`, writes nothing, and says what to do
+next: retry the ingest, run the parallel ingests one at a time, or raise
+the wait.
 
 ### Trusted recall and memory write surface (since v1.35.0)
 
@@ -1146,6 +1179,7 @@ o2b brain dream               [run] [--dry-run] | stage | validate <run-id> | ap
 o2b brain dream retriage R    re-run the deterministic salience gate (`dream.salience_threshold`) against staged bundle R and report the delta: which facts would newly enter or leave the rollup ladder's fold set, each named with its current and its staged score. Read-only - the bundle is never rewritten, so re-stage to adopt the new partition. An unknown bundle, or one staged before the gate shipped, exits 2 naming the reason. Mirrors MCP `brain_dream` `action: "retriage"`
 o2b brain dream --step S      run ONE independently-runnable step instead of the full pass: `scan` (pure read) or `heal-enrich` (asking for it is the opt-in, so the config gate is not consulted). Any other token - including a dream reporting phase - exits 2 with the specific reason that step cannot run alone and the runnable set. Returns a partial result marked `partial: true`, never a run summary. Mirrors MCP `brain_dream` `step`
 o2b brain dream --gate N=V    override one phase gate for THIS RUN ONLY (`--gate heal_enrich=true|false`); repeatable, never written back to `Brain/_brain.yaml`, so a targeted pass needs no config edit and no revert. An unknown gate or a non-boolean value exits 2 naming the known gates. Mirrors MCP `brain_dream` `gates: {heal_enrich: bool}`
+o2b brain dream (archive)     every run also moves inbox signals older than `dream.contradiction_window_days` that it did not consume into `Brain/inbox/archived/` (never deleted; `archived_signals` in the summary and the log event, previewed by `--dry-run`, count in MCP `archived_signals_count`). `dream.archive_stale_signals: false` turns it off; `o2b brain doctor` reports `inbox-archivable` while a pass is due
 o2b brain doctor              gains the removed-tool-reference warning: vault notes, root instruction files, and installed skills naming a tool removed in 1.0.0 are flagged with the replacement
 o2b brain doctor              opt-in `entity-alias-candidate` lint (off by default): with `entity_semantic_dedup_enabled: true` surfaces lexical entity-name variants ("Google LLC" vs "Google Inc") as PROPOSAL-ONLY alias-merge candidates via a deterministic jaccard layer (`entity_semantic_dedup_lexical_threshold`, default 0.8); never auto-merges or rewrites the identity key. The embedding-cosine layer (`entity_semantic_dedup_threshold`, default 0.92, reuses the configured embedding provider) is exposed as a library reader for apply plans
 o2b brain daily | weekly | monthly | morning-brief | timeline
@@ -1180,6 +1214,22 @@ Which emitters those verbs actually have is not taken on trust. `tests/cli/progr
 | `o2b mcp` (both transports, since v1.50.0) | Stops accepting new requests, waits for the in-flight ones to a bounded deadline, closes, and exits **130** / **143**. It is the one verb here that calls `process.exit` rather than re-raising, because two `exit` hooks - the search-store WAL checkpoint and the lock release - do not run when a process dies by signal. See "Shutdown and draining" in [`mcp.md`](mcp.md). |
 
 For the two verbs that do hold a handle, a second interrupt is not intercepted and falls through to the default handler, so a wedged run is always killable by pressing the key twice. And an interrupt that arrives while such a verb is in a region with no checkpoint - opening a store, writing a report - is not swallowed: the verb prints `interrupted: SIGINT arrived while … stopping now` and ends with the signal's code rather than returning 0. A run the operator stopped never exits 0.
+
+## Lock and cache overrides (since v1.61.0)
+
+Three environment variables tune how long a writer waits for a shared lock
+and where the machine-local dedup cache lives. None of them has a
+`_brain.yaml` key: they describe the host, not the vault.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `OPEN_SECOND_BRAIN_LOCK_WAIT_MS` | `5000` | How long a write to shared ingest state (content manifest, plan checkpoint, session ledger, git record store) waits for its lock before it is refused with `ELOCKED`. A whole number of milliseconds; `0` means one attempt; anything else is an error. The one-second interactive wait is not affected. See [Source pipeline integrity](#source-pipeline-integrity-and-operator-tooling-since-v1340). |
+| `OPEN_SECOND_BRAIN_DEDUP_CACHE_DIR` | the user cache directory, `open-second-brain/dedup-index/` | Where the signal dedup index cache is kept, one `<vault-digest>.json` per vault, outside the vault. |
+| `OPEN_SECOND_BRAIN_DEDUP_CACHE` | on | `0` turns the dedup index cache off; every capture then walks the inbox, `processed/` and `archived/` in full. |
+
+The automatic Brain upgrade worker takes no override: its lock is
+`.open-second-brain/self-heal-upgrade.lock` in the vault, so a hook, the MCP
+server and the worker agree on it whatever their temp directories are.
 
 ## Vault scope
 
@@ -1255,7 +1305,7 @@ hand-written copies.
 
 ### The catalogue and the two tiers
 
-**40 declared surfaces**, printed whole. A row says what this build CAN keep
+**45 declared surfaces**, printed whole. A row says what this build CAN keep
 at that location, never that this machine has it; presence is the measured
 half. They are grouped by what losing one costs, which is the first thing a
 migration needs:
@@ -1269,7 +1319,7 @@ The tier is a RECOVERY story, not a location: `Brain/.state/anticipatory/`
 sits inside the Markdown tree and is `derived` because deleting it costs one
 recomputation, and the search index sits outside it and is `derived` for the
 same reason. Whether a surface can hold memory CONTENT is a separate axis,
-reported per row and counted in the summary line - 15 of the 40 can.
+reported per row and counted in the summary line - 17 of the 45 can.
 
 Only two overrides move anything: `OPEN_SECOND_BRAIN_SEARCH_DB` /
 `search_db_path` relocate the search store and everything that follows it,

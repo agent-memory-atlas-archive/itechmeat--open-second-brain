@@ -74,11 +74,13 @@
 
 import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { gunzipSync, gzipSync } from "node:zlib";
 import {
   closeSync,
   cpSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -90,14 +92,14 @@ import {
   realpathSync,
   rmSync,
   statSync,
-  unlinkSync,
   writeFileSync,
+  writeSync,
   type Dirent,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
-import { FileAlreadyExistsError, renameWithRetry } from "../fs-atomic.ts";
+import { FileAlreadyExistsError, renameWithRetry, unlinkWithRetry } from "../fs-atomic.ts";
 import { classifyRecoverability, type RecoverabilityVerdict } from "./gates/recoverability.ts";
 import { sha256Hex } from "../integrity/digest.ts";
 import { resolveConfiguredIndexPath } from "../search/paths.ts";
@@ -812,12 +814,13 @@ export function createSnapshot(
       "-T",
       tarPathArg(listPath),
     ];
-    compressInto(
-      { kind: "buffer", bytes: runArchiveProducer("tar", tarArgs, runId) },
-      outPath,
-      tools,
-      runId,
-    );
+    // tar writes into a staging file beside the member list rather than
+    // into a captured pipe, and the compressor reads that file: neither
+    // the tar stream nor the compressed archive ever sits in this
+    // process's memory, so the size of `Brain/` sets no ceiling here.
+    const tarPath = join(listDir, "brain.tar");
+    runArchiveProducer("tar", tarArgs, tarPath, runId);
+    compressInto({ kind: "file", path: tarPath }, outPath, tools, runId);
     if (!existsSync(outPath)) {
       throw new BrainSnapshotError(
         `archive write reported success but ${outPath} is absent`,
@@ -1090,12 +1093,6 @@ function writeStoreArchive(
 ): void {
   const tmp = mkdtempSync(join(tmpdir(), `o2b-store-vacuum-${runId}-`));
   const vacuumed = join(tmp, DERIVED_STORE_VACUUM_FILE);
-  // Whether the destination was ALREADY taken when this call began. It
-  // decides whether the cleanup below may touch it: an archive a racing
-  // process wrote is the very thing the overwrite refusal protects, and
-  // removing it in the name of cleaning up after that refusal would
-  // reintroduce the data-loss path by the back door.
-  const preexisting = existsSync(archivePath);
   try {
     const db = new Database(sourcePath, { readonly: true });
     try {
@@ -1105,16 +1102,10 @@ function writeStoreArchive(
     }
     compressInto({ kind: "file", path: vacuumed }, archivePath, tools, runId);
   } catch (err) {
-    // A failed compression may have left a partial archive of OUR making;
-    // the snapshot is about to be refused, so nothing may survive that a
-    // later read could mistake for a recovery point.
-    if (!preexisting) {
-      try {
-        unlinkSync(archivePath);
-      } catch {
-        // Nothing was written, or it is already gone. Either is fine.
-      }
-    }
+    // Nothing to remove here: the compressor wrote a partial file that
+    // `compressInto` discards, and the archive name is only ever created by
+    // a successful publish. A failure on that name is a peer's archive,
+    // which must survive the refusal.
     if (err instanceof BrainSnapshotError) throw err;
     throw new BrainSnapshotError(
       `failed to archive the derived store: ${(err as Error).message ?? String(err)}`,
@@ -1166,9 +1157,11 @@ function discardStoreArchive(
  *
  * The refusal is therefore made explicit here, before either compressor
  * runs, so both paths fail with the same typed error and the same
- * message. The gzip write additionally opens with `wx` (exclusive
- * create), which closes the window between the check and the write that
- * a probe alone would leave open.
+ * message. Both compressors then write a partial file, and
+ * {@link publishArchive} gives it the final name with an exclusive hard
+ * link, which closes the window between the check and the publish that a
+ * probe alone would leave open and means a killed compression never
+ * leaves a truncated archive under a recovery point's name.
  *
  * The on-disk extension stays `.tar.zst` under gzip. The restore probes
  * the magic bytes rather than the name, and one suffix keeps listing and
@@ -1180,41 +1173,223 @@ function compressInto(
   tools: ToolAvailability,
   runId: string,
 ): void {
-  if (existsSync(outPath)) {
-    // The refusal carries an EEXIST-shaped cause because the id allocator
-    // above ladders past a taken name and needs to recognise this as the
-    // collision it is. Without it the allocator sees an opaque snapshot
-    // failure, declines to retry, and aborts the destructive operation the
-    // snapshot exists to protect.
-    throw new BrainSnapshotError(`refusing to overwrite an existing archive: ${outPath}`, runId, {
-      cause: new FileAlreadyExistsError(outPath, { kind: "snapshot archive" }),
-    });
+  if (existsSync(outPath)) throw archiveCollision(outPath, runId);
+  // The compressor writes a partial name beside the archive, and the
+  // archive appears under its final name only once the compressor has
+  // exited cleanly. A process killed part-way through compression (an
+  // operator's kill, a host timeout, a power cut) used to leave a
+  // truncated `<run_id>.tar.zst` with no manifest, which the listing,
+  // retention and rollback all treat as a recovery point. A partial file
+  // never ends in the archive suffix, so nothing lists it.
+  const partial = `${outPath}${PARTIAL_ARCHIVE_INFIX}${process.pid}-${randomBytes(4).toString("hex")}`;
+  try {
+    if (tools.zstd) {
+      runCompressor("zstd", ["-19", "-q", "-o", partial, payload.path], runId);
+    } else {
+      // No zstd: gzip in-process. `node:zlib` ships with every runtime this
+      // tool supports, so a snapshot never depends on a `gzip` binary -
+      // which native Windows does not have. Level 9 matches the `gzip -9`
+      // this replaced, byte format included, so older readers restore it
+      // unchanged.
+      gzipFileExclusive(payload.path, partial, runId);
+    }
+    publishArchive(partial, outPath, runId);
+  } finally {
+    discardPartial(partial);
   }
-  if (tools.zstd) {
-    // `zstd -o` opens the destination itself and refuses an existing one.
-    const args =
-      payload.kind === "file"
-        ? ["-19", "-q", "-o", outPath, payload.path]
-        : ["-19", "-q", "-o", outPath, "-"];
-    runCompressor("zstd", args, payload, runId, null);
-    return;
-  }
-  // No zstd: gzip in-process. `node:zlib` ships with every runtime this
-  // tool supports, so a snapshot never depends on a `gzip` binary - which
-  // native Windows does not have. Level 9 matches the `gzip -9` this
-  // replaced, byte format included, so older readers restore it unchanged.
-  const raw = payload.kind === "buffer" ? payload.bytes : readFileSync(payload.path);
-  writeArchiveExclusive(outPath, gzipSync(raw, { level: 9 }), runId);
 }
 
 /**
- * Exclusive create of a finished archive. `wx` is what makes the gzip path
- * refuse an existing archive the way `zstd -o` always has; see
- * {@link compressInto} for why that refusal is load-bearing rather than
- * tidy. A torn write remains possible (worst case: a corrupt archive that
- * fails on restore, the same outcome as any other interrupted snapshot) -
- * what is no longer possible is silently replacing someone else's
- * recovery point.
+ * Remove a partial archive this process wrote. Best-effort and never
+ * throwing: it runs in a `finally`, where a throw would replace the real
+ * outcome - turning a published archive into a failed snapshot, or hiding
+ * the typed collision the run-id allocator ladders on. A partial left
+ * behind is never listed, and {@link pruneSnapshots} removes stale ones.
+ */
+function discardPartial(partial: string): void {
+  try {
+    unlinkWithRetry(partial);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    process.stderr.write(
+      `warning: could not remove the partial snapshot archive ${partial}: ` +
+        `${(err as Error).message ?? String(err)}\n`,
+    );
+  }
+}
+
+/** Infix of a partial archive's name: `<archive>.partial-<pid>-<hex>`. */
+const PARTIAL_ARCHIVE_INFIX = ".partial-";
+
+/**
+ * A partial archive older than this is left over from a process that was
+ * killed during compression. Generous against the longest compression a
+ * live snapshot could still be running.
+ */
+const STALE_PARTIAL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Remove partial archives a killed snapshot left in `.snapshots/`. They are
+ * this tool's own unfinished output, never a recovery point (nothing lists
+ * them), and each can be as large as the whole Brain tar. Best-effort.
+ */
+function removeStalePartials(snapshotsDirPath: string, now: number): void {
+  let names: string[];
+  try {
+    names = readdirSync(snapshotsDirPath);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.includes(PARTIAL_ARCHIVE_INFIX)) continue;
+    const full = join(snapshotsDirPath, name);
+    try {
+      const st = lstatSync(full);
+      if (!st.isFile() || now - st.mtimeMs < STALE_PARTIAL_MS) continue;
+      unlinkWithRetry(full);
+    } catch {
+      // gone already, or not ours to remove right now; the next prune retries
+    }
+  }
+}
+
+/**
+ * The typed "this name is taken" refusal. It carries an EEXIST-shaped
+ * cause because the id allocator in `snapshot-gate.ts` ladders past a
+ * taken name and needs to recognise this as the collision it is. Without
+ * it the allocator sees an opaque snapshot failure, declines to retry, and
+ * aborts the destructive operation the snapshot exists to protect.
+ */
+function archiveCollision(outPath: string, runId: string): BrainSnapshotError {
+  return new BrainSnapshotError(`refusing to overwrite an existing archive: ${outPath}`, runId, {
+    cause: new FileAlreadyExistsError(outPath, { kind: "snapshot archive" }),
+  });
+}
+
+/**
+ * errno values from the hard link that rule out the rename fallback too: the
+ * partial file or the directory is gone, the volume is full or read-only.
+ * Every other failure (a filesystem without hard links reports EPERM,
+ * ENOTSUP, or on Windows FAT and exFAT an `ERROR_INVALID_FUNCTION` that
+ * libuv maps to EISDIR) falls through to the checked rename.
+ */
+const LINK_FATAL_CODES: ReadonlySet<string> = new Set(["ENOENT", "ENOSPC", "EROFS"]);
+
+/**
+ * Give the finished `partial` file its final archive name, refusing a name
+ * that is already taken.
+ *
+ * A hard link is an exclusive create of the name with the content already
+ * in place: it fails with EEXIST when a peer published first and never
+ * replaces anything, on POSIX and on NTFS alike. `rename` would replace an
+ * existing archive silently, so it is used only when the link fails for
+ * another reason (typically a filesystem without hard links), behind an
+ * existence check. That leaves a window between
+ * the check and the rename on such a volume; the run id already carries
+ * the second it was taken in, and the allocator probes the name first.
+ * The partial file itself is removed by the caller.
+ */
+function publishArchive(partial: string, outPath: string, runId: string): void {
+  try {
+    linkSync(partial, outPath);
+    return;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "";
+    if (code === "EEXIST") throw archiveCollision(outPath, runId);
+    if (LINK_FATAL_CODES.has(code)) {
+      throw new BrainSnapshotError(
+        `failed to publish ${outPath}: ${(err as Error).message ?? String(err)}`,
+        runId,
+        { cause: err },
+      );
+    }
+  }
+  if (existsSync(outPath)) throw archiveCollision(outPath, runId);
+  try {
+    renameWithRetry(partial, outPath);
+  } catch (err) {
+    throw new BrainSnapshotError(
+      `failed to publish ${outPath}: ${(err as Error).message ?? String(err)}`,
+      runId,
+      { cause: err },
+    );
+  }
+}
+
+/**
+ * Input read per gzip member by {@link gzipFileExclusive}. Bounds the
+ * memory the gzip fallback holds at once, whatever the archive's size.
+ */
+const GZIP_MEMBER_INPUT_BYTES = 8 * 1024 * 1024;
+
+/**
+ * gzip `source` into `outPath` one bounded chunk at a time.
+ *
+ * `node:zlib` has no synchronous streaming API, and the snapshot path is
+ * synchronous by contract (the destructive gate runs it inline before the
+ * mutation it protects). So each chunk is compressed on its own and the
+ * results are written back to back: a multi-member gzip file (RFC 1952,
+ * section 2.2), which `gunzip`, `node:zlib` and every `tar -z` read as the
+ * concatenation of the members. The restore path reads it unchanged.
+ *
+ * The destination is opened `wx`, so the exclusivity {@link compressInto}
+ * relies on holds here exactly as it did for the single-buffer write. A
+ * file this call created and could not finish is removed: it is ours, and
+ * left behind it would read as a recovery point.
+ */
+function gzipFileExclusive(source: string, outPath: string, runId: string): void {
+  let out: number;
+  try {
+    out = openSync(outPath, "wx");
+  } catch (err) {
+    throw new BrainSnapshotError(
+      `failed to write ${outPath}: ${(err as Error).message ?? String(err)}`,
+      runId,
+      { cause: err },
+    );
+  }
+  let finished = false;
+  try {
+    const input = openSync(source, "r");
+    try {
+      const chunk = Buffer.allocUnsafe(GZIP_MEMBER_INPUT_BYTES);
+      let wroteMember = false;
+      for (;;) {
+        const read = readSync(input, chunk, 0, chunk.length, null);
+        if (read === 0) break;
+        writeFully(out, gzipSync(chunk.subarray(0, read), { level: 9 }));
+        wroteMember = true;
+      }
+      // An empty source still produces a valid (one-member) gzip file.
+      if (!wroteMember) writeFully(out, gzipSync(Buffer.alloc(0), { level: 9 }));
+    } finally {
+      closeSync(input);
+    }
+    finished = true;
+  } catch (err) {
+    throw new BrainSnapshotError(
+      `failed to write ${outPath}: ${(err as Error).message ?? String(err)}`,
+      runId,
+      { cause: err },
+    );
+  } finally {
+    closeSync(out);
+    if (!finished) rmSync(outPath, { force: true });
+  }
+}
+
+/** `writeSync` until every byte of `bytes` is on `fd`. */
+function writeFully(fd: number, bytes: Buffer): void {
+  let offset = 0;
+  while (offset < bytes.length) {
+    offset += writeSync(fd, bytes, offset, bytes.length - offset);
+  }
+}
+
+/**
+ * Exclusive create of a decompressed payload. `wx` refuses an existing
+ * destination the way `zstd -o` does, so neither decompressor can replace
+ * a file it did not create.
  */
 function writeArchiveExclusive(outPath: string, bytes: Buffer, runId: string): void {
   try {
@@ -1229,99 +1404,30 @@ function writeArchiveExclusive(outPath: string, bytes: Buffer, runId: string): v
 }
 
 /**
- * What a compressor reads. A `buffer` is the tar stream we already hold;
- * a `file` is the vacuumed store copy, handed over by path so a
- * multi-hundred-megabyte database never round-trips through memory.
+ * What a compressor reads: a file, handed over by path - the staged tar
+ * stream or the vacuumed store copy - so a multi-hundred-megabyte payload
+ * never round-trips through memory.
  */
-type CompressionSource =
-  | { readonly kind: "buffer"; readonly bytes: Buffer }
-  | { readonly kind: "file"; readonly path: string };
+type CompressionSource = { readonly kind: "file"; readonly path: string };
 
-/** Hard ceiling on any single captured subprocess stream. */
+/**
+ * Hard ceiling on any single CAPTURED subprocess stream. Only diagnostic
+ * output (stderr) is captured on the archive path; archive bytes go
+ * through files, so this never bounds the size of a snapshot.
+ */
 const SUBPROCESS_MAX_BUFFER_BYTES = 256 * 1024 * 1024;
 
 /**
- * Run one compressor over `payload`. When `outPath` is non-null the
- * compressor writes to stdout and we own the destination file; when it
- * is null the compressor was given the destination itself.
+ * Run one compressor that writes the destination named after its `-o`
+ * itself, so only its stderr is captured. Every destination handed to it
+ * is a name this process owns: a partial file with a random suffix, or a
+ * file in a private temp directory. A collision on the published archive
+ * name is detected by {@link publishArchive}, not here.
  */
-/**
- * The path a `-o <path>` compressor invocation was told to write.
- *
- * Read back off the argv rather than threaded separately, because the argv is
- * what the process actually acted on: a second copy of the path could drift
- * from the one the command used and then misclassify the failure.
- */
-function destinationOf(args: ReadonlyArray<string>): string {
-  const flag = args.indexOf("-o");
-  return flag >= 0 ? (args[flag + 1] ?? "") : "";
-}
-
-function runCompressor(
-  cmd: string,
-  args: ReadonlyArray<string>,
-  payload: CompressionSource,
-  runId: string,
-  outPath: string | null,
-): void {
+function runCompressor(cmd: string, args: ReadonlyArray<string>, runId: string): void {
   const r = spawnSync(cmd, [...args], {
-    ...(payload.kind === "buffer" ? { input: payload.bytes } : {}),
-    stdio: [
-      payload.kind === "buffer" ? "pipe" : "ignore",
-      outPath === null ? "inherit" : "pipe",
-      "pipe",
-    ],
+    stdio: ["ignore", "ignore", "pipe"],
     maxBuffer: SUBPROCESS_MAX_BUFFER_BYTES,
-  });
-  if (r.error) {
-    throw new BrainSnapshotError(`${cmd} failed to start: ${r.error.message}`, runId);
-  }
-  if (r.status !== 0) {
-    const stderr = (r.stderr ?? Buffer.from("")).toString("utf8").trim();
-    // `zstd -o` opens the destination itself and refuses one that already
-    // exists, and it reports that refusal the same way it reports every other
-    // failure: a non-zero status and a sentence. So when the command has
-    // ALREADY failed and the destination is now present, the failure is
-    // classified as a collision rather than left opaque.
-    //
-    // This is not the discredited "check existsSync after the throw and
-    // swallow" pattern: the error is thrown either way and nothing is
-    // retried here. Only its `cause` differs, which is what lets the id
-    // allocator ladder to the next name instead of aborting a destructive
-    // operation because a peer won the same second.
-    const lostRace = outPath === null && existsSync(destinationOf(args));
-    throw new BrainSnapshotError(
-      `${cmd} exited with status ${r.status}: ${stderr}`,
-      runId,
-      lostRace
-        ? { cause: new FileAlreadyExistsError(destinationOf(args), { kind: "snapshot archive" }) }
-        : undefined,
-    );
-  }
-  if (outPath === null) return;
-  writeArchiveExclusive(outPath, r.stdout ?? Buffer.from(""), runId);
-}
-
-/**
- * Run the archive producer and capture its stdout.
- *
- * We avoid a shell pipe entirely: spawn `tar`, capture its stdout into a
- * Buffer (acceptable: Brain trees are Markdown and stay small), then
- * feed the compressor synchronously. The previous approach used
- * `sh -c "tar ... | zstd ..."` and broke on quoting of paths with
- * whitespace; buffering through Node is simpler and verifiably correct.
- *
- * Argument quoting: we deliberately do NOT shell-escape paths, because
- * `tar -C <vault>` already roots everything relative to the vault, and
- * the only user-supplied bytes in `tarArgs` are the run id (which
- * `validateRunId` constrains to `[A-Za-z0-9._-]`) and the top-level
- * `Brain/` entries (`inbox`, `preferences`, …) which are themselves
- * filesystem names produced by our own writers.
- */
-function runArchiveProducer(cmd: string, args: ReadonlyArray<string>, runId: string): Buffer {
-  const r = spawnSync(cmd, [...args], {
-    maxBuffer: SUBPROCESS_MAX_BUFFER_BYTES,
-    stdio: ["ignore", "pipe", "pipe"],
   });
   if (r.error) {
     throw new BrainSnapshotError(`${cmd} failed to start: ${r.error.message}`, runId);
@@ -1330,10 +1436,56 @@ function runArchiveProducer(cmd: string, args: ReadonlyArray<string>, runId: str
     const stderr = (r.stderr ?? Buffer.from("")).toString("utf8").trim();
     throw new BrainSnapshotError(`${cmd} exited with status ${r.status}: ${stderr}`, runId);
   }
-  if (!r.stdout) {
+}
+
+/**
+ * Run the archive producer with its stdout on `outFile`.
+ *
+ * No shell pipe (the old `sh -c "tar ... | zstd ..."` broke on quoting of
+ * paths with whitespace, and native Windows has no `sh`), and no captured
+ * pipe either: tar's stdout is a file descriptor opened here, so the
+ * stream goes straight to disk. It used to be captured through
+ * `spawnSync` with a 256 MB `maxBuffer`, which a `Brain/` tree past that
+ * size overran with `ENOBUFS` after tar had already done all of its work.
+ * Only stderr is captured, for the error message.
+ *
+ * `outFile` is opened `wx`: it lives in a private temp directory, so an
+ * existing file there is a bug to surface rather than a file to reuse.
+ *
+ * Argument quoting: we deliberately do NOT shell-escape paths, because
+ * `tar -C <vault>` already roots everything relative to the vault, and
+ * the only user-supplied bytes in `tarArgs` are the run id (which
+ * `validateRunId` constrains to `[A-Za-z0-9._-]`) and the member list,
+ * which travels through a file.
+ */
+function runArchiveProducer(
+  cmd: string,
+  args: ReadonlyArray<string>,
+  outFile: string,
+  runId: string,
+): void {
+  const fd = openSync(outFile, "wx");
+  let r: ReturnType<typeof spawnSync>;
+  try {
+    r = spawnSync(cmd, [...args], {
+      maxBuffer: SUBPROCESS_MAX_BUFFER_BYTES,
+      stdio: ["ignore", fd, "pipe"],
+    });
+  } finally {
+    closeSync(fd);
+  }
+  if (r.error) {
+    throw new BrainSnapshotError(`${cmd} failed to start: ${r.error.message}`, runId);
+  }
+  if (r.status !== 0) {
+    const stderr = Buffer.from(r.stderr ?? "")
+      .toString("utf8")
+      .trim();
+    throw new BrainSnapshotError(`${cmd} exited with status ${r.status}: ${stderr}`, runId);
+  }
+  if (statSync(outFile).size === 0) {
     throw new BrainSnapshotError(`${cmd} produced no stdout`, runId);
   }
-  return r.stdout;
 }
 
 // ----- listSnapshots / pruneSnapshots --------------------------------------
@@ -1476,6 +1628,7 @@ export function pruneSnapshots(
   if (!Number.isInteger(retentionCount)) {
     throw new Error(`pruneSnapshots: retentionCount must be an integer; got ${retentionCount}`);
   }
+  removeStalePartials(brainDirs(vault).snapshots, Date.now());
   if (retentionCount < SNAPSHOT_RETENTION_FLOOR) {
     // Refused, not obeyed, and not thrown: see the docblock.
     return Object.freeze({
@@ -1609,27 +1762,38 @@ export function extractSnapshotToTemp(vault: string, runId: string): ExtractSnap
     }
 
     if (decompressor === "zstd") {
-      const zstd = spawnSync("zstd", ["-d", "-c", archive], {
-        maxBuffer: 256 * 1024 * 1024,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      if (zstd.error || zstd.status !== 0) {
-        const stderr = (zstd.stderr ?? Buffer.from("")).toString("utf8").trim();
-        throw new BrainSnapshotError(
-          `zstd decompress failed: ${zstd.error?.message ?? stderr}`,
-          runId,
-        );
-      }
-      // `-f -` is explicit stdin: GNU tar defaults to stdin without
-      // it, but BSD tar and busybox tar do not, so passing the flag
-      // keeps the extraction portable across hosts.
-      const tar = spawnSync("tar", ["-x", "-f", "-", "-C", tarPathArg(tmp)], {
-        input: zstd.stdout,
-        stdio: ["pipe", "inherit", "pipe"],
-      });
-      if (tar.error || tar.status !== 0) {
-        const stderr = (tar.stderr ?? Buffer.from("")).toString("utf8").trim();
-        throw new BrainSnapshotError(`tar extract failed: ${tar.error?.message ?? stderr}`, runId);
+      // Decompressed to a staging file OUTSIDE the extraction root, then
+      // handed to tar as its stdin descriptor: neither stream is captured
+      // in memory, so an archive whose tar stream is larger than any
+      // capture buffer restores as well as a small one. Captured through
+      // a 256 MB `maxBuffer` before, which such an archive overran.
+      const staging = mkdtempSync(join(tmpdir(), `o2b-brain-extract-tar-${runId}-`));
+      try {
+        const tarball = join(staging, "brain.tar");
+        runCompressor("zstd", ["-d", "-q", "-o", tarball, archive], runId);
+        const input = openSync(tarball, "r");
+        let tar: ReturnType<typeof spawnSync>;
+        try {
+          // `-f -` is explicit stdin: GNU tar defaults to stdin without
+          // it, but BSD tar and busybox tar do not, so passing the flag
+          // keeps the extraction portable across hosts.
+          tar = spawnSync("tar", ["-x", "-f", "-", "-C", tarPathArg(tmp)], {
+            stdio: [input, "inherit", "pipe"],
+          });
+        } finally {
+          closeSync(input);
+        }
+        if (tar.error || tar.status !== 0) {
+          const stderr = Buffer.from(tar.stderr ?? "")
+            .toString("utf8")
+            .trim();
+          throw new BrainSnapshotError(
+            `tar extract failed: ${tar.error?.message ?? stderr}`,
+            runId,
+          );
+        }
+      } finally {
+        rmSync(staging, { recursive: true, force: true });
       }
     } else {
       // gzip is inflated in-process and piped to `tar -f -`, like the zstd
@@ -2080,13 +2244,7 @@ function decompressArchiveTo(archive: string, outPath: string, runId: string): v
   }
   if (compressor === "zstd") {
     // `zstd -o` opens the destination itself and refuses an existing one.
-    runCompressor(
-      "zstd",
-      ["-d", "-q", "-o", outPath, archive],
-      { kind: "file", path: archive },
-      runId,
-      null,
-    );
+    runCompressor("zstd", ["-d", "-q", "-o", outPath, archive], runId);
     return;
   }
   // gzip is inflated in-process (no `gzip` binary on native Windows);

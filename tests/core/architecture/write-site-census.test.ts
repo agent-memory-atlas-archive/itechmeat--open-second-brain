@@ -877,7 +877,15 @@ const DIRECT_WRITE_EXCLUSIONS: Readonly<Record<string, WriteExclusion>> = Object
   },
   "src/core/brain/snapshot.ts": {
     categories: [C.archiveTransfer, C.retentionDelete],
-    calls: ["cpSync", "renameSync", "rmSync", "unlinkSync", "writeFileSync"],
+    calls: [
+      "cpSync",
+      "linkSync",
+      "renameSync",
+      "rmSync",
+      "unlinkSync",
+      "writeFileSync",
+      "writeSync",
+    ],
     reason:
       "writes the compressed archive BYTES into `.snapshots/`, prunes archives past " +
       "the retention count, and restores by recursive copy. A torn archive fails on " +
@@ -886,7 +894,22 @@ const DIRECT_WRITE_EXCLUSIONS: Readonly<Record<string, WriteExclusion>> = Object
       "database beside its destination and swaps it in under the search writer lock, " +
       "which IS the atomic write for a SQLite file - the same discipline `reindexVault` " +
       "uses, and the reason a partial decompression can never be observed as the live " +
-      "store. The unlink removes a partial store archive whose snapshot was refused.",
+      "store. The unlink removes a partial store archive whose snapshot was refused. " +
+      "The gzip fallback writes the archive one compressed member at a time (`writeSync` " +
+      "on a descriptor opened `wx`) so a Brain tree of any size never sits in memory. " +
+      "Both compressors write a partial name, and the archive is published under its " +
+      "final name by an exclusive hard link (`linkSync`, or a checked rename where the " +
+      "filesystem has no links), so a killed compression never leaves a torn archive.",
+  },
+  "src/core/maintenance/self-heal-upgrade-state.ts": {
+    categories: [C.lockPrimitive, C.retentionDelete],
+    calls: ["unlinkSync", "writeFileSync"],
+    reason:
+      "the automatic-upgrade worker lock is an exclusive create (`wx`) of a token file in " +
+      "`.open-second-brain/`, released by unlinking it; routing it through the atomic " +
+      "writer would lose the exclusivity that makes it a lock. The failed-upgrade marker is " +
+      "written through `atomicWriteFileSync` and unlinked once nothing is pending, which is " +
+      "this tool's own per-device state, never a note.",
   },
 
   "src/core/state/migrate.ts": {
@@ -1183,8 +1206,12 @@ const DIRECT_ROWS = ROWS.filter((row) => row.directCalls.length > 0);
  * 73 -> 74: `src/core/brain/payload-registry.ts` touches a payload that
  * is about to be referenced again (`utimesSync`), restarting the gc grace
  * period; metadata only.
+ *
+ * 74 -> 75: `src/core/maintenance/self-heal-upgrade-state.ts` claims and
+ * releases the automatic-upgrade worker lock (an exclusive create) and
+ * removes the failed-upgrade marker once nothing is pending.
  */
-const DIRECT_WRITE_ROWS = 74;
+const DIRECT_WRITE_ROWS = 75;
 
 /**
  * Measured modules reaching a write through a shared helper. An equality.
@@ -1232,8 +1259,16 @@ const DIRECT_WRITE_ROWS = 74;
  * 103 -> 104: `src/core/brain/portability/knowledge-pack.ts` records each
  * staged page's install fingerprint through `atomicWriteFileSync`. Its
  * uninstall removal keeps its direct-class exclusion.
+ *
+ * 104 -> 105: `src/core/maintenance/self-heal-upgrade-state.ts` writes the
+ * failed-upgrade marker through `atomicWriteFileSync`; its lock and marker
+ * removal are direct and carry their own exclusion.
+ *
+ * 105 -> 106: `src/core/brain/dedup-index-cache.ts` persists the
+ * machine-local dedup index cache through `atomicWriteFileSync`, outside
+ * the vault (issue #195).
  */
-const SHARED_HELPER_ROWS = 104;
+const SHARED_HELPER_ROWS = 106;
 
 // ----- Origin-channel coverage boundary (Unit C) ----------------------------
 
@@ -1302,8 +1337,9 @@ const STAMPED_PATHS: ReadonlySet<string> = new Set(
  * 70 -> 71: the knowledge-pack uninstall's removal (a delete stamps nothing).
  * 71 -> 72: the payload gc's removal (a delete stamps nothing).
  * 72 -> 73: the payload registry's touch (metadata only).
+ * 73 -> 74: the automatic-upgrade lock and marker removal (state, not notes).
  */
-const UNSTAMPED_DIRECT_ROWS = 73;
+const UNSTAMPED_DIRECT_ROWS = 74;
 
 /**
  * Shared-helper write sites the stamp does not reach, measured the same
@@ -1311,9 +1347,11 @@ const UNSTAMPED_DIRECT_ROWS = 73;
  * the log pair through `atomicWriteFileSync`, signals and notes through
  * `writeFrontmatterAtomic` - are the ones missing from this count.
  * The payload registry's `put()` is one of the unstamped sites counted, and
- * so is the knowledge-pack install fingerprint (100 -> 101).
+ * so is the knowledge-pack install fingerprint (100 -> 101), and the
+ * failed-upgrade marker `self-heal-upgrade-state.ts` writes (101 -> 102),
+ * and the dedup index cache, a derived file outside the vault (102 -> 103).
  */
-const UNSTAMPED_SHARED_ROWS = 101;
+const UNSTAMPED_SHARED_ROWS = 103;
 
 describe("in-vault write-site census", () => {
   test("every direct-fs write site carries a written exclusion", () => {
