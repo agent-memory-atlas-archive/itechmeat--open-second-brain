@@ -1393,6 +1393,18 @@ These are invariants of the system, not configuration to enable.
   `o2b brain rollback <run-id>` let you undo any single dream pass.
 - **Path-safe.** Every writer routes through a vault-boundary check;
   `Brain/` operations cannot escape the configured vault root.
+- **Local MCP transport.** `o2b mcp` is a stdio subprocess of the
+  client by default. The optional `--transport http` binds `127.0.0.1`,
+  checks `Host` and `Origin` on every request against DNS rebinding,
+  and refuses a non-loopback `--host` without `--api-key` (or
+  `OPEN_SECOND_BRAIN_MCP_API_KEY`). Shutdown drains in-flight calls,
+  see [mcp.md](mcp.md#shutdown-and-draining-since-v1500).
+- **Guarded injected context.** Automatically surfaced Brain context
+  passes a prompt-injection guard. With `guardrails.untrusted_source_delimiting`
+  enabled in `_brain.yaml`, the context pack (`brain_context_pack`) wraps
+  untrusted spans in a provenance-carrying delimiter instead of filtering
+  them by a word list. The pre-compress pack (`brain_pre_compress_pack`)
+  does not apply the delimiter yet and uses the guard only.
 - **No LLM inside the algorithm.** Semantic merging of similar but
   differently-slugged topics is left to external agents who can call
   the CLI / MCP surface directly — the dream pass itself only does
