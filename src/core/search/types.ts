@@ -22,6 +22,8 @@ import type { ReconciliationOutcome, ReconciliationReport } from "../reconciliat
 import type { VaultPathRule, VaultScopeRules } from "../vault-scope/defaults.ts";
 import type { DegreePredicate } from "./property-filter.ts";
 import type { TemporalIntent } from "./temporal-intent.ts";
+import type { FtsMatchMode } from "./fts-match-mode.ts";
+import type { DisclosureMode } from "./disclosure-mode.ts";
 import type { BrainSearchResult, ScoreBreakdown, TrustMetadata } from "./search-result.ts";
 import type {
   MemoryTrustAssessment,
@@ -586,18 +588,12 @@ export interface IndexCheckReport {
 }
 
 /**
- * Result-depth disclosure mode (progressive 3-layer recall). `full`
- * (default) is the historical flat search: every hit carries its full
- * chunk content. `cards` returns compact layer-1 {@link SearchCard}s
- * instead — path/title/score/reasons/snippet/pointer, no full content —
- * so recall stays token-cheap and the agent pays for depth only by
- * calling `expandHit` (layer 2 fuller note, layer 3 raw transcript).
- *
- * This is NOT the query-lane `expand` flag on {@link SearchOptions}:
- * that broadens the candidate query, this shapes how much of each
- * surfaced result is disclosed.
+ * Result-depth disclosure mode; the vocabulary lives in
+ * `disclosure-mode.ts`. This is NOT the query-lane `expand` flag on
+ * {@link SearchOptions}: that broadens the candidate query, this shapes how
+ * much of each surfaced result is disclosed.
  */
-export type DisclosureMode = "full" | "cards";
+export type { DisclosureMode };
 
 /**
  * Layer-1 compact card (progressive disclosure). The token-cheap
@@ -815,6 +811,13 @@ export interface SearchOptions {
   readonly pathPrefix?: string;
   readonly keywordWeight?: number;
   readonly semanticWeight?: number;
+  /**
+   * Caller-selectable FTS match breadth (t_c5326ece). `all` (default)
+   * keeps the implicit AND the keyword lane always ran; `any` OR-joins the
+   * cleaned query tokens, so a document matching any one term is a keyword
+   * candidate. Absent = `all`, byte-identical to prior behaviour.
+   */
+  readonly matchMode?: FtsMatchMode;
   /**
    * Property filter map (v0.10.17). Each key maps to one or more
    * accepted scalar values. Within one key the match is OR; across

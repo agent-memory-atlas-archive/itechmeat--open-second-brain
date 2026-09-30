@@ -68,8 +68,8 @@
  * already does.
  */
 
-import { lstatSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { lstatSync, readdirSync, statSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 
 import {
   BRAIN_ARTIFACTS_REL,
@@ -86,6 +86,14 @@ import {
   DERIVED_STORE_FILE,
   HOOK_AUDIT_DIR,
 } from "../brain/path-constants.ts";
+import { WATCHDOG_FALLBACK_AUDIT_DIR } from "../brain/audit-dirs.ts";
+import { JSONL_LEDGER_EXT, jsonlLedgerGrammar, parseShardedName } from "../brain/ledger-shards.ts";
+import { MAINTENANCE_JOURNAL_STEM } from "../brain/maintenance/journal.ts";
+import {
+  CAPTURE_DECISION_LEDGER_STEM,
+  QUERY_DEMAND_LEDGER_STEM,
+  RECURRENCE_LEDGER_STEM,
+} from "../brain/paths.ts";
 import { CONFIG_ORIGIN, resolveWithOrigin, type ConfigOrigin } from "../validate.ts";
 
 // ----- Vocabularies ---------------------------------------------------------
@@ -250,6 +258,13 @@ export interface StateSurface {
    * a test rather than silently orphaning a location.
    */
   readonly sources: ReadonlyArray<string>;
+  /**
+   * True for a fixed-name ledger that writes per-device shards beside its
+   * legacy name (t_774dea61): `derive` names the legacy, empty-shard
+   * `<base>.jsonl`, and a device with an id writes `<base>.<deviceId>.jsonl`
+   * instead. The probe reports such a surface present when either exists.
+   */
+  readonly sharded_ledger?: true;
 }
 
 // Names the resolvers spell privately. Declared here so the derivations
@@ -266,18 +281,17 @@ const SESSION_LEDGER_FILE = "session-import-ledger.json";
 const INSTALL_MANIFEST_FILE = "install.lock.json";
 const PROTECT_MANIFEST_FILE = "protect.lock.json";
 const MAINTENANCE_LEASE_FILE = "maintenance.sqlite";
-const MAINTENANCE_JOURNAL_FILE = "maintenance-runs.jsonl";
+const MAINTENANCE_JOURNAL_FILE = `${MAINTENANCE_JOURNAL_STEM}.${JSONL_LEDGER_EXT}`;
 const HOOK_STATE_DIR = "hook-state";
 const SELF_HEAL_UPGRADE_MARKER_FILE = "self-heal-upgrade.json";
-const WATCHDOG_AUDIT_DIR = "watchdog-audit";
 const INJECT_CACHE_DIR = "inject-cache";
 const AIDER_CONTEXT_FILE = "aider-context.md";
 const DREAM_RUNS_DIR = "dream-runs";
 const PREF_AUDIT_DIR = "pref-audit";
 const CONTINUITY_DIR = "continuity";
-const RECURRENCE_FILE = "recurrence-support.jsonl";
-const QUERY_DEMAND_FILE = "query-demand.jsonl";
-const CAPTURE_DECISIONS_FILE = "capture-decisions.jsonl";
+const RECURRENCE_FILE = `${RECURRENCE_LEDGER_STEM}.${JSONL_LEDGER_EXT}`;
+const QUERY_DEMAND_FILE = `${QUERY_DEMAND_LEDGER_STEM}.${JSONL_LEDGER_EXT}`;
+const CAPTURE_DECISIONS_FILE = `${CAPTURE_DECISION_LEDGER_STEM}.${JSONL_LEDGER_EXT}`;
 const CAPTURE_WATERMARK_FILE = ".catchup-watermark.json";
 const PROPOSAL_WATERMARK_FILE = "proposal-watermark.json";
 const TRUTH_DIR = "truth";
@@ -524,6 +538,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     label: "maintenance journal",
     tier: STATE_TIER.derived,
     derive: derivedStore(MAINTENANCE_JOURNAL_FILE),
+    sharded_ledger: true,
     override_env: null,
     override_config_key: null,
     carries_memory: false,
@@ -578,7 +593,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.watchdogAudit,
     label: "watchdog audit fallback",
     tier: STATE_TIER.derived,
-    derive: derivedStore(WATCHDOG_AUDIT_DIR),
+    derive: derivedStore(WATCHDOG_FALLBACK_AUDIT_DIR),
     override_env: null,
     override_config_key: null,
     carries_memory: false,
@@ -677,6 +692,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     label: "procedural recurrence ledger",
     tier: STATE_TIER.vaultContent,
     derive: brainLog(RECURRENCE_FILE),
+    sharded_ledger: true,
     override_env: null,
     override_config_key: null,
     carries_memory: false,
@@ -691,6 +707,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     label: "query demand ledger",
     tier: STATE_TIER.vaultContent,
     derive: brainLog(QUERY_DEMAND_FILE),
+    sharded_ledger: true,
     override_env: null,
     override_config_key: null,
     carries_memory: true,
@@ -705,6 +722,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     label: "inbound capture decision log",
     tier: STATE_TIER.vaultContent,
     derive: brainLog(CAPTURE_DECISIONS_FILE),
+    sharded_ledger: true,
     override_env: null,
     override_config_key: null,
     carries_memory: true,
@@ -733,6 +751,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     label: "session lineage ledger",
     tier: STATE_TIER.vaultContent,
     derive: brainTree(BRAIN_INTERNAL_STATE_DIR, LINEAGE_LEDGER_FILE),
+    sharded_ledger: true,
     override_env: DEVICE_ID_ENV,
     override_config_key: DEVICE_ID_CONFIG_KEY,
     carries_memory: false,
@@ -1113,16 +1132,53 @@ function statOrAbsent(path: string): StatLike | undefined {
 /** What an absent surface says. Absent is a state, not a failure. */
 const ABSENT_REASON = "nothing has created it in this vault yet";
 
+/**
+ * The first shard of the sharded ledger whose legacy (empty-shard) file is
+ * `legacyPath`, or `undefined` when its directory holds none.
+ *
+ * The grammar is the one every writer names its files through, so the probe
+ * and the writers cannot disagree on what a shard is, and a
+ * `*.sync-conflict-*` copy is never counted. A missing directory is the same
+ * `absent` a missing file is; any other listing failure throws, and the
+ * probe reports it as `unchecked` by its code.
+ */
+function firstLedgerShard(legacyPath: string): string | undefined {
+  const name = basename(legacyPath);
+  const suffix = `.${JSONL_LEDGER_EXT}`;
+  if (!name.endsWith(suffix)) {
+    throw new Error(
+      `sharded ledger surface ${JSON.stringify(legacyPath)} does not end in ${suffix}`,
+    );
+  }
+  const grammar = jsonlLedgerGrammar(name.slice(0, -suffix.length));
+  const dir = dirname(legacyPath);
+  let names: string[];
+  try {
+    names = readdirSync(dir).toSorted();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  const shard = names.find((entry) => parseShardedName(entry, grammar) !== null);
+  return shard === undefined ? undefined : join(dir, shard);
+}
+
 function probe(
   path: string,
   statAt: (path: string) => StatLike | undefined,
+  sharded: boolean,
 ): StateReachabilityVerdict {
   try {
-    const stat = statAt(path);
-    if (stat === undefined) {
-      return { state: STATE_REACHABILITY.absent, path, reason: ABSENT_REASON };
+    if (statAt(path) !== undefined) {
+      return { state: STATE_REACHABILITY.present, path, reason: null };
     }
-    return { state: STATE_REACHABILITY.present, path, reason: null };
+    // A sharded ledger on a device with an id never writes the legacy
+    // name at all; one of its shards is the surface just as well.
+    const shard = sharded ? firstLedgerShard(path) : undefined;
+    if (shard !== undefined) {
+      return { state: STATE_REACHABILITY.present, path: shard, reason: null };
+    }
+    return { state: STATE_REACHABILITY.absent, path, reason: ABSENT_REASON };
   } catch (error) {
     // The one branch the tri-state exists for. An EACCES on the parent
     // directory, an ELOOP, an EIO from a dying disk: none of them is
@@ -1168,7 +1224,7 @@ export function inventoryStateSurfaces(input: StateInventoryInput): StateInvento
       override_config_key: surface.override_config_key,
       carries_memory: surface.carries_memory,
       reason: surface.reason,
-      reachability: probe(path, statAt),
+      reachability: probe(path, statAt, surface.sharded_ledger === true),
       origin: resolved.origin,
     };
   });

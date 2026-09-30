@@ -73,6 +73,12 @@ import { decisionModelSearchEnvelope } from "../core/decision-model/answerable.t
 import { MCP_PREVIEW_BUDGET } from "./preview-budget.ts";
 import { explainEnvelope } from "../core/search/explain-envelope.ts";
 import { deriveRecallHint } from "../core/search/recall-hint.ts";
+import { FTS_MATCH_MODES, isFtsMatchMode } from "../core/search/fts-match-mode.ts";
+import {
+  DISCLOSURE_MODE,
+  DISCLOSURE_MODES,
+  isDisclosureMode,
+} from "../core/search/disclosure-mode.ts";
 import {
   ELLIPSIS,
   HEAD_WINDOW_START,
@@ -177,9 +183,15 @@ const SEARCH_INPUT_SCHEMA: Record<string, unknown> = {
       type: "boolean",
       description: "Skip the semantic lane entirely, so no embedding is needed. Default false.",
     },
+    match_mode: {
+      type: "string",
+      enum: [...FTS_MATCH_MODES],
+      description:
+        "FTS match breadth: 'all' (default) requires every term; 'any' matches a document carrying any one term. Absent leaves the implicit AND.",
+    },
     disclosure: {
       type: "string",
-      enum: ["full", "cards"],
+      enum: [...DISCLOSURE_MODES],
       description:
         "Result depth: 'full' (default) returns full chunk content; 'cards' returns token-cheap layer-1 cards — drill a hit with brain_search_expand.",
     },
@@ -900,10 +912,24 @@ async function toolBrainSearch(
 
   const semantic = coerceBoolOptional(args, "semantic");
   const keywordOnly = coerceBoolOptional(args, "keyword_only") ?? false;
-  const disclosure = coerceStringOptional(args, "disclosure", 16);
-  if (disclosure !== undefined && disclosure !== "full" && disclosure !== "cards") {
-    throw new MCPError(INVALID_PARAMS, "argument 'disclosure' must be 'full' or 'cards'");
+  // The enum checks alone bound these values, so no separate length cap:
+  // any present value outside the modes, whatever its type or length, is
+  // refused with the accepted list.
+  const disclosure = args["disclosure"] ?? undefined;
+  if (disclosure !== undefined && !isDisclosureMode(disclosure)) {
+    throw new MCPError(
+      INVALID_PARAMS,
+      `argument 'disclosure' must be one of ${DISCLOSURE_MODES.join(", ")}`,
+    );
   }
+  const matchModeRaw = args["match_mode"] ?? undefined;
+  if (matchModeRaw !== undefined && !isFtsMatchMode(matchModeRaw)) {
+    throw new MCPError(
+      INVALID_PARAMS,
+      `argument 'match_mode' must be one of ${FTS_MATCH_MODES.join(", ")}`,
+    );
+  }
+  const matchMode = matchModeRaw;
   const explain = coerceBoolOptional(args, "explain") ?? false;
   const trust = coerceBoolOptional(args, "trust") ?? false;
   const rerank = coerceBoolOptional(args, "rerank") ?? false;
@@ -991,8 +1017,9 @@ async function toolBrainSearch(
     semantic: semantic ?? null,
     keywordOnly,
     pathPrefix,
+    ...(matchMode !== undefined ? { matchMode } : {}),
     ...(profile !== undefined ? { profile } : {}),
-    ...(disclosure === "cards" ? { disclosure: "cards" as const } : {}),
+    ...(disclosure === DISCLOSURE_MODE.cards ? { disclosure } : {}),
     ...(properties !== undefined ? { properties } : {}),
     ...(degreeFilters !== undefined ? { degreeFilters } : {}),
     ...(visibility !== undefined ? { visibility } : {}),
@@ -1870,7 +1897,7 @@ export const SEARCH_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: "brain_search",
     description:
-      "Full-text search across the vault. Optional semantic layer when configured. Read-only.",
+      "Full-text search across the vault. Optional semantic layer when configured. Read-only. When a query misses, consult brain_recall_gate before widening recall: it classifies whether widening is warranted.",
     inputSchema: SEARCH_INPUT_SCHEMA,
     outputSchema: SEARCH_OUTPUT_SCHEMA,
     previewBudget: MCP_PREVIEW_BUDGET,

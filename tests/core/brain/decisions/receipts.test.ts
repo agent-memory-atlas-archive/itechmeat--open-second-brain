@@ -10,7 +10,10 @@ import {
   normalizeDecisionSubject,
   queryDecisionChangeHistory,
   readDecisionChangeReceipts,
+  receiptShardPath,
+  receiptsDir,
 } from "../../../../src/core/brain/decisions/receipts.ts";
+import { withDeviceId } from "../../../helpers/device-id.ts";
 
 let vault: string;
 
@@ -239,4 +242,13 @@ describe("no receipt on reads", () => {
     const files = existsSync(truthDir) ? readdirSync(truthDir) : [];
     expect(files.filter((f) => f.startsWith("decision-change")).length).toBe(0);
   });
+});
+
+test("the receipt shard name is decision-change[.<deviceId>].jsonl, byte for byte", () => {
+  expect(withDeviceId("", () => receiptShardPath(vault))).toBe(
+    join(receiptsDir(vault), "decision-change.jsonl"),
+  );
+  expect(withDeviceId("laptop-01", () => receiptShardPath(vault))).toBe(
+    join(receiptsDir(vault), "decision-change.laptop-01.jsonl"),
+  );
 });

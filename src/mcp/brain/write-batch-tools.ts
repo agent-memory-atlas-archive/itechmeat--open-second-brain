@@ -22,9 +22,15 @@ import type { BrainApplyOutcome, BrainApplyResult } from "../../core/brain/types
 import {
   applyWriteBatch,
   MAX_BATCH_OPERATIONS,
+  WRITE_BATCH_RECEIPT_STATUS,
+  type WriteBatchReceipt,
   type WriteBatchResult,
   type WriteOperation,
 } from "../../core/brain/write-batch.ts";
+import {
+  IdempotencyKeyError,
+  IdempotencyPayloadMismatchError,
+} from "../../core/brain/idempotency-ledger.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { noteWriteResult, parseFrontmatterArg, writeBatchErrorToMcp } from "./notes-tools.ts";
@@ -182,6 +188,26 @@ function committedNotePage(
   );
 }
 
+/**
+ * The receipt half of the response. A `payload_conflict` also says in
+ * words what the status means for the caller: the writes landed, so the
+ * batch must not be sent again under a new ID.
+ */
+function receiptFields(receipt: WriteBatchReceipt): Record<string, unknown> {
+  return {
+    request_id: receipt.requestId,
+    receipt: receipt.status,
+    ...(receipt.status === WRITE_BATCH_RECEIPT_STATUS.payload_conflict
+      ? {
+          receipt_note:
+            `The writes of this call landed (see results). request_id '${receipt.requestId}' ` +
+            "was recorded concurrently for a different payload, so this call's receipt was not " +
+            "recorded; do not resend this batch under a new request_id.",
+        }
+      : {}),
+  };
+}
+
 async function toolBrainWriteBatch(
   ctx: ServerContext,
   args: Record<string, unknown>,
@@ -193,15 +219,29 @@ async function toolBrainWriteBatch(
   const resolveAgent = (override?: string): string =>
     normalizeAgentArgument(override ?? null) ?? resolveAgentName(ctx.configPath ?? undefined);
   const operations = rawOps.map((raw, index) => mapOperation(raw, index, resolveAgent));
+  const requestId = optionalStr(args, "request_id");
 
+  const baseOpts = ctx.configPath !== null ? { configPath: ctx.configPath } : {};
   let batch: WriteBatchResult;
+  // Set exactly when a request ID was supplied: the core's receipted
+  // overload always carries the status, so nothing here invents one.
+  let receipt: WriteBatchReceipt | undefined;
   try {
-    batch = applyWriteBatch(
-      ctx.vault,
-      operations,
-      ctx.configPath !== null ? { configPath: ctx.configPath } : {},
-    );
+    if (requestId === undefined) {
+      batch = applyWriteBatch(ctx.vault, operations, baseOpts);
+    } else {
+      const receipted = applyWriteBatch(ctx.vault, operations, { ...baseOpts, requestId });
+      batch = receipted;
+      receipt = receipted.receipt;
+    }
   } catch (err) {
+    // A reused request ID with a different payload, or an ID the ledger
+    // cannot store (blank, over-long), is the caller's mistake, not the
+    // server's: INVALID_PARAMS with the ledger's own explanation, the same
+    // mapping the checkpoint tools use. Both are raised before any write.
+    if (err instanceof IdempotencyPayloadMismatchError || err instanceof IdempotencyKeyError) {
+      throw new MCPError(INVALID_PARAMS, `brain_write_batch: request_id: ${err.message}`);
+    }
     throw writeBatchErrorToMcp(err, "brain_write_batch");
   }
   // The pages this batch committed, in commit order. Log-writing ops name
@@ -210,11 +250,18 @@ async function toolBrainWriteBatch(
   // skipped wrote nothing either, so it names no page - the same rule the
   // single-write receipts follow. One report covers the whole batch, with
   // the basename index and schema pack built ONCE.
-  const writtenPages = batch.results.filter(committedNotePage).map((r) => r.path);
+  // A duplicate wrote nothing: its results are the retained receipt of the
+  // call that committed, read back from the synced ledger, so it names no
+  // page as one this call wrote and nothing is linted.
+  const writtenPages =
+    receipt?.status === WRITE_BATCH_RECEIPT_STATUS.duplicate
+      ? []
+      : batch.results.filter(committedNotePage).map((r) => r.path);
   return noteWriteResult(ctx, writtenPages, {
     applied: batch.applied,
     results: batch.results.map((r) => serializeResult(ctx, r)),
     done: true,
+    ...(receipt !== undefined ? receiptFields(receipt) : {}),
   });
 }
 
@@ -281,6 +328,10 @@ export const WRITE_BATCH_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
             required: ["op"],
             additionalProperties: false,
           },
+        },
+        request_id: {
+          type: "string",
+          description: `Optional request ID for exactly-once writes: a repeat with the same operations returns receipt "${WRITE_BATCH_RECEIPT_STATUS.duplicate}" and writes nothing; other operations are refused.`,
         },
       },
       required: ["operations"],

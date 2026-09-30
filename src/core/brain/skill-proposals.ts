@@ -44,6 +44,7 @@ import {
   skillProposalPendingPath,
   skillProposalRejectedPath,
 } from "./paths.ts";
+import { JSONL_LEDGER_EXT, resolveAppendShardId, shardedFileName } from "./ledger-shards.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 import { listContinuityRecords, type ContinuityRecord } from "./continuity/store.ts";
 
@@ -244,8 +245,8 @@ const SUGGESTED_BODY_HEADING = "## Suggested skill body";
 /** Lock basename guarding the accept sequence, inside the proposals root. */
 const ACCEPT_LOCK_NAME = "accept";
 
-/** JSONL ledger of verifier rejections, relative to the vault. */
-const VERIFIER_REJECTION_LEDGER_REL = join(BRAIN_SKILL_PROPOSALS_REL, "verifier-rejections.jsonl");
+/** Shard stem of the verifier-rejection JSONL ledger inside the proposals root. */
+const VERIFIER_REJECTION_LEDGER_STEM = "verifier-rejections";
 
 export function learnSkillProposals(
   vault: string,
@@ -1430,12 +1431,28 @@ function evolveAcceptedProposal(
   }
 }
 
+/**
+ * The verifier-rejection ledger file THIS device appends to:
+ * `verifier-rejections[.<deviceId>].jsonl` (t_774dea61). The empty device
+ * id yields the legacy un-sharded name.
+ */
+export function verifierRejectionLedgerPath(vault: string): string {
+  return ensureInsideVault(
+    join(
+      vault,
+      BRAIN_SKILL_PROPOSALS_REL,
+      shardedFileName(VERIFIER_REJECTION_LEDGER_STEM, resolveAppendShardId(), JSONL_LEDGER_EXT),
+    ),
+    vault,
+  );
+}
+
 /** Append one verifier-rejection record to the JSONL ledger. */
 function appendVerifierRejection(
   vault: string,
   entry: { id: string; name_key: string; reason: string; at: string },
 ): void {
-  const path = ensureInsideVault(join(vault, VERIFIER_REJECTION_LEDGER_REL), vault);
+  const path = verifierRejectionLedgerPath(vault);
   mkdirSync(dirname(path), { recursive: true });
   appendFileSync(path, `${JSON.stringify(entry)}\n`, { encoding: "utf8" });
 }

@@ -14,10 +14,12 @@ import {
   acceptSkillProposal,
   draftDeclaredSkillProposal,
   learnSkillProposals,
+  verifierRejectionLedgerPath,
   listPendingSkillProposals,
   previewDeclaredSkillProposal,
   rejectSkillProposal,
 } from "../../../src/core/brain/skill-proposals.ts";
+import { withDeviceId } from "../../helpers/device-id.ts";
 
 let vault: string;
 
@@ -341,5 +343,16 @@ describe("a declared proposal refuses a taken slug by name", () => {
 
     rejectSkillProposal(vault, listPendingSkillProposals(vault)[0]!.slug, { note: "no" });
     expect(previewDeclaredSkillProposal(vault, declaration).outcome).toBe("suppressed");
+  });
+});
+
+describe("verifier-rejection ledger shards (t_774dea61)", () => {
+  test("each device names its own rejection shard; the empty id keeps the legacy name", () => {
+    const onA = withDeviceId("a", () => verifierRejectionLedgerPath(vault));
+    const onB = withDeviceId("b", () => verifierRejectionLedgerPath(vault));
+    const legacy = withDeviceId("", () => verifierRejectionLedgerPath(vault));
+    expect(onA.endsWith("verifier-rejections.a.jsonl")).toBe(true);
+    expect(onB.endsWith("verifier-rejections.b.jsonl")).toBe(true);
+    expect(legacy.endsWith("verifier-rejections.jsonl")).toBe(true);
   });
 });

@@ -25,7 +25,7 @@
  *      is not an update and is unaffected.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
   existsSync,
   chmodSync,
@@ -39,7 +39,18 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { applyWriteBatch, WriteBatchError } from "../../../src/core/brain/write-batch.ts";
+import {
+  applyWriteBatch,
+  WRITE_BATCH_RECEIPT_STATUS,
+  WriteBatchError,
+  type WriteOperation,
+} from "../../../src/core/brain/write-batch.ts";
+import * as ledger from "../../../src/core/brain/idempotency-ledger.ts";
+import {
+  IdempotencyKeyError,
+  IdempotencyPayloadMismatchError,
+} from "../../../src/core/brain/idempotency-ledger.ts";
+import { writeSignal } from "../../../src/core/brain/signal.ts";
 import { listNoteWrites, type NoteWriteRecord } from "../../../src/core/brain/notes/write-log.ts";
 import {
   NOTE_WRITE_NO_PRIOR,
@@ -600,5 +611,142 @@ describe("applyWriteBatch note-write attribution", () => {
       ]),
     ).toThrow(WriteBatchError);
     expect(noteWrites()).toEqual([]);
+  });
+});
+
+describe("applyWriteBatch client request receipts (t_b34439d9)", () => {
+  const OPS: ReadonlyArray<WriteOperation> = [
+    {
+      kind: "create_note",
+      path: "Notes/Receipt.md",
+      frontmatter: { title: "Receipt" },
+      content: "written once",
+    },
+  ];
+
+  test("without a request id the result carries no receipt and behavior is unchanged", () => {
+    const res = applyWriteBatch(vault, OPS);
+    expect(res.applied).toBe(1);
+    expect(Object.hasOwn(res, "receipt")).toBe(false);
+  });
+
+  test("a fresh request id applies once with an applied receipt", () => {
+    const res = applyWriteBatch(vault, OPS, { requestId: "req-1" });
+    expect(res.receipt).toEqual({ requestId: "req-1", status: WRITE_BATCH_RECEIPT_STATUS.applied });
+    expect(readFileSync(join(vault, "Notes/Receipt.md"), "utf8")).toContain("written once");
+  });
+
+  test("a repeated id with the same payload returns the retained result as a duplicate", () => {
+    applyWriteBatch(vault, OPS, { requestId: "req-2" });
+    const before = readFileSync(join(vault, "Notes/Receipt.md"), "utf8");
+    const retry = applyWriteBatch(vault, OPS, { requestId: "req-2" });
+    expect(retry.receipt).toEqual({
+      requestId: "req-2",
+      status: WRITE_BATCH_RECEIPT_STATUS.duplicate,
+    });
+    // The retained original receipt, not a fresh application.
+    expect(retry.applied).toBe(1);
+    expect(retry.done).toBe(true);
+    expect(readFileSync(join(vault, "Notes/Receipt.md"), "utf8")).toBe(before);
+  });
+
+  test("a repeated id with a different payload throws and writes nothing", () => {
+    applyWriteBatch(vault, OPS, { requestId: "req-3" });
+    const before = readFileSync(join(vault, "Notes/Receipt.md"), "utf8");
+    expect(() =>
+      applyWriteBatch(vault, [{ kind: "create_note", path: "Notes/Other.md", content: "x" }], {
+        requestId: "req-3",
+      }),
+    ).toThrow(IdempotencyPayloadMismatchError);
+    expect(existsSync(join(vault, "Notes/Other.md"))).toBe(false);
+    expect(readFileSync(join(vault, "Notes/Receipt.md"), "utf8")).toBe(before);
+  });
+
+  test("an invalid request id surfaces the ledger's named key error before any write", () => {
+    for (const bad of ["", "   ", "x".repeat(257)]) {
+      expect(() => applyWriteBatch(vault, OPS, { requestId: bad })).toThrow(IdempotencyKeyError);
+    }
+    expect(existsSync(join(vault, "Notes/Receipt.md"))).toBe(false);
+  });
+});
+
+describe("applyWriteBatch request receipt integrity (t_b34439d9 audit)", () => {
+  const LOG_OP: ReadonlyArray<WriteOperation> = [
+    { kind: "append_log_line", input: { text: "receipt race line" } },
+  ];
+
+  test("a rival that records the same id with a different payload mid-batch: this call's writes landed and the receipt says so", () => {
+    applyWriteBatch(vault, LOG_OP, { requestId: "race-1" });
+    // The unlocked pre-write consult misses the rival's record, as it does
+    // when a concurrent process records between the consult and the commit.
+    const spy = spyOn(ledger, "lookupKey").mockReturnValueOnce(null);
+    try {
+      const res = applyWriteBatch(
+        vault,
+        [{ kind: "append_log_line", input: { text: "a different line" } }],
+        { requestId: "race-1" },
+      );
+      expect(res.receipt).toEqual({
+        requestId: "race-1",
+        status: WRITE_BATCH_RECEIPT_STATUS.payload_conflict,
+      });
+      expect(res.applied).toBe(1);
+      expect(res.done).toBe(true);
+      const [only] = res.results;
+      expect(only?.kind).toBe("append_log_line");
+      const logged = readFileSync(join(vault, (only as { log_path: string }).log_path), "utf8");
+      expect(logged).toContain("a different line");
+    } finally {
+      spy.mockRestore();
+    }
+    // The id stays bound to the rival's payload: a retry of this call's
+    // operations under it is refused, and writes nothing more.
+    expect(() =>
+      applyWriteBatch(vault, [{ kind: "append_log_line", input: { text: "a different line" } }], {
+        requestId: "race-1",
+      }),
+    ).toThrow(IdempotencyPayloadMismatchError);
+  });
+
+  test("a rival that records the same id and payload mid-batch is named, never reported as applied", () => {
+    applyWriteBatch(vault, LOG_OP, { requestId: "race-2" });
+    const spy = spyOn(ledger, "lookupKey").mockReturnValueOnce(null);
+    try {
+      const res = applyWriteBatch(vault, LOG_OP, { requestId: "race-2" });
+      expect(res.receipt).toEqual({
+        requestId: "race-2",
+        status: WRITE_BATCH_RECEIPT_STATUS.concurrent_duplicate,
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("a request id does not collide with a brain_feedback idempotency key of the same text", () => {
+    writeSignal(vault, {
+      topic: "shared-key-topic",
+      signal: "positive",
+      agent: "claude",
+      principle: "Keep keys apart.",
+      created_at: "2026-05-01T10:00:00Z",
+      date: "2026-05-01",
+      slug: "shared-key-topic",
+      idempotency_key: "shared-key",
+    });
+    const res = applyWriteBatch(vault, LOG_OP, { requestId: "shared-key" });
+    expect(res.receipt).toEqual({
+      requestId: "shared-key",
+      status: WRITE_BATCH_RECEIPT_STATUS.applied,
+    });
+  });
+
+  test("a non-array operations value with a request id is refused by name", () => {
+    for (const bad of [null, 42, {}]) {
+      expect(() =>
+        applyWriteBatch(vault, bad as unknown as ReadonlyArray<WriteOperation>, {
+          requestId: "shape-1",
+        }),
+      ).toThrow(WriteBatchError);
+    }
   });
 });

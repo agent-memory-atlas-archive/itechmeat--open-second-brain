@@ -8,6 +8,12 @@
  */
 
 import { resolveRecallProfile } from "../profiles.ts";
+import {
+  DEFAULT_FTS_MATCH_MODE,
+  FTS_MATCH_MODES,
+  isFtsMatchMode,
+  type FtsMatchMode,
+} from "../fts-match-mode.ts";
 import { resolveSemanticPolicy, type SemanticPolicy } from "../semantic-phase.ts";
 import { readActiveSessionFocus } from "../session-focus.ts";
 import {
@@ -51,6 +57,8 @@ export interface ResolvedSearchRequest {
   readonly temporalIntent: TemporalIntent | null;
   /** Whether local query expansion runs for this call. */
   readonly expandActive: boolean;
+  /** The resolved FTS match breadth: the caller's choice, else `all`. */
+  readonly matchMode: FtsMatchMode;
   /** The applied knob tuple, or null when neither profile nor tuning fired. */
   readonly tuned: TunedParameters | null;
 }
@@ -133,6 +141,13 @@ export function resolveSearchRequest(
     );
   }
 
+  const matchMode = opts.matchMode ?? DEFAULT_FTS_MATCH_MODE;
+  if (!isFtsMatchMode(matchMode)) {
+    throw new SearchError(
+      "INVALID_INPUT",
+      `match_mode must be one of ${FTS_MATCH_MODES.join(", ")}`,
+    );
+  }
   return {
     config: resolvedConfig,
     query,
@@ -144,6 +159,7 @@ export function resolveSearchRequest(
     timeRange,
     temporalIntent,
     expandActive,
+    matchMode,
     tuned,
   };
 }

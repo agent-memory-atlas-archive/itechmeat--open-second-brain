@@ -2,11 +2,13 @@
  * Per-repo git record store (Project History Suite, t_c812752c).
  *
  * Canonical source of truth for ingested history. Each linked repo owns
- * `Brain/projects/git/<repo-key>/` with two files:
+ * `Brain/projects/git/<repo-key>/` with two kinds of file:
  *
- *   - `commits.jsonl` - append-only mixed-kind records (`commit` | `tag`),
+ *   - `commits[.<deviceId>].jsonl` - one append-only shard per device of
+ *     mixed-kind records (`commit` | `tag`), merged on read by record time,
  *     snake_case on disk like the continuity shards, deduplicated by
- *     commit sha / tag name on append. Typed edges (touched files,
+ *     commit sha / tag (name, target) on append and again on the merged
+ *     read. Typed edges (touched files,
  *     author, carrying release) are STRUCTURED FIELDS here; wikilinks in
  *     rendered notes are always derived from these records, never
  *     hand-maintained (design decision: contain dual-representation drift).
@@ -22,6 +24,14 @@
  */
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  interleaveShardRows,
+  JSONL_LEDGER_EXT,
+  jsonlLedgerGrammar,
+  readShardLinesByShard,
+  resolveAppendShardId,
+  shardedFileName,
+} from "../ledger-shards.ts";
 import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -84,13 +94,29 @@ export interface AppendGitRecordsResult {
   readonly skipped: number;
 }
 
+/** The commits ledger's shard stem: `commits[.<deviceId>].jsonl`. */
+const COMMITS_STEM = "commits";
+
+/** The commits ledger's file-name layout, handed to the shared shard grammar. */
+const COMMITS_GRAMMAR = jsonlLedgerGrammar(COMMITS_STEM);
+
+/** `Brain/projects/git/`: the root that holds one store directory per repository. */
+export function gitStoreRootDir(vault: string): string {
+  return join(vault, "Brain", "projects", "git");
+}
+
 /** Per-repo store directory inside the vault. */
 export function gitStoreDir(vault: string, repoKey: string): string {
-  return join(vault, "Brain", "projects", "git", repoKey);
+  return join(gitStoreRootDir(vault), repoKey);
 }
 
 function commitsPath(vault: string, repoKey: string): string {
-  return join(gitStoreDir(vault, repoKey), "commits.jsonl");
+  // Per-device shard (t_774dea61): each machine appends to - and locks -
+  // its own file; the empty device id keeps the legacy un-sharded name.
+  return join(
+    gitStoreDir(vault, repoKey),
+    shardedFileName(COMMITS_STEM, resolveAppendShardId(), JSONL_LEDGER_EXT),
+  );
 }
 
 function statePath(vault: string, repoKey: string): string {
@@ -159,16 +185,57 @@ function parseRecord(line: string): GitRecord | null {
   return null;
 }
 
+/**
+ * When a record happened, as the cross-device merge orders it. A record
+ * without a readable time (a tag with no `createdAt`) sorts as early as
+ * possible, which in the merge means straight after the record its own
+ * shard holds before it.
+ */
+function recordTime(record: GitRecord): number {
+  const time = Date.parse(record.kind === "commit" ? record.committedAt : (record.createdAt ?? ""));
+  return Number.isFinite(time) ? time : Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * Every record across every device's shard (t_774dea61), oldest first:
+ * shards are interleaved by record time, each shard keeping its own file
+ * order, so a single-shard store reads exactly as before and `limit` and
+ * the latest-tag view see one timeline whatever the shard names are. The
+ * dedup on append reads the same merge, so it also sees commits a synced
+ * peer ingested.
+ *
+ * The merge also keeps only the first occurrence of each record identity
+ * (see {@link recordIdentity}). The append dedup cannot see a shard that
+ * has not synced yet, so two devices ingesting the same history before
+ * Syncthing delivers both write it; without this, every commit they share
+ * would list twice and a `limit` would count the copies.
+ */
 function readRecords(vault: string, repoKey: string): ReadonlyArray<GitRecord> {
-  const path = commitsPath(vault, repoKey);
-  if (!existsSync(path)) return [];
-  const records: GitRecord[] = [];
-  for (const line of readFileSync(path, "utf8").split("\n")) {
-    if (line.trim() === "") continue;
-    const record = parseRecord(line);
-    if (record !== null) records.push(record);
-  }
-  return records;
+  const shards = readShardLinesByShard(gitStoreDir(vault, repoKey), COMMITS_GRAMMAR).map(
+    (shard) => ({
+      shardId: shard.shardId,
+      rows: shard.rows.map(parseRecord).filter((record) => record !== null),
+    }),
+  );
+  const seen = new Set<string>();
+  return interleaveShardRows(shards, recordTime).filter((record) => {
+    const identity = recordIdentity(record);
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+}
+
+/**
+ * What makes two records the same record: a commit's sha, a tag's
+ * (name, target). A retargeted tag (same name, new target) is a new
+ * record; listGitTags surfaces the latest per name. The kind prefix keeps
+ * the two key spaces apart.
+ */
+function recordIdentity(record: GitRecord): string {
+  return record.kind === "commit"
+    ? `commit\x00${record.sha}`
+    : `tag\x00${record.name}\x00${record.targetSha}`;
 }
 
 /**
@@ -205,23 +272,16 @@ function appendGitRecordsLocked(
   repoKey: string,
   records: ReadonlyArray<GitRecord>,
 ): AppendGitRecordsResult {
-  const existing = readRecords(vault, repoKey);
-  const seenShas = new Set<string>();
   // Tag identity is (name, target): a RETARGETED tag (same name, new
   // commit after a force-move) appends a fresh record instead of being
   // silently dropped; listGitTags surfaces the latest record per name.
-  const seenTags = new Set<string>();
-  for (const record of existing) {
-    if (record.kind === "commit") seenShas.add(record.sha);
-    else seenTags.add(`${record.name}\x00${record.targetSha}`);
-  }
+  const seen = new Set(readRecords(vault, repoKey).map(recordIdentity));
   const lines: string[] = [];
   let skipped = 0;
   let appendedCommits = 0;
   let appendedTags = 0;
   for (const record of records) {
-    const key = record.kind === "commit" ? record.sha : `${record.name}\x00${record.targetSha}`;
-    const seen = record.kind === "commit" ? seenShas : seenTags;
+    const key = recordIdentity(record);
     if (seen.has(key)) {
       skipped += 1;
       continue;
@@ -238,7 +298,7 @@ function appendGitRecordsLocked(
   return { appended: lines.length, appendedCommits, appendedTags, skipped };
 }
 
-/** Commits oldest-first (file order), optionally filtered. */
+/** Commits oldest-first (file order, devices merged by commit time), optionally filtered. */
 export function listGitCommits(
   vault: string,
   repoKey: string,
@@ -357,17 +417,33 @@ export interface GitRepoEntry {
   readonly stateError: string | null;
 }
 
-/** Every per-repo store under Brain/projects/git/, sorted by key. */
+/**
+ * Stat errors that mean the entry is simply not there any more (removed
+ * between the listing and the stat, or a dangling link), so skipping it
+ * is the honest answer. Any other code is a store that could not be read.
+ */
+const VANISHED_ENTRY_CODES: ReadonlySet<string> = new Set(["ENOENT", "ENOTDIR"]);
+
+/**
+ * Every per-repo store under Brain/projects/git/, sorted by key. An entry
+ * that vanished is skipped; one that exists but cannot be stat'ed throws
+ * an error naming the path and its code instead of disappearing from the
+ * list.
+ */
 export function listGitRepos(vault: string): ReadonlyArray<GitRepoEntry> {
-  const root = join(vault, "Brain", "projects", "git");
+  const root = gitStoreRootDir(vault);
   if (!existsSync(root)) return [];
   const entries: GitRepoEntry[] = [];
   for (const name of readdirSync(root).toSorted()) {
     const dir = join(root, name);
     try {
       if (!statSync(dir).isDirectory()) continue;
-    } catch {
-      continue;
+    } catch (exc) {
+      const code = (exc as NodeJS.ErrnoException).code;
+      if (code !== undefined && VANISHED_ENTRY_CODES.has(code)) continue;
+      throw new Error(`git store entry ${dir} could not be read: ${code ?? String(exc)}`, {
+        cause: exc,
+      });
     }
     const probe = readGitState(vault, name);
     entries.push(Object.freeze({ key: name, state: probe.state, stateError: probe.error }));

@@ -23,6 +23,7 @@ import {
   writeTruthState,
 } from "../../../../src/core/brain/truth/store.ts";
 import { computeTruthState } from "../../../../src/core/brain/truth/fold.ts";
+import { withDeviceId } from "../../../helpers/device-id.ts";
 
 let vault: string;
 
@@ -207,4 +208,11 @@ describe("sweepClaimEvents", () => {
     expect(existsSync(truthStatePath(vault))).toBe(true);
     expect(readTruthState(vault)!.events).toBe(0);
   });
+});
+
+test("the claim shard name is claims.jsonl or claims.<deviceId>.jsonl, byte for byte", () => {
+  expect(withDeviceId("", () => claimShardPath(vault))).toBe(join(truthDir(vault), "claims.jsonl"));
+  expect(withDeviceId("laptop-01", () => claimShardPath(vault))).toBe(
+    join(truthDir(vault), "claims.laptop-01.jsonl"),
+  );
 });

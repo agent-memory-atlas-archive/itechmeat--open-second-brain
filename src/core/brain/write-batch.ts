@@ -27,7 +27,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join, relative } from "node:path";
 
 import type { FrontmatterMap } from "../types.ts";
 import { atomicWriteFileSync } from "../fs-atomic.ts";
@@ -52,6 +52,14 @@ import { ORIGIN_CHANNEL_FIELD } from "../origin-channel.ts";
 import { preferencePath, validateSlug } from "./paths.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 import { BRAIN_APPLY_RESULT } from "./types.ts";
+import {
+  computePayloadHash,
+  IdempotencyPayloadMismatchError,
+  lookupKey,
+  REMEMBER_KEY_STATUS,
+  rememberKey,
+  type RememberKeyStatus,
+} from "./idempotency-ledger.ts";
 
 /** Separator inserted between the existing body and appended text. */
 const APPEND_SEPARATOR = "\n\n";
@@ -64,6 +72,42 @@ const APPEND_SEPARATOR = "\n\n";
  * legitimate batch while capping the worst-case blocking window.
  */
 export const MAX_BATCH_OPERATIONS = 100;
+
+/**
+ * The idempotency-ledger key space of write-batch request IDs. Request IDs
+ * come from a different client vocabulary than the `idempotency_key` of
+ * brain_feedback and apply-evidence, so they live in their own namespace:
+ * the same string supplied to both tools never collides.
+ */
+const WRITE_BATCH_KEY_NAMESPACE = "write_batch";
+
+/**
+ * What a request receipt says about the call that returned it:
+ * - `applied`: this call committed the batch and recorded the ID.
+ * - `duplicate`: the ID was already recorded with the same payload; this
+ *   call wrote nothing and every other result field is the retained
+ *   receipt of the call that committed.
+ * - `concurrent_duplicate`: this call committed the batch, but a concurrent
+ *   call recorded the same ID with the same payload between this call's
+ *   consult and its record. Both calls' writes landed; the result fields
+ *   are this call's own.
+ * - `payload_conflict`: this call committed the batch - its writes landed
+ *   and the result fields are this call's own - but a concurrent call
+ *   recorded the same ID with a DIFFERENT payload between this call's
+ *   consult and its record. The ID stays bound to that other payload, so
+ *   this call's receipt was not recorded and a retry under the same ID is
+ *   refused as a mismatch. Never retry this batch under a new ID: it is
+ *   already applied.
+ */
+export const WRITE_BATCH_RECEIPT_STATUS = Object.freeze({
+  applied: "applied",
+  duplicate: "duplicate",
+  concurrent_duplicate: "concurrent_duplicate",
+  payload_conflict: "payload_conflict",
+} as const);
+
+export type WriteBatchReceiptStatus =
+  (typeof WRITE_BATCH_RECEIPT_STATUS)[keyof typeof WRITE_BATCH_RECEIPT_STATUS];
 
 /**
  * Create a new vault note. Refuses to clobber an existing file. Maps to
@@ -301,7 +345,22 @@ export interface WriteBatchResult {
   readonly results: ReadonlyArray<WriteBatchOpResult>;
   /** Terminal success marker: the batch committed, do not re-call. */
   readonly done: true;
+  /**
+   * Present exactly when the caller supplied a request ID (see
+   * {@link ReceiptedWriteBatchResult}); {@link WRITE_BATCH_RECEIPT_STATUS}
+   * names what each status means.
+   */
+  readonly receipt?: WriteBatchReceipt;
 }
+
+/** The request-receipt block a caller-supplied request ID adds to a result. */
+export interface WriteBatchReceipt {
+  readonly requestId: string;
+  readonly status: WriteBatchReceiptStatus;
+}
+
+/** A batch result for a call that supplied a request ID: the receipt is always there. */
+export type ReceiptedWriteBatchResult = WriteBatchResult & { readonly receipt: WriteBatchReceipt };
 
 /** A validated operation paired with the closure that commits it. */
 interface PlannedOperation {
@@ -317,6 +376,22 @@ export interface ApplyWriteBatchOptions {
    * record names the agent the caller is.
    */
   readonly configPath?: string;
+  /**
+   * Client-supplied request ID (t_b34439d9). Supplied, the batch consults
+   * the idempotency ledger BEFORE any validation or write: the same ID with
+   * the same semantic payload returns the retained original receipt marked
+   * `duplicate`; the same ID with a different payload throws the ledger's
+   * own {@link IdempotencyPayloadMismatchError}; an unseen ID proceeds and
+   * records the receipt after the commit - the sequencing
+   * {@link import('./signal.ts').writeSignal} already ships. A concurrent
+   * record of the same ID found only after the commit becomes a receipt
+   * status on the committed result (see {@link WRITE_BATCH_RECEIPT_STATUS}).
+   * Absent, behavior is byte-identical. Validation of the ID itself is the
+   * ledger's (non-empty, bounded length), so an invalid ID surfaces the
+   * ledger's named {@link import('./idempotency-ledger.ts').IdempotencyKeyError}
+   * before any write.
+   */
+  readonly requestId?: string;
 }
 
 /**
@@ -328,10 +403,23 @@ export interface ApplyWriteBatchOptions {
 export function applyWriteBatch(
   vault: string,
   operations: ReadonlyArray<WriteOperation>,
+  opts: ApplyWriteBatchOptions & { readonly requestId: string },
+): ReceiptedWriteBatchResult;
+export function applyWriteBatch(
+  vault: string,
+  operations: ReadonlyArray<WriteOperation>,
+  opts?: ApplyWriteBatchOptions,
+): WriteBatchResult;
+export function applyWriteBatch(
+  vault: string,
+  operations: ReadonlyArray<WriteOperation>,
   opts: ApplyWriteBatchOptions = {},
 ): WriteBatchResult {
   // Vault-identity write guard (context-integrity-gates, Unit J).
   assertVaultIdentityForWrite(vault);
+  // The batch's shape is checked first: the request-ID consult hashes the
+  // operations, and a non-array must surface as the named batch error, not
+  // as whatever the hashing throws.
   if (!Array.isArray(operations) || operations.length === 0) {
     throw new WriteBatchError("invalid_operation", -1, "operations must be a non-empty array");
   }
@@ -343,6 +431,13 @@ export function applyWriteBatch(
       { max: MAX_BATCH_OPERATIONS, count: operations.length },
     );
   }
+  // The request-ID consult sits before any per-operation validation: a
+  // duplicate must never re-validate (the original already passed) and an
+  // invalid ID must surface before anything is written.
+  const requestId = opts.requestId;
+  const idempotency =
+    requestId === undefined ? undefined : consultBatchKey(vault, requestId, operations);
+  if (idempotency?.retained !== undefined) return idempotency.retained;
 
   // A note target may appear at most once per batch: projecting each note
   // op against the pre-batch disk state means a second op on the same file
@@ -353,7 +448,102 @@ export function applyWriteBatch(
   );
 
   const results = planned.map((p) => p.commit());
-  return { applied: operations.length, results, done: true };
+  const result: WriteBatchResult = { applied: operations.length, results, done: true };
+  if (idempotency !== undefined && requestId !== undefined) {
+    // Record AFTER the commit so a sequential retry dedupes against a
+    // durable receipt. `rememberKey` re-checks under its shard lock; the
+    // residual crash window between commit and record is the one the
+    // ledger documents for every writer that follows this pattern.
+    const stored: Readonly<Record<string, unknown>> = {
+      applied: result.applied,
+      results: result.results.map((opResult) => storedOpResult(vault, opResult)),
+      done: result.done,
+    };
+    const remembered = rememberKey(vault, {
+      key: requestId,
+      namespace: WRITE_BATCH_KEY_NAMESPACE,
+      contentHash: idempotency.contentHash,
+      ref: stored,
+    });
+    // The unlocked consult above can miss a concurrent call's record; the
+    // locked re-check's verdict is acted on, never dropped. Either way this
+    // call's writes have landed, so the verdict is a receipt status on the
+    // committed result, never an error that would read as "nothing
+    // written" and invite a second application under a fresh ID.
+    return { ...result, receipt: { requestId, status: RECEIPT_STATUS_FOR[remembered.status] } };
+  }
+  return result;
+}
+
+/** The receipt status of a committed batch, by the locked re-check's verdict. */
+const RECEIPT_STATUS_FOR: Readonly<Record<RememberKeyStatus, WriteBatchReceiptStatus>> =
+  Object.freeze({
+    [REMEMBER_KEY_STATUS.inserted]: WRITE_BATCH_RECEIPT_STATUS.applied,
+    [REMEMBER_KEY_STATUS.duplicate_match]: WRITE_BATCH_RECEIPT_STATUS.concurrent_duplicate,
+    [REMEMBER_KEY_STATUS.payload_mismatch]: WRITE_BATCH_RECEIPT_STATUS.payload_conflict,
+  });
+
+/**
+ * One op result as the durable receipt stores it. The ledger is vault
+ * content that syncs to every device, so a log path is stored
+ * vault-relative - the form apply-evidence keeps for its own receipt -
+ * and never as this machine's absolute path. Note results already name
+ * vault-relative paths.
+ */
+function storedOpResult(vault: string, opResult: WriteBatchOpResult): WriteBatchOpResult {
+  if (opResult.kind !== "apply_evidence") return opResult;
+  return { ...opResult, log_path: relative(vault, opResult.log_path) };
+}
+
+/** Inverse of {@link storedOpResult}: the log path rebuilt under the vault serving the retry. */
+function retainedOpResult(vault: string, opResult: WriteBatchOpResult): WriteBatchOpResult {
+  if (opResult.kind !== "apply_evidence") return opResult;
+  return { ...opResult, log_path: join(vault, opResult.log_path) };
+}
+
+/**
+ * The pre-write consult for a caller-supplied request ID. Returns the hash
+ * the batch must record after a successful commit; when the ID is already
+ * in the ledger, `retained` carries the outcome instead - the stored
+ * receipt marked `duplicate` for a matching payload, or nothing after the
+ * mismatch error propagates.
+ */
+function consultBatchKey(
+  vault: string,
+  requestId: string,
+  operations: ReadonlyArray<WriteOperation>,
+): { readonly contentHash: string; readonly retained?: ReceiptedWriteBatchResult } {
+  const contentHash = computePayloadHash({ operations: [...operations] });
+  const existing = lookupKey(vault, requestId, WRITE_BATCH_KEY_NAMESPACE);
+  if (existing === null) return { contentHash };
+  if (existing.contentHash !== contentHash) {
+    throw new IdempotencyPayloadMismatchError(requestId, existing.contentHash, contentHash);
+  }
+  const ref = existing.ref as WriteBatchResult | undefined;
+  if (
+    ref === undefined ||
+    typeof ref !== "object" ||
+    ref.applied === undefined ||
+    !Array.isArray(ref.results) ||
+    ref.done !== true
+  ) {
+    // The ledger cannot answer for a key whose stored receipt is not a
+    // batch receipt. Refusing by name beats inventing an empty result that
+    // would tell the caller the batch applied when nothing did.
+    throw new WriteBatchError(
+      "invalid_operation",
+      -1,
+      `request id '${requestId}' is already recorded without a readable write-batch receipt`,
+    );
+  }
+  return {
+    contentHash,
+    retained: {
+      ...ref,
+      results: ref.results.map((opResult) => retainedOpResult(vault, opResult)),
+      receipt: { requestId, status: WRITE_BATCH_RECEIPT_STATUS.duplicate },
+    },
+  };
 }
 
 function projectOperation(

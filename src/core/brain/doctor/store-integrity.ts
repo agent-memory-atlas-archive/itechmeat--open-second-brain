@@ -10,15 +10,20 @@
 
 import { join } from "node:path";
 
-import { realpathInsideVault, vaultRelative } from "../../path-safety.ts";
+import { ensureInsideVault, realpathInsideVault, vaultRelative } from "../../path-safety.ts";
+import { BRAIN_LOG_AUDIT_DIRS } from "../audit-dirs.ts";
 import { continuityLogDir } from "../continuity/store.ts";
 import { scanDanglingWorkruns } from "../dream-workrun.ts";
 import { readTierDriftCount } from "../frontmatter-tiers.ts";
+import { gitStoreRootDir } from "../git/store.ts";
 import { idempotencyLogDir } from "../idempotency-ledger.ts";
-import { listSyncConflictFiles } from "../ledger-shards.ts";
+import { JSONL_LEDGER_EXT, listSyncConflictFiles } from "../ledger-shards.ts";
 import { brainStateDirPath } from "../lineage/ledger.ts";
 import { metricsDir } from "../metrics.ts";
-import { brainDirs, prefAuditDir } from "../paths.ts";
+import { BRAIN_SKILL_PROPOSALS_REL } from "../path-constants.ts";
+import { brainDirs, hookAuditDir, prefAuditDir } from "../paths.ts";
+import { schemaMutationAuditDir } from "../schema-integrity.ts";
+import { watchdogFallbackAuditDir } from "../watchdog.ts";
 import type { DoctorCheck } from "./check.ts";
 import type { DoctorUncertainEntry } from "./report.ts";
 import {
@@ -80,47 +85,105 @@ export const danglingWorkrunCheck: DoctorCheck = {
  * Every append-only ledger directory in the vault, each named by the
  * module that owns it rather than by a path spelled a second time here.
  *
- * All six shard per device (who-wrote-what, Task B), which is what makes
- * one finding cover all of them: the shard layout prevents NEW conflicts
- * everywhere, so a `*.sync-conflict-*` copy under any of these means the
- * same thing - a file that exists and that no reader merges.
+ * All of them shard per device (who-wrote-what, Task B; t_774dea61),
+ * which is what makes one finding cover all of them: the shard layout
+ * prevents NEW conflicts everywhere, so a `*.sync-conflict-*` copy under
+ * any of these means the same thing - a file that exists and that no
+ * reader merges.
  */
-const LEDGER_DIRS: ReadonlyArray<(vault: string, uncertain: DoctorUncertainEntry[]) => string[]> =
-  Object.freeze([
-    (vault: string) => [brainDirs(vault).log],
-    (vault: string) => [continuityLogDir(vault)],
-    (vault: string) => [idempotencyLogDir(vault)],
-    prefAuditSweepDirs,
-    (vault: string) => [metricsDir(vault)],
-    (vault: string) => [brainStateDirPath(vault)],
-  ]);
+interface LedgerSweep {
+  readonly resolve: (vault: string, uncertain: DoctorUncertainEntry[]) => string[];
+  /**
+   * The directory also holds files that are not ledger shards (notes,
+   * atomically replaced JSON state). There only a copy carrying the JSON
+   * Lines ledger extension is a split-off shard; any other copy is a
+   * conflict of a whole file and is reported with its own remedy.
+   */
+  readonly mixed: boolean;
+}
+
+const LEDGER_DIRS: ReadonlyArray<LedgerSweep> = Object.freeze([
+  { resolve: (vault: string) => [brainDirs(vault).log], mixed: false },
+  {
+    resolve: (vault: string) =>
+      BRAIN_LOG_AUDIT_DIRS.map((name) => join(brainDirs(vault).log, name)),
+    mixed: false,
+  },
+  { resolve: (vault: string) => [schemaMutationAuditDir(vault)], mixed: false },
+  { resolve: (vault: string) => [watchdogFallbackAuditDir(vault)], mixed: false },
+  { resolve: (vault: string) => [hookAuditDir(vault)], mixed: false },
+  { resolve: (vault: string) => [continuityLogDir(vault)], mixed: false },
+  { resolve: (vault: string) => [idempotencyLogDir(vault)], mixed: false },
+  { resolve: prefAuditSweepDirs, mixed: false },
+  { resolve: (vault: string) => [metricsDir(vault)], mixed: false },
+  { resolve: (vault: string) => [brainStateDirPath(vault)], mixed: false },
+  // The verifier-rejection ledger sits at the proposals root, next to the
+  // proposal files. Named through the path constant rather than
+  // `verifierRejectionLedgerPath`: `skill-proposals.ts` reaches the doctor,
+  // so importing it here closes an import cycle.
+  {
+    resolve: (vault: string) => [ensureInsideVault(join(vault, BRAIN_SKILL_PROPOSALS_REL), vault)],
+    mixed: true,
+  },
+  // Preference edit-history shards sit next to the preference notes.
+  { resolve: (vault: string) => [brainDirs(vault).preferences], mixed: true },
+  // Each repository's commits shards sit next to its state.json.
+  { resolve: gitStoreSweepDirs, mixed: true },
+]);
+
+/** What to do with a conflict copy of a ledger shard. */
+const LEDGER_COPY_REMEDY =
+  "Merge its rows into the shard it was split from (union + dedup by timestamp and " +
+  "content), then delete it.";
+
+/** What to do with a conflict copy of a whole file that is not a ledger shard. */
+const FILE_COPY_REMEDY =
+  "It is not a ledger shard: compare it with the file it was copied from, keep the right " +
+  "version by hand, then delete the copy.";
 
 /**
  * The preference audit keeps one DIRECTORY per preference
  * (`pref-audit/<pref-id>/`), so its shards - and therefore any conflict
  * copy of one - live a level below the others. Sweeping only the parent
  * would report a clean ledger while a copy nobody merges sat inside it.
- *
- * A parent that cannot be listed is reported by name through the shared
- * swept-path reporter rather than read as "no preferences": the whole
- * point of this check is to keep "nothing found" and "nothing looked at"
- * apart.
  */
 function prefAuditSweepDirs(vault: string, uncertain: DoctorUncertainEntry[]): string[] {
   const parent = prefAuditDir(vault);
+  return [parent, ...subdirectories(parent, uncertain, "per-preference")];
+}
+
+/**
+ * The git store keeps one directory per repository
+ * (`Brain/projects/git/<repo>/`), each holding its own `commits` shards,
+ * so the repositories are discovered from the tree on every pass. The
+ * root itself holds no ledger. Its path comes from the store's own
+ * root builder rather than being spelled a second time here.
+ */
+function gitStoreSweepDirs(vault: string, uncertain: DoctorUncertainEntry[]): string[] {
+  return subdirectories(gitStoreRootDir(vault), uncertain, "per-repository");
+}
+
+/**
+ * The immediate subdirectories of `parent`. A parent that cannot be
+ * listed is reported by name through the shared swept-path reporter
+ * rather than read as "no subdirectories": the whole point of this check
+ * is to keep "nothing found" and "nothing looked at" apart. An absent
+ * parent is simply empty.
+ */
+function subdirectories(parent: string, uncertain: DoctorUncertainEntry[], kind: string): string[] {
   const entries = readSweptDir(
     parent,
     {
       site: SYNC_CONFLICT_SITE,
       consequence:
-        "its per-preference subdirectories were not listed for Syncthing conflict copies, so a " +
+        `its ${kind} subdirectories were not listed for Syncthing conflict copies, so a ` +
         "leftover copy waiting to be merged is missing from this report",
       uncertain,
     },
     SWEEP_ORIGIN.root,
   );
-  if (entries === null) return [parent];
-  return [parent, ...entries.filter((e) => e.isDirectory()).map((e) => join(parent, e.name))];
+  if (entries === null) return [];
+  return entries.filter((e) => e.isDirectory()).map((e) => join(parent, e.name));
 }
 
 /**
@@ -136,10 +199,10 @@ function prefAuditSweepDirs(vault: string, uncertain: DoctorUncertainEntry[]): s
 export const syncConflictLogCheck: DoctorCheck = {
   failSoft: true,
   run({ vault }, { issues, uncertain }) {
-    for (const resolve of LEDGER_DIRS) {
+    for (const sweep of LEDGER_DIRS) {
       let ledgerDirs: string[];
       try {
-        ledgerDirs = resolve(vault, uncertain);
+        ledgerDirs = sweep.resolve(vault, uncertain);
       } catch {
         // A directory whose own resolver refuses (a vault path that
         // escapes its root) is not a directory this sweep can visit;
@@ -148,14 +211,14 @@ export const syncConflictLogCheck: DoctorCheck = {
       }
       for (const ledgerDir of ledgerDirs) {
         for (const path of listSyncConflicts(ledgerDir, uncertain)) {
+          const ledgerCopy = !sweep.mixed || path.endsWith(`.${JSONL_LEDGER_EXT}`);
           issues.push({
             severity: "warning",
             code: "sync-conflict-log",
             path,
             message:
               `Syncthing sync-conflict copy under ${vaultRelative(ledgerDir, vault)}/: ${path}. ` +
-              "Merge its rows into the shard it was split from (union + dedup by timestamp and " +
-              "content), then delete it.",
+              (ledgerCopy ? LEDGER_COPY_REMEDY : FILE_COPY_REMEDY),
           });
         }
       }
@@ -174,7 +237,7 @@ const SYNC_CONFLICT_SITE = "brain.doctor.syncConflictLog";
  * a throw. Swallowed by the pass's fail-soft arm it produced no finding
  * at all, which reads as "no conflict copies" - the answer this check
  * exists to distinguish from "the directory was not read". Reported per
- * directory, so one unreadable ledger does not silence the other five.
+ * directory, so one unreadable ledger does not silence the others.
  */
 function listSyncConflicts(dir: string, uncertain: DoctorUncertainEntry[]): string[] {
   try {

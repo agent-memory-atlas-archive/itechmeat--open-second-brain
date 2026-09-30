@@ -15,7 +15,7 @@
  * any operation commits.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -38,8 +38,9 @@ import { BRAIN_LOG_EVENT_KIND } from "../../src/core/brain/types.ts";
 import { WRITE_BATCH_TOOLS } from "../../src/mcp/brain/write-batch-tools.ts";
 import { NOTES_TOOLS } from "../../src/mcp/brain/notes-tools.ts";
 import { MAX_BATCH_OPERATIONS } from "../../src/core/brain/write-batch.ts";
+import * as ledger from "../../src/core/brain/idempotency-ledger.ts";
 import { PAGE_LINT_KEY } from "../../src/core/brain/page-lint.ts";
-import { MCPError } from "../../src/mcp/protocol.ts";
+import { INVALID_PARAMS, MCPError } from "../../src/mcp/protocol.ts";
 import type { ServerContext } from "../../src/mcp/tool-contract.ts";
 
 /**
@@ -550,5 +551,105 @@ describe("brain_write_batch - mtime stability on byte-identical rewrites", () =>
     });
     expect(readFileSync(join(vault, "Notes/Appended.md"), "utf8")).toContain("base");
     expect(readFileSync(join(vault, "Notes/Appended.md"), "utf8")).toContain("more");
+  });
+});
+
+describe("brain_write_batch request receipts (t_b34439d9)", () => {
+  const OPS = [{ op: "create_note", path: "Notes/Receipted.md", content: "written once" }];
+
+  test("a request_id returns a receipt, and a retry returns the retained duplicate", async () => {
+    const first = (await tool.handler(ctx, {
+      operations: OPS,
+      request_id: "req-42",
+    })) as Record<string, unknown>;
+    expect(first["request_id"]).toBe("req-42");
+    expect(first["receipt"]).toBe("applied");
+    expect(first["applied"]).toBe(1);
+
+    const retry = (await tool.handler(ctx, {
+      operations: OPS,
+      request_id: "req-42",
+    })) as Record<string, unknown>;
+    expect(retry["request_id"]).toBe("req-42");
+    expect(retry["receipt"]).toBe("duplicate");
+    // The retained original receipt: the batch reports what the FIRST call
+    // applied, and nothing new lands.
+    expect(retry["applied"]).toBe(1);
+    expect(existsSync(join(vault, "Notes/Receipted.md"))).toBe(true);
+  });
+
+  test("a request_id omitted leaves the payload without receipt fields", async () => {
+    const res = (await tool.handler(ctx, { operations: OPS })) as Record<string, unknown>;
+    expect(Object.hasOwn(res, "request_id")).toBe(false);
+    expect(Object.hasOwn(res, "receipt")).toBe(false);
+  });
+
+  test("a concurrent duplicate recorded mid-batch reaches the caller by its own status", async () => {
+    const LOG_OPS = [{ op: "append_log_line", text: "concurrent receipt line" }];
+    await tool.handler(ctx, { operations: LOG_OPS, request_id: "req-race" });
+    // The unlocked consult misses the rival's record, as under a concurrent call.
+    const spy = spyOn(ledger, "lookupKey").mockReturnValueOnce(null);
+    try {
+      const res = (await tool.handler(ctx, {
+        operations: LOG_OPS,
+        request_id: "req-race",
+      })) as Record<string, unknown>;
+      expect(res["receipt"]).toBe("concurrent_duplicate");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("a concurrent record of the same id with another payload: this call's writes landed and the receipt says so", async () => {
+    await tool.handler(ctx, {
+      operations: [{ op: "append_log_line", text: "the rival line" }],
+      request_id: "req-conflict",
+    });
+    const spy = spyOn(ledger, "lookupKey").mockReturnValueOnce(null);
+    try {
+      const res = (await tool.handler(ctx, {
+        operations: OPS,
+        request_id: "req-conflict",
+      })) as Record<string, unknown>;
+      expect(res["receipt"]).toBe("payload_conflict");
+      expect(res["applied"]).toBe(1);
+      expect(res["done"]).toBe(true);
+      expect(String(res["receipt_note"])).toMatch(/writes of this call landed/);
+      expect(existsSync(join(vault, "Notes/Receipted.md"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test.each([
+    ["a number", 7],
+    ["an empty string", ""],
+    ["whitespace", "   "],
+    ["an over-long id", "x".repeat(300)],
+  ])("request_id as %s is INVALID_PARAMS before any write", async (_label, requestId) => {
+    let thrown: unknown = null;
+    try {
+      await tool.handler(ctx, { operations: OPS, request_id: requestId });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(MCPError);
+    expect((thrown as MCPError).code).toBe(INVALID_PARAMS);
+    expect((thrown as MCPError).message).toMatch(/request_id|idempotency key/);
+    expect(existsSync(join(vault, "Notes/Receipted.md"))).toBe(false);
+  });
+
+  test("a duplicate retry lints nothing: the call wrote no page", async () => {
+    const first = (await tool.handler(ctx, { operations: OPS, request_id: "req-lint" })) as Record<
+      string,
+      unknown
+    >;
+    const retry = (await tool.handler(ctx, { operations: OPS, request_id: "req-lint" })) as Record<
+      string,
+      unknown
+    >;
+    expect(retry["receipt"]).toBe("duplicate");
+    expect(PAGE_LINT_KEY in first).toBe(true);
+    expect(PAGE_LINT_KEY in retry).toBe(false);
   });
 });

@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +22,7 @@ import {
   recordQueryDemand,
 } from "../../../src/core/brain/query-demand.ts";
 import { fakeCredential } from "../../helpers/fake-credentials.ts";
+import { withDeviceId } from "../../helpers/device-id.ts";
 
 const SECRET_SHAPED_TERM = fakeCredential("sk-", "abcdef0123456789abcdef0123456789");
 
@@ -286,5 +295,53 @@ describe("rolling cap", () => {
     expect(records.length).toBeLessThan(appends);
     // Compaction keeps recent lines readable and parseable.
     expect(records.every((r) => r.terms.join(" ") === bucketKey)).toBe(true);
+  });
+});
+
+describe("query-demand per-device shards (t_774dea61)", () => {
+  const INPUT = {
+    query: "how does the auth flow work",
+    at: "2026-07-01T00:00:00.000Z",
+    resultCount: 3,
+  };
+
+  test("two devices write two shard files and reads merge both", () => {
+    withDeviceId("a", () => recordQueryDemand(vault, INPUT));
+    withDeviceId("b", () => recordQueryDemand(vault, INPUT));
+    expect(existsSync(join(vault, "Brain", "log", "query-demand.a.jsonl"))).toBe(true);
+    expect(existsSync(join(vault, "Brain", "log", "query-demand.b.jsonl"))).toBe(true);
+    expect(existsSync(join(vault, "Brain", "log", "query-demand.jsonl"))).toBe(false);
+
+    const records = readQueryDemand(vault);
+    expect(records).toHaveLength(2);
+  });
+
+  test("the empty device id keeps the legacy un-sharded file", () => {
+    withDeviceId("", () => recordQueryDemand(vault, INPUT));
+    expect(existsSync(join(vault, "Brain", "log", "query-demand.jsonl"))).toBe(true);
+    expect(readQueryDemand(vault)).toHaveLength(1);
+  });
+
+  test("compaction after a write on one device caps only that device's shard", () => {
+    const logDir = join(vault, "Brain", "log");
+    mkdirSync(logDir, { recursive: true });
+    const line =
+      JSON.stringify({ ts: INPUT.at, terms: ["auth", "flow"], results: 3, coverage: 0.5 }) + "\n";
+    // Both shards already sit over the byte budget. Only the shard the
+    // write lands on may be rewritten; the peer's file is not this
+    // device's to touch, however large it is.
+    const overBudget = line.repeat(Math.ceil(DEMAND_LOG_MAX_BYTES / line.length) + 1);
+    const ownShard = join(logDir, "query-demand.a.jsonl");
+    const peerShard = join(logDir, "query-demand.b.jsonl");
+    writeFileSync(ownShard, overBudget, "utf8");
+    writeFileSync(peerShard, overBudget, "utf8");
+
+    withDeviceId("a", () => {
+      expect(queryDemandLogPath(vault)).toBe(ownShard);
+      recordQueryDemand(vault, INPUT);
+    });
+
+    expect(statSync(ownShard).size).toBeLessThanOrEqual(DEMAND_LOG_MAX_BYTES);
+    expect(readFileSync(peerShard, "utf8")).toBe(overBudget);
   });
 });

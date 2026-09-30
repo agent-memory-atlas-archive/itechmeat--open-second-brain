@@ -41,6 +41,7 @@ import { join } from "node:path";
 
 import { canonicalJson, sha256Hex } from "../integrity/digest.ts";
 import {
+  JSONL_LEDGER_EXT,
   listShardedFiles,
   resolveAppendShardId,
   shardedFileName,
@@ -55,13 +56,13 @@ import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 const IDEMPOTENCY_REL = `${BRAIN_ROOT_REL}/logs/idempotency`;
 
 /** Shard base: one file per UTC month, per device. */
-const MONTH_RE = /^\d{4}-\d{2}$/;
-const IDEMPOTENCY_EXT = "jsonl";
+const MONTH_BASE = "\\d{4}-\\d{2}";
+const MONTH_RE = new RegExp(`^${MONTH_BASE}$`);
 
 /** The ledger's file-name layout, handed to the shared shard grammar. */
 const IDEMPOTENCY_GRAMMAR: LedgerShardGrammar = Object.freeze({
-  base: "\\d{4}-\\d{2}",
-  extensions: Object.freeze([IDEMPOTENCY_EXT]),
+  base: MONTH_BASE,
+  extensions: Object.freeze([JSONL_LEDGER_EXT]),
 });
 
 /** Hard cap on a client key. Long enough for `<session-id>:<slug>` joins. */
@@ -80,6 +81,14 @@ export type RememberKeyStatus = (typeof REMEMBER_KEY_STATUS)[keyof typeof REMEMB
  * original write's identity (e.g. `{ id, path }`). */
 export interface IdempotencyRecord {
   readonly key: string;
+  /**
+   * The key space the record belongs to. Absent is the shared key space of
+   * the historical writers (signal, apply-evidence, preference, session
+   * checkpoint), whose records never carry the field. A writer whose keys
+   * come from a different client vocabulary names its own namespace, so a
+   * string reused across tools never collides.
+   */
+  readonly namespace?: string;
   readonly contentHash: string;
   readonly createdAt: string;
   readonly ref?: Readonly<Record<string, unknown>>;
@@ -87,6 +96,8 @@ export interface IdempotencyRecord {
 
 export interface RememberKeyInput {
   readonly key: string;
+  /** See {@link IdempotencyRecord.namespace}. Absent keeps the shared key space. */
+  readonly namespace?: string;
   readonly contentHash: string;
   /** Canonical UTC ISO-8601; defaults to `isoSecond(new Date())`. Drives the
    * month shard, so a backfilled write lands in its real month. */
@@ -102,6 +113,19 @@ export interface RememberKeyResult {
    * (so callers can read the original `contentHash` / `ref`).
    */
   readonly record: IdempotencyRecord;
+}
+
+/**
+ * Thrown for a client key the ledger cannot store: not a string, blank
+ * after trimming, or longer than the cap. A caller-side mistake, so a
+ * transport maps it to its invalid-parameters error rather than to a
+ * server fault.
+ */
+export class IdempotencyKeyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IdempotencyKeyError";
+  }
 }
 
 /**
@@ -164,7 +188,7 @@ export function idempotencyLogPath(
 ): string {
   if (!MONTH_RE.test(month)) throw new Error(`invalid idempotency month: ${month}`);
   return ensureInsideVault(
-    join(vault, IDEMPOTENCY_REL, shardedFileName(month, shardId, IDEMPOTENCY_EXT)),
+    join(vault, IDEMPOTENCY_REL, shardedFileName(month, shardId, JSONL_LEDGER_EXT)),
     vault,
   );
 }
@@ -173,16 +197,22 @@ export function idempotencyLogPath(
  * Look up the stored record for a client key across EVERY shard of every
  * month. Returns the first-written record for the key (shards read in
  * ascending file-name order, lines in append order) or `null` when the
- * key is unseen.
+ * key is unseen. `namespace` selects the key space (see
+ * {@link IdempotencyRecord.namespace}); absent matches only records of the
+ * shared key space, so the historical callers read exactly what they wrote.
  *
  * The scan spans devices on purpose: a key remembered on one machine has
  * to be honoured on another once Syncthing has delivered its shard, or
  * the retry this ledger exists to dedupe would go through twice.
  */
-export function lookupKey(vault: string, key: string): IdempotencyRecord | null {
+export function lookupKey(
+  vault: string,
+  key: string,
+  namespace?: string,
+): IdempotencyRecord | null {
   const normalised = normaliseKey(key);
   for (const record of readAllRecords(vault)) {
-    if (record.key === normalised) return record;
+    if (record.key === normalised && record.namespace === namespace) return record;
   }
   return null;
 }
@@ -208,7 +238,7 @@ export function rememberKey(vault: string, input: RememberKeyInput): RememberKey
     // The lock is on THIS device's shard - the only file this call can
     // append to - while the scan still spans every shard, so a key a
     // synced peer already remembered is honoured here too.
-    const existing = lookupKey(vault, key);
+    const existing = lookupKey(vault, key, input.namespace);
     if (existing) {
       return {
         status:
@@ -220,6 +250,7 @@ export function rememberKey(vault: string, input: RememberKeyInput): RememberKey
     }
     const record: IdempotencyRecord = Object.freeze({
       key,
+      ...(input.namespace !== undefined ? { namespace: input.namespace } : {}),
       contentHash,
       createdAt,
       ...(input.ref !== undefined ? { ref: input.ref } : {}),
@@ -235,11 +266,11 @@ export function rememberKey(vault: string, input: RememberKeyInput): RememberKey
 
 function normaliseKey(key: unknown): string {
   if (typeof key !== "string" || key.trim() === "") {
-    throw new Error("idempotency key must be a non-empty string");
+    throw new IdempotencyKeyError("idempotency key must be a non-empty string");
   }
   const trimmed = key.trim();
   if (trimmed.length > KEY_MAX_LEN) {
-    throw new Error(`idempotency key too long (max ${KEY_MAX_LEN} chars)`);
+    throw new IdempotencyKeyError(`idempotency key too long (max ${KEY_MAX_LEN} chars)`);
   }
   return trimmed;
 }
@@ -253,7 +284,7 @@ function requireHash(hash: unknown): string {
 
 function monthOf(createdAt: string): string {
   const month = createdAt.slice(0, 7);
-  if (!/^\d{4}-\d{2}$/.test(month)) {
+  if (!MONTH_RE.test(month)) {
     throw new Error(
       `idempotency createdAt must start with YYYY-MM; got ${JSON.stringify(createdAt)}`,
     );

@@ -10,7 +10,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -22,10 +22,12 @@ import {
   literalBase,
   mergeShardedRows,
   parseShardedName,
+  readShardedLines,
   resolveAppendShardId,
   shardedFileName,
   type LedgerShardGrammar,
 } from "../../../src/core/brain/ledger-shards.ts";
+import { CHMOD_CANNOT_DENY } from "../../helpers/platform.ts";
 
 const MONTH_GRAMMAR: LedgerShardGrammar = Object.freeze({
   base: "\\d{4}-\\d{2}",
@@ -260,5 +262,39 @@ describe("the shard id shape", () => {
     expect(LEDGER_SHARD_ID_RE.test("")).toBe(false);
     expect(LEDGER_SHARD_ID_RE.test("Bad")).toBe(false);
     expect(LEDGER_SHARD_ID_RE.test("a".repeat(33))).toBe(false);
+  });
+});
+
+describe("readShardedLines", () => {
+  test("merges every shard in name order, legacy file first, skipping blank lines", () => {
+    const shards = join(dir, "lines-x");
+    mkdirSync(shards, { recursive: true });
+    writeFileSync(join(shards, "led.b.jsonl"), '["b1"]\n\n["b2"]\n', "utf8");
+    writeFileSync(join(shards, "led.jsonl"), '["legacy"]\n', "utf8");
+    writeFileSync(join(shards, "led.a.jsonl"), '["a1"]\n', "utf8");
+    // A conflict copy is never a shard.
+    writeFileSync(join(shards, "led.sync-conflict-x.jsonl"), '["conflict"]\n', "utf8");
+
+    const lines = readShardedLines(shards, { base: "led", extensions: ["jsonl"] });
+    expect(lines).toEqual(['["a1"]', '["b1"]', '["b2"]', '["legacy"]']);
+  });
+
+  test("an absent directory lists nothing", () => {
+    expect(
+      readShardedLines(join(dir, "missing-x"), { base: "led", extensions: ["jsonl"] }),
+    ).toEqual([]);
+  });
+
+  test.skipIf(CHMOD_CANNOT_DENY)("an unreadable directory throws its own error by code", () => {
+    const locked = join(dir, "unreadable-x");
+    mkdirSync(locked, { recursive: true });
+    chmodSync(locked, 0o000);
+    try {
+      expect(() => readShardedLines(locked, { base: "led", extensions: ["jsonl"] })).toThrow(
+        /EACCES/,
+      );
+    } finally {
+      chmodSync(locked, 0o755);
+    }
   });
 });

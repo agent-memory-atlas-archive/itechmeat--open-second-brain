@@ -16,8 +16,13 @@ import { containsCjk, tokenizeCjkSearchText } from "./cjk-tokenizer.ts";
 import { keywordTopKWithFtsSafety, type SafeKeywordOutcome } from "./fts-safety.ts";
 import { RETRIEVAL_DEGRADATION, noteDegradation } from "./retrieval-trail.ts";
 import type { RetrievalDegradationSink } from "./retrieval-trail.ts";
+import { FTS_MATCH_MODE, type FtsMatchMode } from "./fts-match-mode.ts";
 
 const FTS5_OPERATOR_TOKENS = new Set(["AND", "OR", "NOT", "NEAR"]);
+
+export interface FtsMatchOptions {
+  readonly matchMode?: FtsMatchMode;
+}
 
 function quoteToken(t: string): string {
   return `"${t.replace(/"/g, '""')}"`;
@@ -28,11 +33,12 @@ function dropStandaloneOperators(tokens: ReadonlyArray<string>): ReadonlyArray<s
   return withoutOperators.length > 0 ? withoutOperators : tokens;
 }
 
-export function buildFtsMatch(rawQuery: string): string {
+export function buildFtsMatch(rawQuery: string, opts: FtsMatchOptions = {}): string {
   const tokens = containsCjk(rawQuery) ? tokenizeCjkSearchText(rawQuery) : rawQuery.split(/\s+/);
   const cleaned = tokens.map((t) => t.trim()).filter((t) => t.length > 0);
   if (cleaned.length === 0) return "";
-  return dropStandaloneOperators(cleaned).map(quoteToken).join(" ");
+  const kept = dropStandaloneOperators(cleaned).map(quoteToken);
+  return opts.matchMode === FTS_MATCH_MODE.any ? kept.join(" OR ") : kept.join(" ");
 }
 
 /**
@@ -44,13 +50,16 @@ export function buildFtsMatch(rawQuery: string): string {
  *   ("orig1" "orig2") OR "exp1" OR "exp2"
  *
  * With no expansion terms this is byte-identical to {@link buildFtsMatch},
- * so expansion is a true no-op when disabled or empty.
+ * so expansion is a true no-op when disabled or empty. In `any` mode the
+ * base group is itself OR-joined - `("orig1" OR "orig2") OR "exp1"` - which
+ * is semantically the flat ANY superset through the same composition.
  */
 export function buildExpandedFtsMatch(
   rawQuery: string,
   expandedTerms: ReadonlyArray<string>,
+  opts: FtsMatchOptions = {},
 ): string {
-  const base = buildFtsMatch(rawQuery);
+  const base = buildFtsMatch(rawQuery, opts);
   if (base === "" || expandedTerms.length === 0) return base;
   const ors = expandedTerms.map(quoteToken).join(" OR ");
   return `(${base}) OR ${ors}`;
@@ -65,6 +74,12 @@ export interface RunFtsOptions {
    * recall; absent/empty leaves the query byte-identical.
    */
   readonly expandedTerms?: ReadonlyArray<string>;
+  /**
+   * Caller-selectable match breadth (t_c5326ece). Default `all` keeps the
+   * implicit AND; `any` OR-joins the cleaned tokens. The derived-term and
+   * second-pass internal callers leave it unset.
+   */
+  readonly matchMode?: FtsMatchMode;
   /**
    * Optional typed degradation sink (evidence-at-the-boundary, C2), the
    * counterpart of the warnings the outcome already returns. An empty
@@ -84,8 +99,8 @@ export function runFtsQueryDetailed(
 ): SafeKeywordOutcome {
   const match =
     opts.expandedTerms && opts.expandedTerms.length > 0
-      ? buildExpandedFtsMatch(rawQuery, opts.expandedTerms)
-      : buildFtsMatch(rawQuery);
+      ? buildExpandedFtsMatch(rawQuery, opts.expandedTerms, { matchMode: opts.matchMode })
+      : buildFtsMatch(rawQuery, { matchMode: opts.matchMode });
   if (match === "") {
     // The purest silent empty in the pipeline: every token was dropped,
     // so no lookup ran at all and the caller was handed the same empty

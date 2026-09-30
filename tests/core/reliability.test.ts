@@ -3,10 +3,20 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { appendAuditRecord } from "../../src/core/reliability/audit.ts";
+import {
+  appendAuditRecord,
+  AUDIT_WEEK_SHARD_GRAMMAR,
+  isoWeekLabel,
+} from "../../src/core/reliability/audit.ts";
+import {
+  JSONL_LEDGER_EXT,
+  parseShardedName,
+  shardedFileName,
+} from "../../src/core/brain/ledger-shards.ts";
 import { withFileLock } from "../../src/core/reliability/lock.ts";
 import { buildProbeReport } from "../../src/core/reliability/probe.ts";
 import { fakeCredential } from "../helpers/fake-credentials.ts";
+import { withDeviceId } from "../helpers/device-id.ts";
 
 const RESEARCH_TYPE = "research";
 const LOGGED_KEY = fakeCredential("secret-", "value");
@@ -91,6 +101,36 @@ describe("appendAuditRecord", () => {
     expect(lines[0]).not.toContain(LOGGED_KEY);
   });
 
+  test("the device id shards the week file name (t_774dea61)", () => {
+    const auditRoot = join(tmp, "Brain", "log", "device-sharded");
+    const record = {
+      timestamp: "2026-05-30T12:00:00.000Z",
+      actor: "tester",
+      action: "probe",
+      target: "Brain/x",
+      ok: true,
+    };
+    const onA = withDeviceId("a", () =>
+      appendAuditRecord(auditRoot, { ...record, action: "from-a" }),
+    );
+    const onB = withDeviceId("b", () =>
+      appendAuditRecord(auditRoot, { ...record, action: "from-b" }),
+    );
+    expect(onA.endsWith("2026-W22.a.jsonl")).toBe(true);
+    expect(onB.endsWith("2026-W22.b.jsonl")).toBe(true);
+    expect(existsSync(join(auditRoot, "2026-W22.a.jsonl"))).toBe(true);
+    expect(existsSync(join(auditRoot, "2026-W22.b.jsonl"))).toBe(true);
+    expect(existsSync(join(auditRoot, "2026-W22.jsonl"))).toBe(false);
+
+    // The empty device id is the legacy un-sharded file: names and bytes
+    // unchanged, no migration.
+    const legacy = withDeviceId("", () =>
+      appendAuditRecord(auditRoot, { ...record, action: "legacy" }),
+    );
+    expect(legacy.endsWith("2026-W22.jsonl")).toBe(true);
+    expect(existsSync(join(auditRoot, "2026-W22.jsonl"))).toBe(true);
+  });
+
   test("rejects invalid timestamps before week bucketing", () => {
     expect(() =>
       appendAuditRecord(join(tmp, "Brain", "log", "schema-mutations"), {
@@ -128,5 +168,20 @@ describe("buildProbeReport", () => {
       "search_index",
       "snapshot_restore",
     ]);
+  });
+});
+
+describe("audit week shard grammar", () => {
+  test("the reader grammar parses every name the writer composes, and nothing else", () => {
+    const week = isoWeekLabel(new Date("2026-01-01T12:00:00Z"));
+    for (const shardId of ["", "laptop-01"]) {
+      const name = shardedFileName(week, shardId, JSONL_LEDGER_EXT);
+      expect(parseShardedName(name, AUDIT_WEEK_SHARD_GRAMMAR)).toMatchObject({
+        base: week,
+        shardId,
+      });
+    }
+    expect(parseShardedName(`${week}.md`, AUDIT_WEEK_SHARD_GRAMMAR)).toBeNull();
+    expect(parseShardedName("2026-01.jsonl", AUDIT_WEEK_SHARD_GRAMMAR)).toBeNull();
   });
 });

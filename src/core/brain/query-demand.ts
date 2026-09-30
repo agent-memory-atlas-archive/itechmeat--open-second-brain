@@ -22,18 +22,22 @@
  * (never the raw query), each run through the secret redactor, so a
  * query carrying a token or path cannot leak into the log.
  *
- * Storage: `Brain/log/query-demand.jsonl`, one JSON record per line,
- * rolling and byte-budget-capped (see {@link DEMAND_LOG_MAX_BYTES}).
+ * Storage: one shard per device, `Brain/log/query-demand[.<deviceId>].jsonl`
+ * (the empty device id keeps the legacy un-sharded name), one JSON record
+ * per line. Each device appends to and compacts only its own shard, within
+ * the byte budget (see {@link DEMAND_LOG_MAX_BYTES}); reads merge every
+ * shard.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import { atomicWriteFileSync } from "../fs-atomic.ts";
 import { clamp01 } from "../math.ts";
-import { ensureInsideVault } from "../path-safety.ts";
 import { redactRawOutput } from "../redactor.ts";
-import { queryDemandLogPath } from "./paths.ts";
+import { BRAIN_LOG_REL } from "./path-constants.ts";
+import { jsonlLedgerGrammar, readShardedLines } from "./ledger-shards.ts";
+import { QUERY_DEMAND_LEDGER_STEM, queryDemandLogPath } from "./paths.ts";
 import { acquireLockSync } from "./sync-lockfile.ts";
 import {
   COMPLETENESS_COMPLETE_THRESHOLD,
@@ -222,6 +226,9 @@ function isSecretShapedTerm(term: string): boolean {
   return /[a-z]/.test(term) && /[0-9]/.test(term);
 }
 
+/** The demand ledger's file-name layout, handed to the shared shard grammar. */
+const DEMAND_LEDGER_GRAMMAR = jsonlLedgerGrammar(QUERY_DEMAND_LEDGER_STEM);
+
 /**
  * Append one recall observation to the demand log. Terms are derived
  * from `terms` (redacted) or `query` (normalized+redacted); a query with
@@ -247,8 +254,11 @@ export function recordQueryDemand(
   };
   // Vault-identity write guard (context-integrity-gates, Unit J).
   assertVaultIdentityForWrite(vault);
+  // Per-device shard (t_774dea61): this device appends to a file no other
+  // device writes, and the per-file lock plus the in-place compaction are
+  // scoped to that one shard.
   const path = queryDemandLogPath(vault);
-  mkdirSync(ensureInsideVault(dirname(path), vault), { recursive: true });
+  mkdirSync(dirname(path), { recursive: true });
   const handle = acquireLockSync(path);
   try {
     appendFileSync(path, `${JSON.stringify(record)}\n`, { encoding: "utf8" });
@@ -327,8 +337,9 @@ export function readQueryDemand(
   vault: string,
   filter: QueryDemandFilter = {},
 ): ReadonlyArray<QueryDemandRecord> {
-  const path = queryDemandLogPath(vault);
-  if (!existsSync(path)) return Object.freeze([]);
+  // Merged read over every device's shard (t_774dea61); the absent
+  // directory lists nothing, which is the same empty result as before.
+  const lines = readShardedLines(join(vault, BRAIN_LOG_REL), DEMAND_LEDGER_GRAMMAR);
   // Normalize the filter bounds to the same millisecond-precision form the
   // stored `ts` already uses (records are normalized at write time). The
   // comparison below is lexical, so a second-precision `--since
@@ -338,8 +349,7 @@ export function readQueryDemand(
   const since = filter.since !== undefined ? normalizeDemandTimestamp(filter.since) : undefined;
   const until = filter.until !== undefined ? normalizeDemandTimestamp(filter.until) : undefined;
   const out: QueryDemandRecord[] = [];
-  for (const line of readFileSync(path, "utf8").split("\n")) {
-    if (!line.trim()) continue;
+  for (const line of lines) {
     const record = coerceRecord(line);
     if (record === null) continue;
     if (since !== undefined && record.ts < since) continue;
@@ -522,13 +532,10 @@ function coerceRecord(line: string): QueryDemandRecord | null {
  * O(1) until the rare compaction.
  */
 function compactIfNeeded(path: string): void {
-  let size: number;
-  try {
-    size = statSync(path).size;
-  } catch {
-    return;
-  }
-  if (size <= DEMAND_LOG_MAX_BYTES) return;
+  // Only a vanished shard is "nothing to compact"; any other stat failure
+  // (EACCES, EIO) propagates by its code instead of leaving the cap unchecked.
+  const size = statSync(path, { throwIfNoEntry: false })?.size;
+  if (size === undefined || size <= DEMAND_LOG_MAX_BYTES) return;
   const lines = readFileSync(path, "utf8")
     .split("\n")
     .filter((line) => line.trim().length > 0);

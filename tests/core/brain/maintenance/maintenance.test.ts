@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -44,6 +44,7 @@ import {
 } from "../../../../src/core/brain/recall-telemetry.ts";
 import { bootstrapBrain } from "../../../../src/core/brain/init.ts";
 import { atomicWriteFileSync } from "../../../../src/core/fs-atomic.ts";
+import { withDeviceId } from "../../../helpers/device-id.ts";
 
 const NOW = new Date("2026-06-05T03:30:00Z");
 
@@ -496,5 +497,72 @@ describe("the consecutive-failure streak", () => {
     const forced = await laneRun(true, true);
     expect(forced.tasks[0]!.ok).toBe(true);
     expect(consecutiveTaskFailures(vault, TASK)).toBe(0);
+  });
+});
+
+describe("maintenance journal per-device shards (t_774dea61)", () => {
+  test("two devices write their own shards; lists merge and the sweep trims only the local shard", () => {
+    appendAs("a", "2026-06-01T10:00:00Z", false);
+    appendAs("b", "2026-06-01T10:01:00Z", true);
+    const derived = join(vault, ".open-second-brain");
+    expect(existsSync(join(derived, "maintenance-runs.a.jsonl"))).toBe(true);
+    expect(existsSync(join(derived, "maintenance-runs.b.jsonl"))).toBe(true);
+    expect(existsSync(join(derived, "maintenance-runs.jsonl"))).toBe(false);
+
+    expect(listJournal(vault)).toHaveLength(2);
+
+    // The cap sweep rewrites only the local device's shard: host b's
+    // shard is trimmed to the cap, host a's rows stay on disk.
+    withDeviceId("b", () => sweepJournal(vault, 1));
+    expect(listJournal(vault)).toHaveLength(2);
+    const bShard = readFileSync(join(derived, "maintenance-runs.b.jsonl"), "utf8")
+      .trim()
+      .split("\n");
+    expect(bShard).toHaveLength(1);
+    expect(readFileSync(join(derived, "maintenance-runs.a.jsonl"), "utf8").trim()).toContain(
+      "host-a",
+    );
+  });
+});
+
+function appendAs(device: string, ts: string, ok: boolean): void {
+  withDeviceId(device, () =>
+    appendJournal(vault, {
+      ts,
+      holder: `host-${device}`,
+      verdict: MAINTENANCE_VERDICT.run,
+      task: LANE_TASK.dream,
+      ok,
+    }),
+  );
+}
+
+describe("maintenance journal merged order across devices (t_774dea61)", () => {
+  test("the merged list is newest-first by timestamp, and the streak walks that order", () => {
+    // Device a's newest failure is newer than device b's success, but a's
+    // shard sorts first by name: a name-order merge put b's success on top
+    // and read the live streak as zero.
+    appendAs("a", "2026-06-01T10:00:00.000Z", false);
+    appendAs("a", "2026-06-01T10:04:00.000Z", false);
+    appendAs("b", "2026-06-01T10:02:00.000Z", true);
+
+    expect(listJournal(vault).map((entry) => entry.ts)).toEqual([
+      "2026-06-01T10:04:00.000Z",
+      "2026-06-01T10:02:00.000Z",
+      "2026-06-01T10:00:00.000Z",
+    ]);
+    expect(consecutiveTaskFailures(vault, LANE_TASK.dream)).toBe(1);
+  });
+
+  test("one shard keeps its own file order even when its timestamps are not monotonic", () => {
+    appendAs("a", "2026-06-01T10:05:00.000Z", true);
+    // A clock stepped back: the row appended later carries the older stamp.
+    appendAs("a", "2026-06-01T10:01:00.000Z", false);
+
+    expect(listJournal(vault).map((entry) => entry.ts)).toEqual([
+      "2026-06-01T10:01:00.000Z",
+      "2026-06-01T10:05:00.000Z",
+    ]);
+    expect(consecutiveTaskFailures(vault, LANE_TASK.dream)).toBe(1);
   });
 });

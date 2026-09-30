@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -20,6 +20,7 @@ import {
   type EditHistoryEntry,
 } from "../../../../src/core/brain/health/edit-history.ts";
 import { preferenceHistoryPath } from "../../../../src/core/brain/paths.ts";
+import { withDeviceId } from "../../../helpers/device-id.ts";
 
 let vault: string;
 
@@ -108,5 +109,32 @@ describe("renderEditHistory", () => {
 
   test("renders an empty timeline as a stable placeholder", () => {
     expect(renderEditHistory([]).trim().length).toBeGreaterThan(0);
+  });
+});
+
+describe("edit-history per-device shards (t_774dea61)", () => {
+  test("two devices write two shard files and reads merge both, dedupe included", () => {
+    withDeviceId("a", () =>
+      appendEditHistory(vault, "alpha", [entry({ revision: 1, after: "spaces" })]),
+    );
+    withDeviceId("b", () =>
+      appendEditHistory(vault, "alpha", [entry({ revision: 2, after: "tabs again" })]),
+    );
+    // A shard of one device carries no revision 2; a plain read of it
+    // would not dedupe a cross-device replay, so the merged read must
+    // see both files before the dedupe.
+    expect(existsSync(join(vault, "Brain", "preferences", "pref-alpha.history.a.jsonl"))).toBe(
+      true,
+    );
+    expect(existsSync(join(vault, "Brain", "preferences", "pref-alpha.history.b.jsonl"))).toBe(
+      true,
+    );
+
+    const replay = withDeviceId("b", () =>
+      appendEditHistory(vault, "alpha", [entry({ revision: 1, after: "spaces" })]),
+    );
+    expect(replay).toBe(0);
+    const merged = readEditHistory(vault, "alpha");
+    expect(merged.map((e) => e.revision).toSorted()).toEqual([1, 2]);
   });
 });

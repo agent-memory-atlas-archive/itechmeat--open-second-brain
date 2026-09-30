@@ -931,7 +931,7 @@ export const VERB_HELP: Record<string, string> = {
     "Read opt-in recall telemetry continuity records and aggregate coverage gaps. cost folds write volume (feedback/apply-evidence/note/host writes) against reads into a write-vs-read ratio, a write-heavy flag, and a rough weighted cost signal per period.\n",
   "knowledge-gaps":
     "usage: o2b brain knowledge-gaps [--min-occurrences <n>] [--max-satisfaction <0..1>] [--since <iso>] [--until <iso>] [--limit <n>] [--vault <path>] [--json]\n" +
-    "Aggregate the persisted cross-query demand log (Brain/log/query-demand.jsonl) into recurring queries the vault answers poorly. Buckets by normalized query terms and ranks by frequency x (1 - satisfaction), where satisfaction is the reused IDF-weighted coverage (or the non-empty-result fraction when coverage was not recorded). Turns repeated recall failures into a prioritized backlog of what to write next. Read-only; the log is written only by opt-in recall telemetry.\n",
+    "Aggregate the persisted cross-query demand log (Brain/log/query-demand[.<deviceId>].jsonl, every device's shard merged) into recurring queries the vault answers poorly. Buckets by normalized query terms and ranks by frequency x (1 - satisfaction), where satisfaction is the reused IDF-weighted coverage (or the non-empty-result fraction when coverage was not recorded). Turns repeated recall failures into a prioritized backlog of what to write next. Read-only; the log is written only by opt-in recall telemetry.\n",
   "generation-reports":
     "usage: o2b brain generation-reports record <write_session|context_pack|dream_stage> --ref <id> --agent <name> --prompt <text> [--enable] [--provider <p>] [--model <m>] [--finish-reason <r>] [--latency-ms <n>] [--input-tokens <n>] [--output-tokens <n>] [--cached-tokens <n>] [--total-tokens <n>] [--scope <s>] [--source <id[=path]>...] [--created-at <iso>] [--vault <path>] [--json]\n" +
     "       o2b brain generation-reports list [--handoff <kind>] [--agent <name>] [--since <iso>] [--until <iso>] [--limit <n>] [--vault <path>] [--json]\n" +
@@ -1075,6 +1075,9 @@ export const VERB_HELP: Record<string, string> = {
     "phrase via --confirm. A confidence threshold and a hard per-run write cap\n" +
     "bound the writes; existing edges are skipped, so a rerun converges to zero\n" +
     "writes. Inferred candidates are opt-in behind --include-inferred.\n" +
+    "An explicit reference is a mention of a page title or alias that exactly\n" +
+    "one page carries; a term several pages carry binds to none of them and is\n" +
+    "reported as a skip-ambiguous decision naming each carrier.\n" +
     "--apply is gated by the paired graph-efficacy holdout harness: every\n" +
     "proposed edge is checked as an (anchor, target) holdout, graph lift is\n" +
     "counted apart from direct recall, and the apply is refused without writing\n" +

@@ -10,6 +10,15 @@
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import {
+  interleaveShardRows,
+  JSONL_LEDGER_EXT,
+  jsonlLedgerGrammar,
+  readShardLinesByShard,
+  resolveAppendShardId,
+  shardedFileName,
+} from "../ledger-shards.ts";
+import { DERIVED_STORE_DIR } from "../path-constants.ts";
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
 import type { HostPressureUnmeasurableReason } from "./host-pressure.ts";
 import { renameWithRetry } from "../../fs-atomic.ts";
@@ -20,7 +29,7 @@ export const MAINTENANCE_JOURNAL_CAP = 500;
  * What one journal row records.
  *
  * A closed vocabulary rather than a bare union because these values are
- * persisted to `.open-second-brain/maintenance-runs.jsonl` and read back
+ * persisted to `.open-second-brain/maintenance-runs[.<deviceId>].jsonl` and read back
  * by whichever build runs next - across an upgrade, that is not the build
  * that wrote them. The guard is the boundary for a row this build does
  * not understand.
@@ -72,8 +81,23 @@ export interface MaintenanceJournalEntry {
   readonly streak?: number;
 }
 
+/** The journal's shard stem: `maintenance-runs[.<deviceId>].jsonl`. */
+export const MAINTENANCE_JOURNAL_STEM = "maintenance-runs";
+
+/** The journal's file-name layout, handed to the shared shard grammar. */
+const JOURNAL_GRAMMAR = jsonlLedgerGrammar(MAINTENANCE_JOURNAL_STEM);
+
+/**
+ * The journal file THIS device appends to, and the only shard the cap
+ * sweep rewrites: `maintenance-runs[.<deviceId>].jsonl` (t_774dea61). The
+ * empty device id yields the legacy un-sharded name.
+ */
 function journalPath(vault: string): string {
-  return join(vault, ".open-second-brain", "maintenance-runs.jsonl");
+  return join(
+    vault,
+    DERIVED_STORE_DIR,
+    shardedFileName(MAINTENANCE_JOURNAL_STEM, resolveAppendShardId(), JSONL_LEDGER_EXT),
+  );
 }
 
 export function appendJournal(vault: string, entry: MaintenanceJournalEntry): void {
@@ -102,21 +126,47 @@ export function sweepJournal(vault: string, cap: number = MAINTENANCE_JOURNAL_CA
   renameWithRetry(tmp, path);
 }
 
-/** Journal entries, newest first. Unparseable lines are skipped. */
-export function listJournal(vault: string, limit?: number): MaintenanceJournalEntry[] {
-  const lines = readLines(journalPath(vault));
-  const out: MaintenanceJournalEntry[] = [];
-  for (const line of lines) {
-    try {
-      const parsed: unknown = JSON.parse(line);
-      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-        out.push(parsed as MaintenanceJournalEntry);
-      }
-    } catch {
-      // Fail-soft: a torn line never breaks the journal read.
-    }
+/**
+ * When a row was written, as the merge orders it. A row whose stamp does
+ * not parse sorts as the oldest, so it can never displace a readable row
+ * from the head of the newest-first list.
+ */
+function entryTime(entry: MaintenanceJournalEntry): number {
+  const time = Date.parse(entry.ts);
+  return Number.isFinite(time) ? time : Number.NEGATIVE_INFINITY;
+}
+
+/** One journal line as an entry, or `null` for a torn or non-object line. */
+function parseEntry(line: string): MaintenanceJournalEntry | null {
+  try {
+    const parsed: unknown = JSON.parse(line);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as MaintenanceJournalEntry)
+      : null;
+  } catch {
+    // Fail-soft: a torn line never breaks the journal read.
+    return null;
   }
-  out.reverse();
+}
+
+/**
+ * Journal entries, newest first - the one order both this list and
+ * {@link consecutiveTaskFailures} walk.
+ *
+ * Every device's shard (t_774dea61) is interleaved by row timestamp, so a
+ * failure on one device that is newer than a success on another reads as
+ * newer whatever the shard names are; each shard's own append order is
+ * never changed, so a single-shard vault reads exactly as before.
+ * Unparseable lines are skipped.
+ */
+export function listJournal(vault: string, limit?: number): MaintenanceJournalEntry[] {
+  const shards = readShardLinesByShard(dirname(journalPath(vault)), JOURNAL_GRAMMAR).map(
+    (shard) => ({
+      shardId: shard.shardId,
+      rows: shard.rows.map(parseEntry).filter((entry) => entry !== null),
+    }),
+  );
+  const out = interleaveShardRows(shards, entryTime).toReversed();
   return limit !== undefined ? out.slice(0, Math.max(0, limit)) : out;
 }
 

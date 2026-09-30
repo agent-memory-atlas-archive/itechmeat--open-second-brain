@@ -43,8 +43,12 @@ import {
   type Provenance,
 } from "../provenance/provenance.ts";
 import { PLAN_ID_LABEL, recordCompleted } from "./checkpoint.ts";
-import { updateManifest } from "./content-manifest.ts";
-import { preExtractCodeStructure, type PreExtractResult } from "./pre-extract.ts";
+import { readManifest, updateManifest } from "./content-manifest.ts";
+import {
+  isCodeStructureSource,
+  preExtractCodeStructure,
+  type PreExtractResult,
+} from "./pre-extract.ts";
 
 /** Frontmatter `kind:` marker of an ingested source summary page. */
 export const BRAIN_SOURCE_KIND = "brain-source";
@@ -254,9 +258,14 @@ function runPreExtract(vault: string, canonicalSource: string): PreExtractResult
       reason: `source does not resolve inside this vault; code-structure pre-extraction skipped: ${canonicalSource}`,
     };
   }
-  const abs = join(vault, canonicalSource);
+  // A source the pass cannot parse needs neither its bytes nor the manifest:
+  // the pass itself reports the unsupported extension, by name.
+  if (!isCodeStructureSource(canonicalSource)) {
+    return preExtractCodeStructure(canonicalSource, "");
+  }
+  let content: string;
   try {
-    return preExtractCodeStructure(canonicalSource, readFileSync(abs, "utf8"));
+    content = readFileSync(join(vault, canonicalSource), "utf8");
   } catch {
     // A source with no readable file bytes - a URL/identity-only source, a
     // directory, a permission failure, or a deletion race - cannot be parsed,
@@ -266,6 +275,16 @@ function runPreExtract(vault: string, canonicalSource: string): PreExtractResult
       reason: `source has no readable file bytes for code-structure pre-extraction: ${canonicalSource}`,
     };
   }
+  // The manifest's canonical path set is what a relative import specifier
+  // may bind to: a specifier probes it and fills the seed's `resolvedTo`
+  // only on an exactly-one match. The source's OWN entry is not in the set
+  // yet - the manifest is updated after this pass - which is the correct
+  // incremental reality: a module cannot have been ingested before it was.
+  // Read once, outside the source-read guard: a corrupted or unsupported
+  // manifest is its own named error, never "no readable file bytes".
+  return preExtractCodeStructure(canonicalSource, content, {
+    ingestedFiles: new Set(Object.keys(readManifest(vault).entries)),
+  });
 }
 
 /**

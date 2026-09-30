@@ -6,6 +6,7 @@
  */
 
 import { runFtsQueryDetailed } from "../fts.ts";
+import type { FtsMatchMode } from "../fts-match-mode.ts";
 import { buildQueryPlan } from "../query-plan.ts";
 import type { RetrievalDegradationSink } from "../retrieval-trail.ts";
 import { DEFAULT_EXPANSION, deriveExpansionTerms, tokenizeForExpansion } from "../synonyms.ts";
@@ -38,6 +39,8 @@ export interface KeywordLaneInput {
   readonly basePlan: QueryPlan;
   readonly limit: number;
   readonly pathPrefix: string | undefined;
+  /** The caller's FTS match breadth (`all` default, `any` OR-joins). */
+  readonly matchMode?: FtsMatchMode;
 }
 
 export interface KeywordLaneOutcome {
@@ -61,6 +64,7 @@ export function runKeywordLane(input: KeywordLaneInput): KeywordLaneOutcome {
   const kwOutcome = runFtsQueryDetailed(store, keywordQuery, {
     limit: limit * recall.poolMultiplier,
     pathPrefix,
+    matchMode: input.matchMode,
     degraded,
   });
   let hits = kwOutcome.hits;
@@ -123,6 +127,7 @@ function expandWithSynonyms(
     limit: limit * recall.poolMultiplier,
     pathPrefix,
     expandedTerms,
+    matchMode: input.matchMode,
   });
   return { plan, hits: kwOutcome.hits, warnings: kwOutcome.warnings };
 }
