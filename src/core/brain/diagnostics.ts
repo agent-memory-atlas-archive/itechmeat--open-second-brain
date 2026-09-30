@@ -208,6 +208,17 @@ export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map
         autoRepairable: false,
       },
       {
+        // An observation signal whose session_ref resolves to no session
+        // or continuity record. The exit is the detach verb, which is
+        // dry-run by default and confirm-gated; `autoRepairable` stays
+        // false because the doctor's repair planner has no fixer for it -
+        // the repair lives behind the verb the issue's `fix` field names.
+        code: "orphan-session-ref",
+        issueClass: "observation whose session_ref resolves to no session",
+        nextCommand: "o2b brain orphan-repair",
+        autoRepairable: false,
+      },
+      {
         code: "broken-backlinks",
         issueClass: "broken Brain backlink",
         nextCommand: "o2b brain backlinks",
@@ -553,6 +564,19 @@ export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map
         code: "embedding-model-sunset-announced",
         issueClass: "configured embedding model has an announced decommission date",
         nextCommand: "o2b search provider presets",
+        autoRepairable: false,
+      },
+      {
+        // The index behind its embedding configuration: chunks with no
+        // vector, or stored vectors under a retired model/dimension. The
+        // registry carries the backfill verb because it is the
+        // condition's cheapest first act; the warning prose names the
+        // re-embed remedy the stale half needs beside it, since a
+        // backfill finds stale rows fully vectorised and leaves them
+        // where they are.
+        code: "embeddings-backlog",
+        issueClass: "indexed chunks with no vector or vectors stale against the configured model",
+        nextCommand: "o2b search vector-backfill",
         autoRepairable: false,
       },
       {

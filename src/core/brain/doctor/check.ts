@@ -10,7 +10,7 @@
  */
 
 import type { BrainConfig, DoctorIssue } from "../types.ts";
-import type { LogRecord, PreferenceRecord } from "./records.ts";
+import type { LogRecord, PreferenceRecord, UnreadableLogDay } from "./records.ts";
 import type { DoctorUncertainEntry } from "./report.ts";
 
 /**
@@ -26,7 +26,11 @@ export interface DoctorCheckContext {
   readonly now: Date;
   /** Resolved `_brain.yaml`, or absent when it could not be loaded. */
   readonly config: BrainConfig | undefined;
-  /** Search-index path for index-backed checks; absent skips them. */
+  /**
+   * Search-index path for index-backed checks. When absent, the store
+   * integrity check skips itself and the embeddings-health check falls
+   * back to the path the search configuration resolves.
+   */
   readonly dbPath: string | undefined;
   /**
    * The `o2b` config file the pass was invoked against (C1).
@@ -49,6 +53,11 @@ export interface DoctorCheckContext {
   readonly idIndex: Map<string, string[]>;
   readonly preferences: ReadonlyArray<PreferenceRecord>;
   readonly logs: ReadonlyArray<LogRecord>;
+  /**
+   * Log days the snapshot above could not read. Optional so a context
+   * built by hand stays valid; absent reads as none.
+   */
+  readonly unreadableLogDays?: ReadonlyArray<UnreadableLogDay>;
 }
 
 /**

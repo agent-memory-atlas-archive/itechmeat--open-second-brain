@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.62.0] - 2026-09-29
+
+Wider egress redaction, honest write receipts, an ingest plan that accounts for what it sets aside, a search store that keeps its journal mode honest on remote filesystems, and two more brain-doctor checks with a confirm-gated repair verb.
+
+### Fixed
+
+- **URL credentials whose username is empty are now redacted.** The URL pass required a username, so the password-only spelling connection strings use (`scheme://:pass@host`) was left verbatim wherever the pass runs, including the export boundary where it is on by default. The username half is optional now; the colon between the halves stays mandatory and adjacent, so a URL whose path carries an `@` but no userinfo colon is untouched, and the pass stays linear.
+- **URL credentials whose password carries a slash are now redacted.** The password class stopped at a slash, and one unmatched character failed the whole match - the username was left verbatim too. The class now runs to the `@` anchor, so a generated database password with a slash is redacted wherever the URL pass runs. A colon followed by a port and a path is never read as the userinfo colon, so a URL such as `http://localhost:5173/@vite/client` or `https://registry.npmjs.org:443/@types/node` stays untouched (a slash password that itself begins with 1-5 digits is the known miss, as on main).
+- **Bare JSON Web Tokens are redacted by default.** A JWT pass runs next to the bearer pass on every surface the shared redactor guards: it is anchored on the header prefix - compact JSON (`eyJ`) or a header with whitespace after the brace (`eyA`, `ewo`, `ew0`, `ewk`) - with segments bounded at 64 KiB each, so a bare token - not only a `Bearer`-prefixed one - is redacted.
+- **A secret named beside its value is redacted in structured data.** The structured walk reads a `{name, value}` pair whose sibling name names a secret - an environment block such as `{"name": "DB_PASSWORD", "value": "..."}` - and redacts the value.
+- **A byte-identical note rewrite no longer bumps the note's mtime.** The atomic rename landed a fresh inode on every write, so re-applying identical bytes moved the file's `mtime` while the receipt claimed `updated: true` for a write that changed nothing - poisoning recency ranking, validity windows and vault-delta counts. Both write chokepoints now skip a byte-identical rewrite, and `updated` / `appended` carry the write's own verdict: a skipped write stores no before-image and records no note-write event. The skip is decided before anything is written, so a rewrite that does change the bytes still stores its before-image before the rename, and a failed store leaves the note untouched.
+- **The search index opens with journal mode DELETE on a remote filesystem, and says so once.** An index file on a network filesystem (on Linux nfs, cifs, SMB2/SMB3, smbfs, ceph, afs and 9p; on Windows a UNC path; macOS is not probed) opens without WAL, and the write open prints one clear warning naming the filesystem and the slower writes; every later open makes the same decision instead of enabling WAL there. Leaving WAL needs exclusive access, so while another connection has an index in WAL open the switch is kept for later instead of failing: the read open stays in WAL silently (never an `INDEX_UNREADABLE` that would trigger a reindex), and the write open keeps WAL, warns once that it stays until other connections close, and retries on its next open.
+- **A batch write lints only the pages it actually committed.** `brain_write_batch` named a page for the write-time lint whenever a result carried a path, which included skipped rewrites; a skipped operation now names no page, matching the single-write receipts.
+
+### Changed
+
+- **Docs:** `docs/cli-reference.md` lists `o2b brain orphan-repair`; `docs/mcp.md` documents the plan's `skip_reason_counts` and `unclassifiable` aggregates, the optional `path_advisory` on note receipts, and the new doctor findings; `docs/observability.md` and `docs/how-it-works.md` describe the before-image ordering and the journal-mode decision as the code now makes them.
+
+### Added
+
+- **A note write receipt can carry a non-blocking `path_advisory`.** An authored note body that mentions an absolute host path is advised on the receipt (frontmatter values are never scanned) through the hygiene scan's grammar, as-is; the key is absent when the content is clean, log-line operations are never scanned, and the advisory never blocks the write.
+- **The ingest plan accounts for what it sets aside.** Every file the extractable gate sets aside (`skipped_non_extractable`) carries a reason from a closed, typed set and the value behind it (the legacy free-text sentence still parses, through `parseSkippedPageReason`; the type guard accepts members only), while `skipped` stays a list of unchanged paths; the plan aggregates per-reason counts, and extensionless regular files nothing can classify are counted by extension; both aggregates appear on the MCP plan and the CLI rendering only when non-empty, so a plan with nothing set aside serializes exactly as before.
+- **`o2b brain doctor` checks embedding health.** A fail-soft, read-only check reports an embedding backlog, an unrecorded census and an unmeasured health verdict; an unrecorded census lands in `uncertain`, never in healthy. The stale count resolves the dimension the way the indexer does (configured, then the local embedder's default, then the stored value) and compares by model alone when none resolves, so a model switch on a default configuration is counted - in `o2b search status` too; a provider with no configured model is `uncertain`, and the check reads the index the doctor pass was pointed at.
+- **`o2b brain doctor` reports orphaned session references, and `o2b brain orphan-repair` detaches them.** An observation signal whose `session_ref` resolves against neither the continuity ledger nor the Brain log's session lifecycle is a warning that names the repair verb on its `fix` field. A ref written by `o2b brain sessions import` (`<transcript basename>#<turn>`) points at a transcript outside the vault that the import keeps no guaranteed record of, so it is never judged; the capture form and the extract-signals form are. A log day or shard the pass could not read makes the check report `uncertain` and no finding, because a session whose lifecycle lived there would otherwise read as an orphan. The verb removes only the `session_ref` key, and only while it still holds the value the scan resolved under the signal's per-file lock (a reference rewritten in between is reported `skip-changed`, a contended lock `skip-locked`) - the observation body, topic and every other field stay - dry-run by default, behind an exact confirmation phrase, with a hard per-run cap, and it is never reachable from the doctor pass itself.
+
 ## [1.61.0] - 2026-09-28
 
 MCP server start-up off the Brain upgrade path, fair ingest locks, the Claude Code MCP manifest inside `plugin.json`, and an inbox archive (issues #216, #198, #196, #195).
@@ -7810,6 +7835,7 @@ plugin config (vault field)`, and exits with a clear
 - Sandbox vault and plugin manifest fixtures for tests.
 - GitHub release workflow for tag-based and manually dispatched releases.
 
+[1.62.0]: https://github.com/itechmeat/open-second-brain/compare/v1.61.0...v1.62.0
 [1.61.0]: https://github.com/itechmeat/open-second-brain/compare/v1.60.0...v1.61.0
 [1.60.0]: https://github.com/itechmeat/open-second-brain/compare/v1.59.0...v1.60.0
 [1.59.0]: https://github.com/itechmeat/open-second-brain/compare/v1.58.2...v1.59.0

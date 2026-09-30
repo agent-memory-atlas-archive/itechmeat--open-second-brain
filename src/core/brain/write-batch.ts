@@ -41,6 +41,7 @@ import {
 } from "./notes/write-record.ts";
 import { formatFrontmatter, parseFrontmatterWithNotices } from "../vault.ts";
 import { DEGRADATION_CODE } from "../integrity/degradation.ts";
+import { writePathAdvisoryField, type WritePathAdvisoryField } from "./write-path-advisory.ts";
 import {
   appendApplyEvidence,
   type AppendApplyEvidenceInput,
@@ -237,23 +238,59 @@ export interface NoteWriteAudit {
   readonly audit_reason?: string;
 }
 
-/** Per-operation outcome, discriminated by `kind`. */
+/**
+ * The advisory half every note-write result MAY carry (p4
+ * silent-failure-hardening, Task 3): the absolute home paths the call's
+ * authored content embeds. Byte-identical-when-absent - the key is simply
+ * not there for a clean write - and never a refusal: the write lands and
+ * the receipt says what it embeds. Log-line and evidence ops author no
+ * note content and never carry it.
+ */
+export type NoteWriteAdvisory = WritePathAdvisoryField;
+
+/**
+ * Per-operation outcome, discriminated by `kind`.
+ *
+ * The update and append arms split on their flag so a caller cannot read
+ * a write that did not happen as one that did: `updated: true` /
+ * `appended: true` always carry the audit half (an id, or null plus the
+ * reason there is none), while the `false` arms carry no audit fields at
+ * all - a skipped write stored no before-image and recorded no event, so
+ * there is no null that could be mistaken for a lost one, the same shape
+ * the create skip spells. Both arms carry the advisory: the caller
+ * authored that content either way.
+ */
 export type WriteBatchOpResult =
   | ({
       readonly kind: "create_note";
       readonly path: string;
       readonly created: true;
-    } & NoteWriteAudit)
+    } & NoteWriteAudit &
+      NoteWriteAdvisory)
   | ({
       readonly kind: "update_note";
       readonly path: string;
       readonly updated: true;
-    } & NoteWriteAudit)
+    } & NoteWriteAudit &
+      NoteWriteAdvisory)
+  | ({
+      readonly kind: "update_note";
+      readonly path: string;
+      /** The target already held these bytes; nothing was written. */
+      readonly updated: false;
+    } & NoteWriteAdvisory)
   | ({
       readonly kind: "append_note";
       readonly path: string;
       readonly appended: true;
-    } & NoteWriteAudit)
+    } & NoteWriteAudit &
+      NoteWriteAdvisory)
+  | ({
+      readonly kind: "append_note";
+      readonly path: string;
+      /** The target already held the would-be result; nothing was written. */
+      readonly appended: false;
+    } & NoteWriteAdvisory)
   | { readonly kind: "apply_evidence"; readonly logged_at: string; readonly log_path: string }
   | { readonly kind: "append_log_line"; readonly logged_at: string; readonly log_path: string };
 
@@ -432,13 +469,16 @@ function projectCreateNote(
           );
         }
         // The create writer records its own event, so the batch carries
-        // its receipt through rather than appending a second one.
+        // its receipt through rather than appending a second one. The
+        // advisory was computed in the projection from the authored
+        // content; it advises, it never refuses.
         return {
           kind: "create_note",
           path: res.path,
           created: true,
           write_id: res.write_id,
           ...(res.audit_reason !== undefined ? { audit_reason: res.audit_reason } : {}),
+          ...writePathAdvisoryField(op.content, res.path),
         };
       } catch (err) {
         throw envelopeError(err, index);
@@ -532,7 +572,28 @@ function projectUpdateNote(
         NOTE_WRITE_OP.update,
         opts,
       );
-      return { kind: "update_note", path: target.relPath, updated: true, ...audit };
+      // The flag is the write's own verdict, not a hardcoded success: a
+      // byte-identical re-apply skipped the write and says so, carrying
+      // no audit half because nothing was recorded.
+      if (audit.wrote) {
+        const { write_id, audit_reason } = audit;
+        return {
+          kind: "update_note",
+          path: target.relPath,
+          updated: true,
+          write_id,
+          ...(audit_reason !== undefined ? { audit_reason } : {}),
+          // The caller's authored body, not the note's whole content: a
+          // path already on disk was not this call's authorship.
+          ...writePathAdvisoryField(op.body, target.relPath),
+        };
+      }
+      return {
+        kind: "update_note",
+        path: target.relPath,
+        updated: false,
+        ...writePathAdvisoryField(op.body, target.relPath),
+      };
     },
   };
 }
@@ -566,20 +627,64 @@ function projectAppendNote(
         NOTE_WRITE_OP.append,
         opts,
       );
-      return { kind: "append_note", path: target.relPath, appended: true, ...audit };
+      // Honest for the same reason the update's flag is: a rewrite whose
+      // bytes already sit on disk (a hand-edited note that already
+      // contains the would-be result) wrote nothing and says so, with no
+      // audit half because nothing was recorded.
+      if (audit.wrote) {
+        const { write_id, audit_reason } = audit;
+        return {
+          kind: "append_note",
+          path: target.relPath,
+          appended: true,
+          write_id,
+          ...(audit_reason !== undefined ? { audit_reason } : {}),
+          // The appended text is the call's authorship; the body it
+          // joined is not.
+          ...writePathAdvisoryField(op.content, target.relPath),
+        };
+      }
+      return {
+        kind: "append_note",
+        path: target.relPath,
+        appended: false,
+        ...writePathAdvisoryField(op.content, target.relPath),
+      };
     },
   };
 }
 
 /**
- * Commit one note rewrite and attribute it, in the order the design
- * fixes: keep the bytes this write replaces, write, record.
+ * What one note rewrite actually did: either it wrote, and carries the
+ * audit half (`write_id`, plus `audit_reason` exactly when that id is
+ * null), or it skipped a byte-identical target and carries nothing. The
+ * split - rather than a boolean beside optional fields - is what keeps a
+ * skipped write from ever spelling a null write_id that a caller could
+ * mistake for a lost record.
+ */
+type CommittedNoteRewrite = ({ readonly wrote: true } & NoteWriteAudit) | { readonly wrote: false };
+
+/**
+ * Commit one note rewrite and attribute it: for a rewrite that changes
+ * the bytes, keep the bytes it replaces, write, and record the event.
  *
- * The image goes FIRST because it is the only copy of the prior content
- * that survives the rename - a process that dies between the rename and
- * the record loses the audit line, which is recoverable, rather than the
- * bytes, which are not. The record goes LAST and cannot fail the write:
- * `recordNoteWrite` returns its failure, and this returns it too.
+ * The write runs with `skipIfUnchanged`, so a byte-identical re-apply
+ * leaves the target untouched - no temp file, no rename, no mtime bump
+ * for the recency and validity consumers to misread - and the returned
+ * verdict is the one source of truth for what happened. A skipped write
+ * stores no before-image (the prior bytes are still the bytes on disk;
+ * an image would claim a replace that never occurred) and records no
+ * note-write event (no audit line exists for a write that did not
+ * happen).
+ *
+ * The order is the design's: image, then write, then record. Whether an
+ * image is owed is decided up front (`before !== contents`), so the image
+ * lands BEFORE the rename and a crash or a failed store never leaves the
+ * prior bytes replaced without their copy - a retry would otherwise see
+ * the new bytes, skip as unchanged and never reach the ledger. The store
+ * is content-addressed and idempotent, so an image stored for a write
+ * that `skipIfUnchanged` then skips (the target changed underneath to
+ * the new bytes) is harmless.
  */
 function commitNoteRewrite(
   vault: string,
@@ -588,17 +693,20 @@ function commitNoteRewrite(
   contents: string,
   op: NoteWriteOp,
   opts: ApplyWriteBatchOptions,
-): NoteWriteAudit {
-  mkdirSync(dirname(target.abs), { recursive: true });
+): CommittedNoteRewrite {
+  if (before === contents) return { wrote: false };
   storeBeforeImage(vault, before);
-  atomicWriteFileSync(target.abs, contents);
-  return recordNoteWrite(vault, {
+  mkdirSync(dirname(target.abs), { recursive: true });
+  const wrote = atomicWriteFileSync(target.abs, contents, { skipIfUnchanged: true });
+  if (!wrote) return { wrote: false };
+  const audit = recordNoteWrite(vault, {
     op,
     target: target.relPath,
     before: { bytes: before },
     after: { bytes: contents },
     ...(opts.configPath !== undefined ? { configPath: opts.configPath } : {}),
   });
+  return { wrote: true, ...audit };
 }
 
 /** Accepted apply-evidence result values, for phase-1 validation. */

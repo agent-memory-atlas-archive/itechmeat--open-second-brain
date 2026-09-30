@@ -51,6 +51,7 @@ import { inboxArchivableCheck } from "./doctor/inbox-archive-check.ts";
 import { capturePatternCheck, configCheck, vaultIgnoreCheck } from "./doctor/config-checks.ts";
 import { entityRegistryCheck } from "./doctor/entity-checks.ts";
 import { brokenBacklinkCheck } from "./doctor/link-checks.ts";
+import { orphanSessionCheck } from "./doctor/orphan-session-check.ts";
 import { evidenceRangeCheck, logShardCheck, orphanEvidenceCheck } from "./doctor/log-checks.ts";
 import {
   contentHashDriftCheck,
@@ -67,10 +68,12 @@ import {
 } from "./doctor/record-checks.ts";
 import {
   collectAllBasenames,
-  readAllLogRecords,
+  readLogSnapshot,
+  type LogSnapshot,
   readAllPreferenceRecords,
 } from "./doctor/records.ts";
 import { embeddingSunsetCheck } from "./doctor/embedding-sunset-check.ts";
+import { embeddingsHealthCheck } from "./doctor/embeddings-health-check.ts";
 import { payloadRegistryCheck } from "./doctor/payload-checks.ts";
 import { recallChannelCoverageCheck } from "./doctor/recall-channel-coverage.ts";
 import { recoveryPointLivenessCheck } from "./doctor/recovery-point-liveness.ts";
@@ -161,6 +164,7 @@ const DOCTOR_CHECKS: ReadonlyArray<DoctorCheck> = Object.freeze([
   activeBudgetPressureCheck,
   evidenceRangeCheck,
   orphanEvidenceCheck,
+  orphanSessionCheck,
   entityRegistryCheck,
   capturePatternCheck,
   syncConflictLogCheck,
@@ -176,6 +180,7 @@ const DOCTOR_CHECKS: ReadonlyArray<DoctorCheck> = Object.freeze([
   recallChannelCoverageCheck,
   recoveryPointLivenessCheck,
   embeddingSunsetCheck,
+  embeddingsHealthCheck,
   payloadRegistryCheck,
 ]);
 
@@ -380,6 +385,9 @@ function resolveContext(
   } catch {
     config = undefined;
   }
+  // Read in the literal's own order below, so the uncertainty stream keeps
+  // the order it has always had.
+  let logSnapshot: LogSnapshot;
   return {
     vault,
     now: opts.now ?? new Date(),
@@ -403,13 +411,14 @@ function resolveContext(
         "subset of the store",
       uncertain,
     }),
-    logs: readAllLogRecords(vault, {
+    logs: (logSnapshot = readLogSnapshot(vault, {
       site: CONTEXT_SITE,
       consequence:
         "no log day in it was loaded, so the evidence and orphan lints below report on a subset " +
         "of the store",
       uncertain,
-    }),
+    })).records,
+    unreadableLogDays: logSnapshot.unreadableDays,
   };
 }
 

@@ -42,6 +42,10 @@ import {
 } from "../../core/brain/write-batch.ts";
 import { nextCommandField } from "../../core/brain/next-step.ts";
 import { lintWrittenPages, pageLintField, type PageLintField } from "../../core/brain/page-lint.ts";
+import {
+  WRITE_PATH_ADVISORY_KEY,
+  type WritePathAdvisoryField,
+} from "../../core/brain/write-path-advisory.ts";
 import { WRITE_BINDING_REFUSED_CODE } from "../../core/write-binding/index.ts";
 import { isFrontmatterKey } from "../../core/vault.ts";
 import { rethrowVaultFrozen } from "../frozen-refusal.ts";
@@ -350,11 +354,14 @@ async function toolBrainUpdateNote(
   };
   const result = runSingleWrite(ctx, op, "brain_update_note");
   // The flag comes off the kernel result rather than being restated here:
-  // one fact, one source.
-  return noteWriteResult(ctx, [result.path], {
+  // one fact, one source. A skipped update wrote no bytes, so it names no
+  // page for the lint and carries no audit half - the same shape a
+  // skipped create spells.
+  return noteWriteResult(ctx, result.updated ? [result.path] : [], {
     updated: result.updated,
     path: result.path,
-    ...auditFields(result),
+    ...(result.updated ? auditFields(result) : {}),
+    ...pathAdvisoryFields(result),
   });
 }
 
@@ -370,10 +377,13 @@ async function toolBrainAppendNote(
   const content = coerceStr(args, "content", true)!;
   const op: AppendNoteOperation = { kind: "append_note", path, content };
   const result = runSingleWrite(ctx, op, "brain_append_note");
-  return noteWriteResult(ctx, [result.path], {
+  // Skipped-append receipts follow the skipped-update shape: no bytes
+  // landed, so no page to lint and no audit half to mistake.
+  return noteWriteResult(ctx, result.appended ? [result.path] : [], {
     appended: result.appended,
     path: result.path,
-    ...auditFields(result),
+    ...(result.appended ? auditFields(result) : {}),
+    ...pathAdvisoryFields(result),
   });
 }
 
@@ -392,6 +402,18 @@ function auditFields(audit: NoteWriteAudit): Record<string, unknown> {
     write_id: audit.write_id,
     ...(audit.audit_reason !== undefined ? { audit_reason: audit.audit_reason } : {}),
   };
+}
+
+/**
+ * The absolute-path advisory a kernel result computed over the call's
+ * authored content, passed through under its own key. Byte-identical-
+ * when-absent: a clean write contributes nothing, exactly as the page
+ * lint does at the envelope level. The kernel already advises - this
+ * only lets the receipt say it.
+ */
+function pathAdvisoryFields(result: NoteOpResult): WritePathAdvisoryField {
+  const report = result[WRITE_PATH_ADVISORY_KEY];
+  return report === undefined ? {} : { [WRITE_PATH_ADVISORY_KEY]: report };
 }
 
 /** The kernel results that name a note file: exactly the three note ops. */

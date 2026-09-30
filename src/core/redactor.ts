@@ -230,6 +230,27 @@ const JSON_ENTRY_RE = new RegExp(
 // and only replace the token portion.
 const BEARER_RE = /\b(Bearer\s+)([A-Za-z0-9._\-+/=]+)/gi;
 
+// A bare JSON Web Token: three base64url segments joined by dots. The
+// shape carries no key=value assignment for the passes above and no
+// vendor prefix for the token pass, and the canonical 20-character
+// header slips HIGH_ENTROPY_TOKEN_RE's 24-character gate - so under the
+// token pass the payload and signature were eaten while the header
+// stayed, announcing a credential and naming its algorithm. Default-on:
+// a JWT is a bearer credential wherever it appears, not only where a
+// key names it.
+//
+// The header prefix anchors the match, while matching any three
+// dot-separated base64url runs would also claim ordinary dotted
+// identifiers. A compact header `{"` encodes to `eyJ`; a header written
+// with whitespace after the brace encodes to `eyA` (`{ `), `ewo` (`{\n`),
+// `ew0` (`{\r`) or `ewk` (`{\t`), so all five open the match. The header
+// segment must be at least 12 characters in total (a real header is far
+// longer), which keeps short dotted words such as `ewok.a.b` prose.
+// Segments are bounded (64 KiB each, room for a large claims payload),
+// so the pass stays linear on large inputs.
+const JWT_RE =
+  /\b(?:eyJ|eyA|ewo|ew0|ewk)[A-Za-z0-9_-]{9,65533}(?:\.[A-Za-z0-9_-]{4,65536}){2}(?![A-Za-z0-9_-])/g;
+
 // ----- Infra-topology detectors (opt-in via `redactInfra`) ------------------
 //
 // These scrub network coordinates that carry no key=value shape, so the
@@ -246,7 +267,30 @@ const IPV4 = `${IPV4_OCTET}(?:\\.${IPV4_OCTET}){3}`;
 // `scheme://user:pass@host` — strip the embedded credentials but keep the
 // scheme and `@host` for readability. Run first so the host that follows
 // is still available to the host/port passes below.
-const BASIC_AUTH_URL_RE = /\b([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^\s/:@]+):([^\s/@]+)@/g;
+//
+// The password class is `[^\s@]+`, not `[^\s/@]+`: a generated database
+// password routinely carries `/`, and with the old class the regex failed
+// the match ENTIRELY - both the user and the password left verbatim, a
+// wider leak than if the pass had never run. The username may be EMPTY -
+// a password-only authority is a spelling connection strings really use
+// (`scheme://:pass@host`) - while the colon between the halves stays
+// mandatory and adjacent, so a URL whose path carries an `@` but no
+// userinfo colon is untouched. Every class still cannot cross whitespace,
+// the `://` scheme anchor and the `@` anchor are kept, and each run is
+// bounded by those anchors (a `[^\s@]+` run ends at the first whitespace
+// or `@`, deterministically), so the documented linear / no-ReDoS
+// property above holds.
+//
+// Because the password class crosses `/`, a `host:port/path@x` URL would
+// read the port colon as the userinfo colon and swallow the host, the port
+// and half the path (`http://localhost:5173/@vite/client`). The lookahead
+// rejects a colon followed by 1-5 digits and then `/`: that is a port and a
+// path, not a password. Two accepted trade-offs, both as on main: a slash
+// password that begins with 1-5 digits (`bob:8080/x@host`) is missed, and a
+// query or fragment directly after a port with an `@` in it
+// (`example.com:443?x@y`) is still read as userinfo - far rarer than a
+// password such as `123?secret`, which this keeps redacted.
+const BASIC_AUTH_URL_RE = /\b([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^\s/:@]*):(?!\d{1,5}\/)([^\s@]+)@/g;
 
 // `ipv4:port` — a reachable service endpoint. Redacted whole regardless of
 // whether the address is public or private (the port is what leaks the
@@ -751,6 +795,12 @@ export function scanRawOutput(text: string, opts: RedactRawOutputOptions = {}): 
   // Bearer headers BEFORE the generic colon rule.
   out = out.replace(BEARER_RE, (_match, prefix: string) => `${prefix}${PLACEHOLDER}`);
 
+  // Bare JWTs BEFORE the opt-in passes: the token pass would eat only the
+  // payload and signature segments (the header slips the entropy gate) and
+  // leave a half-standing credential, and the URL pass must see a
+  // JWT-in-a-password already collapsed.
+  out = out.replace(JWT_RE, PLACEHOLDER);
+
   // Indented continuations BEFORE the single-line rule: `token: |` has a
   // same-line value the colon rule would consume, leaving its block behind.
   out = out.replace(
@@ -956,6 +1006,25 @@ function isPlainContainer(value: object): boolean {
 }
 
 /**
+ * True for the sibling-pair shape configuration formats use for
+ * environment entries: `{ name: "DB_PASSWORD", value: … }`. The credential
+ * NAME sits in a SIBLING member, so the key-name rule - which reads only
+ * the CURRENT key, and here sees `value`, which says nothing - never
+ * fires, and a literal secret rode past the walk untouched.
+ *
+ * The matcher is the same {@link isSecretKeyName} the object branch
+ * applies to a key; no new secret-name vocabulary. An entry without a
+ * literal `value` member - the ECS `valueFrom` reference shape - is not a
+ * literal secret and stays with the normal walk.
+ */
+function siblingPairDeclaresSecret(item: unknown): boolean {
+  if (typeof item !== "object" || item === null) return false;
+  if (!isPlainContainer(item)) return false;
+  const record = item as Record<string, unknown>;
+  return "value" in record && isSecretKeyName(record["name"]);
+}
+
+/**
  * Redact a JSON-shaped value tree: every string leaf through
  * {@link redactRawOutput}, and every value whose KEY NAME declares a
  * credential ({@link isSecretKeyName}) replaced whole.
@@ -982,6 +1051,31 @@ export function redactStructured(
 
   const record = (location: string): void => {
     if (secretIdentifiers.size < MAX_REPORTED_IDENTIFIERS) secretIdentifiers.add(location);
+  };
+
+  /**
+   * Walk a plain object's entries under `location`, marking each value
+   * secret when `secretKey` says its key declares one. One loop for both
+   * positions that walk an object - the object branch, and the array
+   * branch's sibling `{name, value}` pair - so the key reporting and the
+   * location spelling cannot drift between them.
+   */
+  const walkEntries = (
+    source: Record<string, unknown>,
+    location: string,
+    secretKey: (key: string) => boolean,
+  ): Record<string, unknown> => {
+    const out: Record<string, unknown> = {};
+    let index = 0;
+    for (const [key, child] of Object.entries(source)) {
+      // The key is reported by POSITION, never by name: the name is the
+      // secret in this case.
+      if (keyNameCarriesSecret(key)) record(`${location === "" ? "" : location}#${index}`);
+      const childLocation = location === "" ? key : `${location}.${key}`;
+      out[key] = walk(child, childLocation, secretKey(key), isIdentifierKeyName(key));
+      index += 1;
+    }
+    return out;
   };
 
   const walk = (
@@ -1031,23 +1125,23 @@ export function redactStructured(
       return scan.text;
     }
     if (Array.isArray(value)) {
-      return value.map((item, index) =>
-        walk(item, `${location}[${index}]`, false, underIdentifierKey),
-      );
+      return value.map((item, index) => {
+        const itemLocation = `${location}[${index}]`;
+        if (!siblingPairDeclaresSecret(item)) {
+          return walk(item, itemLocation, false, underIdentifierKey);
+        }
+        // A `{name, value}` pair whose NAME declares a credential: the
+        // literal rides in the sibling `value` member, so that member is
+        // walked under a secret key. Every other member keeps the normal
+        // per-key decision.
+        return walkEntries(item as Record<string, unknown>, itemLocation, (key) =>
+          key === "value" ? true : isSecretKeyName(key),
+        );
+      });
     }
     if (typeof value === "object" && value !== null) {
       if (!isPlainContainer(value)) return value;
-      const out: Record<string, unknown> = {};
-      let index = 0;
-      for (const [key, child] of Object.entries(value)) {
-        // The key is reported by POSITION, never by name: the name is the
-        // secret in this case.
-        if (keyNameCarriesSecret(key)) record(`${location === "" ? "" : location}#${index}`);
-        const childLocation = location === "" ? key : `${location}.${key}`;
-        out[key] = walk(child, childLocation, isSecretKeyName(key), isIdentifierKeyName(key));
-        index += 1;
-      }
-      return out;
+      return walkEntries(value as Record<string, unknown>, location, isSecretKeyName);
     }
     return value;
   };

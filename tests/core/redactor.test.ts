@@ -10,6 +10,8 @@ import {
   stripPrivateRegions,
   wasScanTruncated,
 } from "../../src/core/redactor.ts";
+import { EGRESS_OUTCOME, redactForEgress } from "../../src/core/egress/guard.ts";
+import { fakeCredential } from "../helpers/fake-credentials.ts";
 
 describe("stripPrivateRegions", () => {
   test("strips balanced private regions across lines", () => {
@@ -220,6 +222,179 @@ describe("redactRawOutput infra-topology pass (redactInfra)", () => {
     // Should return promptly; a catastrophic-backtracking regex would hang.
     const out = redactRawOutput(evil, { redactInfra: true });
     expect(typeof out).toBe("string");
+  });
+});
+
+describe("URL credentials whose password carries a slash", () => {
+  // The password class was `[^\s/@]+`, which excluded the one character a
+  // generated database password most often carries. The regex then failed
+  // the match ENTIRELY, so both the user and the password left verbatim -
+  // a wider leak than if the pass had never run.
+  const SLASH_PASSWORD_URL = "postgres://admin:s3cr3t/Tr4p@db.internal:5432/prod";
+
+  test("the export-boundary default options redact user and password, keeping scheme and host", () => {
+    const verdict = redactForEgress("brain-bank-export", { dsn: SLASH_PASSWORD_URL });
+    expect(verdict.outcome).toBe(EGRESS_OUTCOME.released);
+    if (verdict.outcome !== EGRESS_OUTCOME.released) throw new Error("unreachable");
+    expect(verdict.payload.dsn).toBe("postgres://***REDACTED***@db.internal:5432/prod");
+    expect(verdict.redacted).toBe(true);
+  });
+
+  test("redactUrlCredentials alone redacts user and password, keeping scheme and host", () => {
+    const out = redactRawOutput(`connect ${SLASH_PASSWORD_URL} now`, {
+      redactUrlCredentials: true,
+    });
+    expect(out).toBe("connect postgres://***REDACTED***@db.internal:5432/prod now");
+  });
+
+  test("the slash-free control URL redacts as before", () => {
+    const out = redactRawOutput("git clone https://alice:hunter2@github.com/x.git", {
+      redactUrlCredentials: true,
+    });
+    expect(out).toBe("git clone https://***REDACTED***@github.com/x.git");
+  });
+});
+
+describe("URL credentials with an empty username", () => {
+  // The `user:pass@` spelling requires a username, so the sibling spelling
+  // connection strings actually use for password-only authorities -
+  // `scheme://:pass@host` - matched nothing: the password rode past the
+  // pass verbatim. The user half is optional; the colon and `@` anchors
+  // stay, so a URL whose path carries an `@` but no userinfo colon is
+  // still untouched.
+  const EMPTY_USER_URL = "postgres://:s3cr3t@db.internal:5432/prod";
+  const EMPTY_USER_SLASH_PASSWORD_URL = "redis://:s3cr3t/Tr4p@cache.internal:6379/0";
+
+  test("the export-boundary default options redact a password-only userinfo section", () => {
+    const verdict = redactForEgress("brain-bank-export", { dsn: EMPTY_USER_URL });
+    expect(verdict.outcome).toBe(EGRESS_OUTCOME.released);
+    if (verdict.outcome !== EGRESS_OUTCOME.released) throw new Error("unreachable");
+    expect(verdict.payload.dsn).toBe("postgres://***REDACTED***@db.internal:5432/prod");
+    expect(verdict.redacted).toBe(true);
+  });
+
+  test("redactUrlCredentials alone redacts an empty username with a slash password", () => {
+    const out = redactRawOutput(`connect ${EMPTY_USER_SLASH_PASSWORD_URL} now`, {
+      redactUrlCredentials: true,
+    });
+    expect(out).toBe("connect redis://***REDACTED***@cache.internal:6379/0 now");
+  });
+
+  test("a path-only `@` without a userinfo colon is not rewritten", () => {
+    const out = redactRawOutput("see https://mastodon.social/@someone for the thread", {
+      redactUrlCredentials: true,
+    });
+    expect(out).toBe("see https://mastodon.social/@someone for the thread");
+  });
+});
+
+describe("URL credentials never swallow a port and a path", () => {
+  // The password class crosses `/`, so without a guard the `host:port`
+  // colon read as the userinfo colon and a later `@` in the path closed
+  // the match: the host, the port and half the path became "credentials".
+  const UNTOUCHED = [
+    "https://example.com:443/a@b",
+    "http://localhost:5173/@vite/client",
+    "https://registry.npmjs.org:443/@types/node",
+    "https://example.com:8443/users/alice@example.org",
+    "see https://example.com:8080/users/@alice now",
+  ];
+
+  for (const url of UNTOUCHED) {
+    test(`${url} stays byte-identical`, () => {
+      expect(redactRawOutput(url, { redactUrlCredentials: true })).toBe(url);
+    });
+  }
+
+  const REDACTED: Array<[string, string]> = [
+    ["https://user:pa/ss@h/x", "https://***REDACTED***@h/x"],
+    ["https://:secret@h", "https://***REDACTED***@h"],
+    ["https://u:p?q@h", "https://***REDACTED***@h"],
+    ["https://user:8080@h/x", "https://***REDACTED***@h/x"],
+    ["https://alice:123?secret@host.example", "https://***REDACTED***@host.example"],
+    ["https://u:123#x@h", "https://***REDACTED***@h"],
+  ];
+
+  test("a slash password that begins with digits is the documented miss, as on main", () => {
+    const url = "https://bob:8080/x@host";
+    expect(redactRawOutput(url, { redactUrlCredentials: true })).toBe(url);
+  });
+
+  for (const [input, expected] of REDACTED) {
+    test(`${input} still redacts its userinfo`, () => {
+      expect(redactRawOutput(input, { redactUrlCredentials: true })).toBe(expected);
+    });
+  }
+});
+
+describe("bare JWT (three base64url segments)", () => {
+  // A JWT's header is compact JSON, so it always base64s to the `eyJ`
+  // prefix; the 20-character canonical header slips the 24-character
+  // high-entropy gate, and a bare token carries no key=value shape for the
+  // assignment passes. Nothing below default options saw it at all.
+  const JWT = fakeCredential(
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+    ".eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIn0",
+    ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+  );
+
+  test("a bare three-segment JWT is redacted under default options", () => {
+    const out = redactRawOutput(`token ${JWT} end`);
+    expect(out).toBe(`token ${REDACTION_PLACEHOLDER} end`);
+  });
+
+  test("a JWT leaf is redacted at the export boundary by default", () => {
+    const verdict = redactForEgress("brain-bank-export", { pasted: JWT });
+    expect(verdict.outcome).toBe(EGRESS_OUTCOME.released);
+    if (verdict.outcome !== EGRESS_OUTCOME.released) throw new Error("unreachable");
+    expect(verdict.payload.pasted).toBe(REDACTION_PLACEHOLDER);
+    expect(verdict.redacted).toBe(true);
+  });
+
+  test("a JWT is redacted whole under the token pass too, not left half-standing", () => {
+    // The high-entropy pass alone ate the payload and signature segments
+    // and left the header: `eyJ…J9.***REDACTED***.***REDACTED***` still
+    // announces a credential and hands over its algorithm.
+    const out = redactRawOutput(`token ${JWT}`, { redactTokens: true });
+    expect(out).toBe(`token ${REDACTION_PLACEHOLDER}`);
+  });
+
+  test("a Bearer-prefixed JWT keeps the prefix and one placeholder (regression guard)", () => {
+    const out = redactRawOutput(`Authorization: Bearer ${JWT}`);
+    expect(out).toBe("Authorization: Bearer ***REDACTED***");
+  });
+
+  test("a JWT with a payload longer than 4096 characters is redacted whole", () => {
+    const payload = Buffer.from(JSON.stringify({ sub: "x".repeat(3300) })).toString("base64url");
+    expect(payload.length).toBeGreaterThan(4096);
+    const token = fakeCredential(
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+      `.${payload}`,
+      ".c2lnbmF0dXJlLXNlZ21lbnQ",
+    );
+    expect(redactRawOutput(`token ${token} end`)).toBe(`token ${REDACTION_PLACEHOLDER} end`);
+  });
+
+  test("a JWT whose header JSON is whitespace-formatted is redacted", () => {
+    for (const header of [
+      '{ "alg": "HS256", "typ": "JWT" }',
+      '{\n  "alg": "HS256"\n}',
+      '{\t"alg":"HS256"}',
+      '{\r\n"alg":"HS256"}',
+    ]) {
+      const encoded = Buffer.from(header).toString("base64url");
+      const token = fakeCredential(
+        encoded,
+        ".eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+        ".c2lnbmF0dXJlLXNlZ21lbnQ",
+      );
+      expect(redactRawOutput(`token ${token} end`)).toBe(`token ${REDACTION_PLACEHOLDER} end`);
+    }
+  });
+
+  test("short dotted words that merely start like a header stay prose", () => {
+    const text = "see ewok.item.list and eyAb.cdef.ghij here";
+    expect(redactRawOutput(text)).toBe(text);
   });
 });
 

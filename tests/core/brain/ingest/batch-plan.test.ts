@@ -15,8 +15,10 @@ import { tmpdir } from "node:os";
 import { bootstrapBrain } from "../../../../src/core/brain/init.ts";
 import { atomicWriteFileSync } from "../../../../src/core/fs-atomic.ts";
 import { updateManifest } from "../../../../src/core/brain/ingest/content-manifest.ts";
-import { planBatches } from "../../../../src/core/brain/ingest/batch-plan.ts";
+import { planBatches, type BatchPlan } from "../../../../src/core/brain/ingest/batch-plan.ts";
 import { recordCompleted } from "../../../../src/core/brain/ingest/checkpoint.ts";
+import { SKIPPED_PAGE_REASON } from "../../../../src/core/brain/ingest/extractable-gate.ts";
+import { serializeBatchPlan } from "../../../../src/mcp/brain/ingest-tools.ts";
 
 let vault: string;
 let configHome: string;
@@ -43,6 +45,26 @@ function writeSized(rel: string, bytes: number): void {
 
 function allPlannedPaths(plan: ReturnType<typeof planBatches>): string[] {
   return plan.batches.flatMap((b) => b.files.map((f) => f.path));
+}
+
+const CAPS = { maxBatchBytes: 10_000, maxBatchFiles: 100 } as const;
+
+/** Write a page carrying an optional `schema_type` frontmatter field. */
+function page(rel: string, schemaType?: string): void {
+  const abs = join(vault, rel);
+  mkdirSync(join(abs, ".."), { recursive: true });
+  const fm = schemaType === undefined ? "" : `schema_type: ${schemaType}\n`;
+  writeFileSync(abs, `---\ntitle: ${rel}\n${fm}---\n\nbody text\n`, "utf8");
+}
+
+/** Point the schema pack at an `extractable` allowlist (gates discovery). */
+function setExtractable(tokens: string[]): void {
+  const block = tokens.map((t) => `    - ${t}`).join("\n");
+  writeFileSync(
+    join(vault, "Brain", "_brain.yaml"),
+    `schema_version: 1\nschema:\n  page_types:\n    - paper\n    - memo\n  extractable:\n${block}\n`,
+    "utf8",
+  );
 }
 
 describe("planBatches — discovery + skip-unchanged", () => {
@@ -225,5 +247,85 @@ describe("planBatches — resume (t_ba1fa5f6)", () => {
     } finally {
       delete process.env["OSB_INGEST_NO_CHECKPOINT"];
     }
+  });
+});
+
+describe("planBatches — typed skip reasons + per-reason counts (P4)", () => {
+  test("the plan counts skipped pages per typed reason token", () => {
+    page("Sources/a.md", "paper");
+    page("Sources/b.md", "memo");
+    page("Sources/c.md", "memo");
+    page("Sources/d.md", "paper");
+    setExtractable(["paper"]);
+
+    const plan: BatchPlan = planBatches(vault, "Sources", CAPS);
+    expect(plan.skippedNonExtractable).toHaveLength(2);
+    expect(plan.skipReasonCounts).toEqual({ [SKIPPED_PAGE_REASON.notExtractable]: 2 });
+  });
+
+  test("a plan with no skips counts nothing", () => {
+    page("Sources/a.md", "paper");
+    page("Sources/b.md", "memo");
+    const plan = planBatches(vault, "Sources", CAPS);
+    expect(Object.keys(plan.skipReasonCounts)).toEqual([]);
+  });
+
+  test("serializeBatchPlan emits the counts only when non-empty (byte-identical when absent)", () => {
+    writeSized("Docs/a.md", 50);
+    const clean = planBatches(vault, "Docs", CAPS);
+    expect("skip_reason_counts" in serializeBatchPlan(clean)).toBe(false);
+
+    page("Sources/b.md", "memo");
+    setExtractable(["paper"]);
+    const gated = planBatches(vault, "Sources", CAPS);
+    const wire = serializeBatchPlan(gated);
+    expect(wire["skip_reason_counts"]).toEqual({ [SKIPPED_PAGE_REASON.notExtractable]: 1 });
+    expect(wire["skipped_non_extractable"]).toEqual([
+      { path: "Sources/b.md", reason: SKIPPED_PAGE_REASON.notExtractable, detail: "memo" },
+    ]);
+  });
+});
+
+describe("planBatches — unclassifiable files (P4)", () => {
+  test("counts files dropped for a non-ingestible extension, per extension", () => {
+    writeSized("Docs/a.md", 50);
+    writeSized("Docs/pic.png", 50);
+    writeSized("Docs/data.csv", 50);
+
+    const plan = planBatches(vault, "Docs", CAPS);
+    expect(plan.unclassifiable.total).toBe(2);
+    expect(plan.unclassifiable.byExtension).toEqual({ ".png": 1, ".csv": 1 });
+
+    // Counting must not alter the discovered set: the plan id (derived from
+    // the ingestible set) is the same with and without the foreign files.
+    rmSync(join(vault, "Docs", "pic.png"));
+    rmSync(join(vault, "Docs", "data.csv"));
+    expect(planBatches(vault, "Docs", CAPS).planId).toBe(plan.planId);
+  });
+
+  test("hidden entries and ignore-rule matches are excluded by declaration, not counted", () => {
+    writeSized("Docs/a.md", 50);
+    writeSized("Docs/.hidden.png", 50);
+    writeSized("Docs/.hid/x.png", 50);
+    writeSized("Docs/node_modules/lib/x.png", 50);
+    writeFileSync(join(vault, "Docs", ".gitignore"), "node_modules/\n", "utf8");
+
+    const plan = planBatches(vault, "Docs", CAPS);
+    expect(plan.unclassifiable.total).toBe(0);
+    expect(allPlannedPaths(plan)).toEqual(["Docs/a.md"]);
+  });
+
+  test("serializeBatchPlan emits the aggregate only when non-empty", () => {
+    writeSized("Docs/a.md", 50);
+    const clean = planBatches(vault, "Docs", CAPS);
+    expect("unclassifiable" in serializeBatchPlan(clean)).toBe(false);
+
+    writeSized("Docs/pic.png", 50);
+    writeSized("Docs/data.csv", 50);
+    const withDrops = planBatches(vault, "Docs", CAPS);
+    expect(serializeBatchPlan(withDrops)["unclassifiable"]).toEqual({
+      total: 2,
+      by_extension: { ".png": 1, ".csv": 1 },
+    });
   });
 });

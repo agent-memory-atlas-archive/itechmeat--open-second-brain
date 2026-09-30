@@ -211,6 +211,11 @@ import {
   PAGE_LINT_SKIP_REASONS,
 } from "../../../src/core/brain/page-lint.ts";
 import {
+  isSkippedPageReason,
+  SKIPPED_PAGE_REASON,
+  SKIPPED_PAGE_REASONS,
+} from "../../../src/core/brain/ingest/extractable-gate.ts";
+import {
   EGRESS_REDACTION,
   EGRESS_REDACTION_STATUSES,
   isEgressRedactionStatus,
@@ -297,9 +302,12 @@ import {
   isEmbeddingSunsetUndeterminedReason,
 } from "../../../src/core/search/embeddings/sunset.ts";
 import {
+  isVaultBackingRemoteness,
   isVaultBackingState,
   isVaultBackingUndeterminedReason,
   VAULT_BACKING,
+  VAULT_BACKING_REMOTENESS,
+  VAULT_BACKING_REMOTENESS_STATES,
   VAULT_BACKING_STATES,
   VAULT_BACKING_UNDETERMINED_REASON,
   VAULT_BACKING_UNDETERMINED_REASONS,
@@ -697,6 +705,16 @@ const CENSUS: ReadonlyArray<VocabularyUnderCensus> = Object.freeze([
     guard: isPageLintSkipReason,
   },
   {
+    // What the extractable gate names a skipped page. Registered for the
+    // same reason the page-lint vocabulary is: the token crosses the MCP
+    // wire and the CLI JSON verbatim, so a value added here and forgotten
+    // in the membership list is a reason no reader can narrow.
+    name: "SKIPPED_PAGE_REASON",
+    values: SKIPPED_PAGE_REASON,
+    members: SKIPPED_PAGE_REASONS,
+    guard: isSkippedPageReason,
+  },
+  {
     // C1. What a given export path does about secrets on the way out.
     // Registered because the value is the load-bearing field of a
     // declaration that a source-reading census checks against the code:
@@ -942,6 +960,17 @@ const CENSUS: ReadonlyArray<VocabularyUnderCensus> = Object.freeze([
     values: VAULT_BACKING_UNDETERMINED_REASON,
     members: VAULT_BACKING_UNDETERMINED_REASONS,
     guard: isVaultBackingUndeterminedReason,
+  },
+  {
+    // A2, second axis. Whether the backing is a NAMED network filesystem,
+    // beside - not inside - the survival verdict: nfs and cifs are both
+    // durable AND remote, and `non_remote` deliberately is not named
+    // `local`, because an unknown or unprobeable backing answers
+    // non-remote too and "no network finding" is not evidence of local.
+    name: "VAULT_BACKING_REMOTENESS",
+    values: VAULT_BACKING_REMOTENESS,
+    members: VAULT_BACKING_REMOTENESS_STATES,
+    guard: isVaultBackingRemoteness,
   },
   {
     // U7. The runtimes whose session adapters ship in this tree. It was a
@@ -1533,7 +1562,7 @@ const SCANNED = scanVocabularies(SOURCE_TREE);
  * How many four-piece vocabularies `src/` currently holds. Measured, and
  * kept as an equality rather than a floor - see the population test.
  */
-const VOCABULARY_POPULATION = 75;
+const VOCABULARY_POPULATION = 77;
 const REGISTERED = new Map(CENSUS.map((entry) => [entry.name, entry] as const));
 
 describe("verdict vocabulary census", () => {

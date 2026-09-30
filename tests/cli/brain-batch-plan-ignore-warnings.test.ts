@@ -167,3 +167,78 @@ describe("the CLI and MCP batch-plan payloads come from one serializer", () => {
     expect(cli).toEqual(mcp);
   });
 });
+
+/** A vault whose schema pack gates ingest to `paper` pages only. */
+function gateToPaper(): void {
+  mkdirSync(join(vault, "Brain"), { recursive: true });
+  writeFileSync(
+    join(vault, "Brain", "_brain.yaml"),
+    "schema_version: 1\nschema:\n  page_types:\n    - paper\n    - memo\n  extractable:\n    - paper\n",
+    "utf8",
+  );
+}
+
+describe("o2b brain batch-plan skip-reason counts (P4)", () => {
+  test("the human surface renders the per-reason counts", async () => {
+    write("mono/a.md", "---\nschema_type: paper\n---\nbody\n");
+    write("mono/b.md", "---\nschema_type: memo\n---\nbody\n");
+    gateToPaper();
+
+    const res = await runCli(["brain", "batch-plan", "mono"], { env: ENV() });
+    expect(res.returncode).toBe(0);
+    expect(res.stdout).toContain("schema-type-not-extractable=1");
+    expect(res.stdout).toContain("memo");
+  });
+
+  test("the --json payload carries the typed token and the counts", async () => {
+    write("mono/a.md", "---\nschema_type: paper\n---\nbody\n");
+    write("mono/b.md", "---\nschema_type: memo\n---\nbody\n");
+    gateToPaper();
+
+    const res = await runCli(["brain", "batch-plan", "mono", "--json"], { env: ENV() });
+    expect(res.returncode).toBe(0);
+    const plan = JSON.parse(res.stdout);
+    expect(plan.skipped_non_extractable).toEqual([
+      { path: "mono/b.md", reason: "schema-type-not-extractable", detail: "memo" },
+    ]);
+    expect(plan.skip_reason_counts).toEqual({ "schema-type-not-extractable": 1 });
+  });
+});
+
+describe("o2b brain batch-plan unclassifiable counts (P4)", () => {
+  test("the human surface renders the per-extension counts", async () => {
+    write("mono/a.md");
+    write("mono/pic.png", "binary");
+    write("mono/data.csv", "a,b\n");
+
+    const res = await runCli(["brain", "batch-plan", "mono"], { env: ENV() });
+    expect(res.returncode).toBe(0);
+    expect(res.stdout).toContain("2 unclassifiable file(s)");
+    expect(res.stdout).toContain(".png: 1");
+    expect(res.stdout).toContain(".csv: 1");
+  });
+
+  test("a tree with no unclassifiable files renders no count and carries no key on the wire", async () => {
+    write("mono/a.md");
+
+    const human = await runCli(["brain", "batch-plan", "mono"], { env: ENV() });
+    expect(human.returncode).toBe(0);
+    expect(human.stdout).not.toContain("unclassifiable");
+
+    const json = await runCli(["brain", "batch-plan", "mono", "--json"], { env: ENV() });
+    expect(json.returncode).toBe(0);
+    const plan = JSON.parse(json.stdout);
+    expect("unclassifiable" in plan).toBe(false);
+  });
+
+  test("the --json payload carries the total and per-extension counts", async () => {
+    write("mono/a.md");
+    write("mono/pic.png", "binary");
+    write("mono/data.csv", "a,b\n");
+
+    const res = await runCli(["brain", "batch-plan", "mono", "--json"], { env: ENV() });
+    expect(res.returncode).toBe(0);
+    const plan = JSON.parse(res.stdout);
+    expect(plan.unclassifiable).toEqual({ total: 2, by_extension: { ".png": 1, ".csv": 1 } });
+  });
+});
