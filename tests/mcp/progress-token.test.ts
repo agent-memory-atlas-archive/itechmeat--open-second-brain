@@ -31,7 +31,11 @@ import {
   serveStdioFromString,
   startHttp,
 } from "../../src/mcp/index.ts";
-import { PROGRESS_META_KEY, PROGRESS_NOTIFICATION_METHOD } from "../../src/mcp/progress.ts";
+import {
+  PROGRESS_META_KEY,
+  PROGRESS_NOTIFICATION_METHOD,
+  withProgressRefusal,
+} from "../../src/mcp/progress.ts";
 import {
   isProgressKind,
   PROGRESS_KIND,
@@ -352,5 +356,15 @@ describe("HTTP refuses a progress token by name", () => {
     } finally {
       await handle.close();
     }
+  });
+});
+
+describe("withProgressRefusal", () => {
+  // The merge beside an error code is covered end to end by
+  // tool-error-envelope.test.ts; this pins the no-refusal identity, which
+  // keeps a call that asked for no progress byte-identical.
+  test("no refusal returns the very same result object", () => {
+    const ok = { content: [], isError: false };
+    expect(withProgressRefusal(ok, undefined)).toBe(ok);
   });
 });

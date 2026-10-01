@@ -43,14 +43,12 @@ import {
 } from "../../core/brain/notes/create-note.ts";
 import { INTERNAL_ERROR, INVALID_PARAMS, MCPError } from "../protocol.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
+import { COUNT_GUARD_WIRE_CODE, TOOL_ERROR_CODE } from "../tool-error-codes.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
-import { coerceBoolOptional, coerceStr } from "../coerce.ts";
+import { coerceBoolOptional, coerceStr, unknownOperationError } from "../coerce.ts";
 import { coerceNonNegativeInteger, readCountGuardArgs } from "./shared.ts";
 
 const TOOL = "brain_note_lifecycle";
-
-/** The `data.code` a count-guard refusal reports itself under. */
-const COUNT_GUARD_CODE = "count_guard";
 
 /** Project the frozen core result into the tool's snake_cased response. */
 function renderResult(res: NoteLifecycleResult): Record<string, unknown> {
@@ -113,8 +111,7 @@ async function toolBrainNoteLifecycle(
     // Refused rather than defaulted: a caller that asked for a
     // disposition this tool does not have must never be told its request
     // succeeded under a different one.
-    throw new MCPError(
-      INVALID_PARAMS,
+    throw unknownOperationError(
       `${TOOL}: 'action' must be one of ${NOTE_LIFECYCLE_ACTIONS.join(", ")}`,
     );
   }
@@ -150,7 +147,7 @@ async function toolBrainNoteLifecycle(
     }
     if (err instanceof CountGuardError) {
       throw new MCPError(INVALID_PARAMS, `${TOOL}: ${err.message}`, {
-        code: COUNT_GUARD_CODE,
+        code: COUNT_GUARD_WIRE_CODE,
         matched: err.matched,
         expected: err.expected,
       });
@@ -222,9 +219,6 @@ const STUB_ACTION_ARGUMENTS: Readonly<Record<StubScaffoldAction, ReadonlyArray<s
     ]),
   });
 
-/** The `data.code` an action-incompatible argument is refused under. */
-const ARGUMENT_FORBIDDEN_CODE = "argument_forbidden";
-
 /**
  * Refuse every argument that belongs to the OTHER action. `action`
  * itself is the dispatch key and belongs to both; anything the schema
@@ -247,7 +241,7 @@ function assertArgumentsMatchAction(
     INVALID_PARAMS,
     `${STUB_TOOL}: action=${action} takes none of ${foreign.join(", ")}; ` +
       `it reads ${mine.join(", ")}`,
-    { code: ARGUMENT_FORBIDDEN_CODE, action, forbidden: foreign, accepted: [...mine] },
+    { code: TOOL_ERROR_CODE.argumentForbidden, action, forbidden: foreign, accepted: [...mine] },
   );
 }
 
@@ -267,8 +261,7 @@ async function toolBrainScaffoldStub(
 ): Promise<Record<string, unknown>> {
   const action = coerceStr(args, "action", true)!;
   if (!isStubScaffoldAction(action)) {
-    throw new MCPError(
-      INVALID_PARAMS,
+    throw unknownOperationError(
       `${STUB_TOOL}: 'action' must be one of ${STUB_SCAFFOLD_ACTIONS.join(", ")}`,
     );
   }

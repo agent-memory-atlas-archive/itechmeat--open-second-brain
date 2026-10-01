@@ -11,17 +11,28 @@
  *
  * Network rules mirror `embeddings/openai-compat.ts` at a smaller scale:
  * one request (the top-K candidate set is small, no batching), a
- * per-request timeout, and provider-shaped `SearchError`s. Retries are
+ * per-request timeout, and provider-shaped `RerankEndpointError`s (a
+ * `SearchError` with code `RERANK_PROVIDER_HTTP` plus a closed failure
+ * category, see `failure.ts`). Retries are
  * intentionally omitted: this is an opt-in final reader step that
  * degrades gracefully to the heuristic ordering on ANY failure (see
  * `applyCrossEncoderRerank`), so a slow retry loop would only add latency
  * to the hot path for a result the caller already has a good answer for.
  */
 
-import { SearchError } from "../types.ts";
 import { assertHttpEgressEndpoint, linkAbortSignal } from "../embeddings/http-util.ts";
 import type { OpenAiCompatEndpoint } from "../embeddings/provider-resolve.ts";
 import type { RerankCallOptions, RerankProvider } from "./contract.ts";
+import {
+  RERANK_FAILURE_CATEGORY,
+  RerankEndpointError,
+  rerankCategoryForStatus,
+} from "./failure.ts";
+
+/** A 2xx body this build cannot read as one score per document. */
+function malformed(message: string): RerankEndpointError {
+  return new RerankEndpointError(message, { category: RERANK_FAILURE_CATEGORY.malformed });
+}
 
 /** Default per-request timeout when the caller does not override it. */
 export const DEFAULT_RERANK_TIMEOUT_MS = 5000;
@@ -45,19 +56,13 @@ function extractItems(json: unknown): ReadonlyArray<RerankResultItem> {
   ) {
     return (json as WrappedRerankResponse).results;
   }
-  throw new SearchError(
-    "RERANK_PROVIDER_HTTP",
-    "rerank response shape: expected an array or a { results: [...] } object",
-  );
+  throw malformed("rerank response shape: expected an array or a { results: [...] } object");
 }
 
 function scoreOf(item: RerankResultItem): number {
   const raw = item.relevance_score ?? item.score;
   if (typeof raw !== "number" || !Number.isFinite(raw)) {
-    throw new SearchError(
-      "RERANK_PROVIDER_HTTP",
-      `rerank response: item at index ${item.index} has no finite relevance score`,
-    );
+    throw malformed(`rerank response: item at index ${item.index} has no finite relevance score`);
   }
   return raw;
 }
@@ -92,62 +97,88 @@ export class CrossEncoderRerankProvider implements RerankProvider {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     const unlink = linkAbortSignal(opts?.signal, controller);
-    let response: Response;
+    // The timeout and the caller's signal cover the body read as well as
+    // the fetch, so the timer is cleared only once the body is in.
+    let text: string;
     try {
-      response = await fetch(this.url, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${this.endpoint.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: this.model,
-          query,
-          documents: [...documents],
-        }),
-        // No cross-host redirect may take the bearer key - or the query -
-        // somewhere the operator did not configure.
-        redirect: "error",
-        signal: controller.signal,
-      });
-    } catch (e) {
-      const cause = e instanceof Error ? e : new Error(String(e));
-      // The caller cancelled: its own abort reason travels up unchanged,
-      // so the caller recognises its cancellation by name.
-      if (opts?.signal?.aborted === true) throw opts.signal.reason;
-      if (cause.name === "AbortError") {
-        throw new SearchError(
-          "RERANK_PROVIDER_HTTP",
-          `rerank request timed out after ${this.timeoutMs}ms`,
+      let response: Response;
+      try {
+        response = await fetch(this.url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${this.endpoint.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: this.model,
+            query,
+            documents: [...documents],
+          }),
+          // No cross-host redirect may take the bearer key - or the query -
+          // somewhere the operator did not configure.
+          redirect: "error",
+          signal: controller.signal,
+        });
+      } catch (e) {
+        const cause = e instanceof Error ? e : new Error(String(e));
+        // The caller cancelled: its own abort reason travels up unchanged,
+        // so the caller recognises its cancellation by name.
+        if (opts?.signal?.aborted === true) throw opts.signal.reason;
+        if (controller.signal.aborted) {
+          throw new RerankEndpointError(`rerank request timed out after ${this.timeoutMs}ms`, {
+            category: RERANK_FAILURE_CATEGORY.timeout,
+          });
+        }
+        throw new RerankEndpointError(`network error: ${cause.message}`, {
+          category: RERANK_FAILURE_CATEGORY.network,
+        });
+      }
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => "");
+        const head = body.slice(0, 300);
+        throw new RerankEndpointError(
+          `rerank HTTP ${response.status}: ${head || response.statusText}`,
+          { category: rerankCategoryForStatus(response.status), status: response.status },
         );
       }
-      throw new SearchError("RERANK_PROVIDER_HTTP", `network error: ${cause.message}`);
+
+      // Read and parse apart: a stream that breaks while the 2xx body is
+      // read is the path failing (`network`), while a body that arrived
+      // whole and is not JSON is the endpoint's answer (`malformed`).
+      try {
+        text = await response.text();
+      } catch (e) {
+        // The timer and the caller's signal abort a stalled body too, and
+        // read the same way they do for the fetch.
+        if (opts?.signal?.aborted === true) throw opts.signal.reason;
+        if (controller.signal.aborted) {
+          throw new RerankEndpointError(`rerank request timed out after ${this.timeoutMs}ms`, {
+            category: RERANK_FAILURE_CATEGORY.timeout,
+          });
+        }
+        const msg = e instanceof Error ? e.message : String(e);
+        throw new RerankEndpointError(`network error: ${msg}`, {
+          category: RERANK_FAILURE_CATEGORY.network,
+        });
+      }
     } finally {
       clearTimeout(timer);
       unlink();
     }
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      const head = body.slice(0, 300);
-      throw new SearchError(
-        "RERANK_PROVIDER_HTTP",
-        `rerank HTTP ${response.status}: ${head || response.statusText}`,
-      );
-    }
-
     let json: unknown;
     try {
-      json = await response.json();
+      // Parsed through a Response rather than JSON.parse, so the parse
+      // error, and with it the message, is the one `response.json()` gave.
+      json = await new Response(text).json();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      throw new SearchError("RERANK_PROVIDER_HTTP", `rerank response not JSON: ${msg}`);
+      throw malformed(`rerank response not JSON: ${msg}`);
     }
 
     const items = extractItems(json);
     if (items.length !== documents.length) {
-      throw new SearchError(
-        "RERANK_PROVIDER_HTTP",
+      throw malformed(
         `rerank response shape: expected ${documents.length} scores, got ${items.length}`,
       );
     }
@@ -163,16 +194,10 @@ export class CrossEncoderRerankProvider implements RerankProvider {
         item.index >= documents.length ||
         !Number.isInteger(item.index)
       ) {
-        throw new SearchError(
-          "RERANK_PROVIDER_HTTP",
-          `rerank response: out-of-range index ${item.index}`,
-        );
+        throw malformed(`rerank response: out-of-range index ${item.index}`);
       }
       if (seen[item.index]) {
-        throw new SearchError(
-          "RERANK_PROVIDER_HTTP",
-          `rerank response: duplicate index ${item.index}`,
-        );
+        throw malformed(`rerank response: duplicate index ${item.index}`);
       }
       seen[item.index] = true;
       scores[item.index] = scoreOf(item);

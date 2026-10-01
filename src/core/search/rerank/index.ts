@@ -28,19 +28,40 @@ import { makeRerankProvider } from "./provider.ts";
 import type { RerankProvider } from "./contract.ts";
 import type { DecisionProvider } from "../../decision-model/contract.ts";
 import type { DecisionRerankExtras } from "./decision-model.ts";
+import {
+  RERANK_FAILURE_CATEGORY,
+  RerankEndpointError,
+  rerankCategoryForError,
+  type RerankFailureCategory,
+} from "./failure.ts";
+import { classifyRerankSunset, rerankSunsetHasPassed } from "./sunset.ts";
+import type { EmbeddingSunsetSurvey } from "../embeddings/sunset.ts";
 
 /** Fixed-precision so the reason string is stable for a given score. */
 function fmtScore(x: number): string {
   return x.toFixed(4);
 }
 
-export interface RerankTelemetryEvent {
-  readonly status: "applied" | "error";
-  /** Present on `error`: the provider-shaped failure message. */
-  readonly reason?: string;
+interface RerankTelemetryBase {
   /** Number of top candidates handed to the cross-encoder. */
   readonly candidateCount: number;
 }
+
+/** The rerank re-ordered the top-K block. */
+export interface RerankAppliedEvent extends RerankTelemetryBase {
+  readonly status: "applied";
+}
+
+/** The rerank request failed and the heuristic order was served. */
+export interface RerankErrorEvent extends RerankTelemetryBase {
+  readonly status: "error";
+  /** Why, as a closed category computed from the typed failure. */
+  readonly category: RerankFailureCategory;
+  /** The provider-shaped failure message, for the operator-facing warning. */
+  readonly reason: string;
+}
+
+export type RerankTelemetryEvent = RerankAppliedEvent | RerankErrorEvent;
 
 export interface ApplyCrossEncoderRerankOptions {
   /** Inject a provider (tests / alternate backends). Defaults to the HTTP one. */
@@ -96,6 +117,24 @@ export interface ApplyCrossEncoderRerankOptions {
    * instead of degrading, because nobody is waiting for the order.
    */
   readonly signal?: AbortSignal;
+  /**
+   * `openai-compat` kind only: consult the rerank sunset survey for the
+   * configured model, and skip the request once its announced shutdown
+   * date has passed. Absent: the survey is not consulted (direct callers
+   * and tests that measure the endpoint they are pointed at).
+   */
+  readonly sunset?: RerankSunsetOptions;
+}
+
+/**
+ * The sunset skip's inputs. The clock is the caller's own, so this stage
+ * reads no wall clock; the survey defaults to the shipped one.
+ */
+export interface RerankSunsetOptions {
+  readonly nowMs: number;
+  readonly survey?: EmbeddingSunsetSurvey;
+  /** Called once when the configured model is past its announced date. */
+  readonly onSkip: () => void;
 }
 
 interface Scored {
@@ -210,6 +249,17 @@ export async function applyCrossEncoderRerank(
 
   if (results.length === 0) return results;
 
+  // A model past its announced shutdown can only refuse the request, so
+  // none is made. Only the remote kind keys on a model string a vendor
+  // can retire; `local` is this build's own reranker.
+  if (config.kind === "openai-compat" && opts.sunset !== undefined) {
+    const verdict = classifyRerankSunset(config.model, opts.sunset.nowMs, opts.sunset.survey);
+    if (rerankSunsetHasPassed(verdict)) {
+      opts.sunset.onSkip();
+      return results;
+    }
+  }
+
   const topK = Math.min(Math.max(1, config.topK), results.length);
   const head = results.slice(0, topK);
   const tail = results.slice(topK);
@@ -223,7 +273,9 @@ export async function applyCrossEncoderRerank(
       opts.signal !== undefined ? { signal: opts.signal } : undefined,
     );
     if (scores.length !== documents.length) {
-      throw new Error(`expected ${documents.length} scores, got ${scores.length}`);
+      throw new RerankEndpointError(`expected ${documents.length} scores, got ${scores.length}`, {
+        category: RERANK_FAILURE_CATEGORY.malformed,
+      });
     }
   } catch (e) {
     // A cancelled call is not an endpoint failure: no telemetry, and the
@@ -233,6 +285,7 @@ export async function applyCrossEncoderRerank(
     // untouched and emit one fail-open telemetry event.
     opts.onTelemetry?.({
       status: "error",
+      category: rerankCategoryForError(e),
       reason: e instanceof Error ? e.message : String(e),
       candidateCount: topK,
     });

@@ -27,8 +27,18 @@ import {
   SERVER_NAME,
   SERVER_VERSION,
 } from "./protocol.ts";
-import type { JsonRpcNotification } from "./protocol.ts";
+import type { JsonRpcErrorCode, JsonRpcNotification, MCPErrorData } from "./protocol.ts";
 import {
+  codeForError,
+  isToolErrorCode,
+  defaultCodeForRpc,
+  TOOL_ERROR_META_KEY,
+  toolErrorMeta,
+  type ToolErrorCode,
+} from "./tool-error-codes.ts";
+import {
+  META_MEMBER,
+  PROGRESS_META_KEY,
   progressRefusal,
   progressSink,
   readProgressToken,
@@ -121,8 +131,22 @@ export interface JsonRpcResponse {
   readonly jsonrpc: string;
   readonly id: unknown;
   readonly result?: unknown;
-  readonly error?: { code: number; message: string; data?: unknown };
+  readonly error?: JsonRpcErrorBody;
 }
+
+/**
+ * The `error` member of a JSON-RPC answer. `data` is always present and
+ * always carries the string code, because {@link errorResponse} is the
+ * one builder and adds it when the thrower did not.
+ */
+export interface JsonRpcErrorBody {
+  readonly code: JsonRpcErrorCode;
+  readonly message: string;
+  readonly data: JsonRpcErrorData;
+}
+
+/** `error.data`: the thrower's record plus the stable string code. */
+export type JsonRpcErrorData = MCPErrorData & { readonly code: string };
 
 export class MCPServer {
   readonly vault: string;
@@ -365,9 +389,7 @@ export class MCPServer {
       // through the redactor - at remote reach with the vault, home and
       // temp roots replaced too: a caller probing with traversal paths
       // learns that a file is missing, not the host layout behind it.
-      const raw = (exc as Error).message ?? String(exc);
-      const message = redactErrorForCaller(raw, this.vault, this.reach);
-      return errorResponse(requestId, INTERNAL_ERROR, `internal error: ${message}`);
+      return internalErrorResponse(requestId, exc, this.vault, this.reach);
     }
   }
 
@@ -452,8 +474,8 @@ export class MCPServer {
     const token = readProgressToken(params);
     const onProgress = progressSink(token, this.sendNotification);
     // A token this transport cannot honour is refused by name on the way
-    // out - on the error envelope too, because a call that asked for
-    // progress and then failed still never got any.
+    // out - on an isError result and on a JSON-RPC error too, because a
+    // call that asked for progress and then failed still never got any.
     const refusal: ProgressRefusal | undefined =
       token !== undefined && onProgress === undefined
         ? progressRefusal(token, PROGRESS_REASON.transportSingleResponse)
@@ -462,7 +484,10 @@ export class MCPServer {
       const structured = await this.invokeToolHandler(tool, args, onProgress);
       return withProgressRefusal(buildMcpToolResult(tool, structured, this.artifactStore), refusal);
     } catch (exc) {
-      if (exc instanceof MCPError) throw exc;
+      if (exc instanceof MCPError) {
+        if (refusal === undefined) throw exc;
+        throw new MCPError(exc.code, exc.message, { ...exc.data, [PROGRESS_META_KEY]: refusal });
+      }
       // The tool-level twin of the INTERNAL_ERROR channel: the same raw
       // exception prose, so the same host-path redaction at remote reach.
       // A local caller already holds the filesystem, and these messages
@@ -475,7 +500,7 @@ export class MCPServer {
       // ValueError/TypeError semantics in Python → tool-level error envelope.
       // OSError in Python → "filesystem error" prefix. We collapse both to a
       // single tool-level error since JS doesn't distinguish.
-      return withProgressRefusal(toolError(message), refusal);
+      return withProgressRefusal(toolError(message, codeForError(exc)), refusal);
     }
   }
 }
@@ -567,10 +592,16 @@ export function buildMcpToolResult(
   };
 }
 
-function toolError(message: string): Record<string, unknown> {
+/**
+ * An `isError` tool result. The text is the message alone, as it always
+ * was; the stable code rides on `_meta` because strict clients validate
+ * `structuredContent` against the tool's output schema even on an error.
+ */
+function toolError(message: string, code: ToolErrorCode): Record<string, unknown> {
   return {
     content: [{ type: "text", text: message }],
     isError: true,
+    [META_MEMBER]: { [TOOL_ERROR_META_KEY]: toolErrorMeta(code) },
   };
 }
 
@@ -582,18 +613,84 @@ function sortedReplacer(_key: string, value: unknown): unknown {
   return value;
 }
 
+/** The member of `error.data` every JSON-RPC error answer carries. */
+const ERROR_DATA_CODE_KEY = "code";
+
+/** The stderr line a thrower-supplied code outside the registry is named on. */
+const UNREGISTERED_CODE_WARNING = "warning: unregistered error code on the wire: ";
+
+/** The longest quoted code that warning line repeats. */
+const UNREGISTERED_CODE_LOG_MAX = 120;
+
+/**
+ * `data` with its stable string code. A thrower-supplied string code
+ * always wins; otherwise the default derived from the numeric JSON-RPC
+ * code is added after the thrower's own members, so a record such as the
+ * argument guard's keeps its shape and gains one key.
+ *
+ * A supplied code outside {@link isToolErrorCode} is still sent as it
+ * is - replacing it would hide which producer chose it - and is named on
+ * stderr. Every producer passes a constant token, never prose, but the
+ * line exists to catch one that breaks that rule, so the code is written
+ * JSON-quoted and capped: a newline in it cannot forge a second line.
+ */
+function withDefaultCode(code: JsonRpcErrorCode, data: MCPErrorData | undefined): JsonRpcErrorData {
+  const supplied: unknown = (data as { readonly [ERROR_DATA_CODE_KEY]?: unknown } | undefined)?.[
+    ERROR_DATA_CODE_KEY
+  ];
+  if (data !== undefined && typeof supplied === "string") {
+    if (!isToolErrorCode(supplied)) {
+      const quoted = JSON.stringify(supplied).slice(0, UNREGISTERED_CODE_LOG_MAX);
+      process.stderr.write(`${UNREGISTERED_CODE_WARNING}${quoted}\n`);
+    }
+    return data as JsonRpcErrorData;
+  }
+  return { ...data, [ERROR_DATA_CODE_KEY]: defaultCodeForRpc(code) };
+}
+
+/**
+ * The one builder every JSON-RPC error answer passes through, including
+ * the transport errors of `stdio.ts` and `http.ts`, so "every error
+ * response carries `error.data.code`" holds by construction.
+ */
 export function errorResponse(
   requestId: unknown,
-  code: number,
+  code: JsonRpcErrorCode,
   message: string,
-  data?: unknown,
+  data?: MCPErrorData,
 ): JsonRpcResponse {
-  const error: { code: number; message: string; data?: unknown } = {
-    code,
-    message,
+  return {
+    jsonrpc: JSONRPC_VERSION,
+    id: requestId ?? null,
+    error: { code, message, data: withDefaultCode(code, data) },
   };
-  if (data !== undefined) error.data = data;
-  return { jsonrpc: JSONRPC_VERSION, id: requestId ?? null, error };
+}
+
+/**
+ * The prefix of the INTERNAL_ERROR answer {@link internalErrorResponse}
+ * builds for an unmapped throw. Handlers that throw their own
+ * INTERNAL_ERROR keep their own message; `error.data.code` is the stable
+ * signal, not this prefix.
+ */
+const INTERNAL_ERROR_PREFIX = "internal error: ";
+
+/**
+ * The INTERNAL_ERROR answer for a throw no handler mapped: the raw prose
+ * through the redactor for the bind's reach, the code from the
+ * classifier, which names an unknown class on stderr. One builder for the
+ * dispatcher and the HTTP catch-all, so the two channels cannot drift.
+ */
+export function internalErrorResponse(
+  requestId: unknown,
+  exc: unknown,
+  vault: string,
+  reach: TransportReach,
+): JsonRpcResponse {
+  const raw = (exc as Error).message ?? String(exc);
+  const message = redactErrorForCaller(raw, vault, reach);
+  return errorResponse(requestId, INTERNAL_ERROR, `${INTERNAL_ERROR_PREFIX}${message}`, {
+    code: codeForError(exc),
+  });
 }
 
 // Re-exports so callers that previously imported these names from

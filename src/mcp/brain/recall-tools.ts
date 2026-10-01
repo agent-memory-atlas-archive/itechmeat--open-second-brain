@@ -82,12 +82,13 @@ import {
 } from "../../core/brain/payload-registry.ts";
 import { TRANSPORT_REACH } from "../../core/graph/transport-reach.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
+import { searchErrorData } from "../search-tools.ts";
 import { contextReach } from "../tool-contract.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { vaultPathField } from "../vault-path-field.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
 import { coercePositiveInteger, optionalStringArg, requiredStringArg } from "./shared.ts";
-import { AGENT_SCOPE_SCHEMA, coerceAgentScope } from "../coerce.ts";
+import { AGENT_SCOPE_SCHEMA, coerceAgentScope, unknownOperationError } from "../coerce.ts";
 
 /** Recall-quality benchmark over an inline dataset. */
 async function toolBrainBenchmark(
@@ -96,7 +97,7 @@ async function toolBrainBenchmark(
 ): Promise<Record<string, unknown>> {
   const op = args["operation"];
   if (op !== "run") {
-    throw new MCPError(INVALID_PARAMS, "brain_benchmark: operation must be run");
+    throw unknownOperationError("brain_benchmark: operation must be run");
   }
   const k = args["k"];
   if (k !== undefined && (!Number.isInteger(k) || (k as number) < 1)) {
@@ -156,7 +157,7 @@ async function toolBrainTune(
 ): Promise<Record<string, unknown>> {
   const op = args["operation"];
   if (op !== "run" && op !== "status" && op !== "reset") {
-    throw new MCPError(INVALID_PARAMS, "brain_tune: operation must be run|status|reset");
+    throw unknownOperationError("brain_tune: operation must be run|status|reset");
   }
   const searchConfig = resolveSearchConfig({
     vault: ctx.vault,
@@ -287,8 +288,7 @@ async function toolBrainRecallTelemetry(
     });
     return { vault_path: vaultPathField(ctx), ...meter };
   }
-  throw new MCPError(
-    INVALID_PARAMS,
+  throw unknownOperationError(
     "brain_recall_telemetry: operation must be list, summary, gate_list, gate_summary, observed_reuse, or cost",
   );
 }
@@ -379,7 +379,7 @@ async function toolBrainRouteMetrics(
     const summary = summarizeMcpRouteLatency(ctx.vault, filter);
     return { vault_path: vaultPathField(ctx), ...summary };
   }
-  throw new MCPError(INVALID_PARAMS, "brain_route_metrics: operation must be list or summary");
+  throw unknownOperationError("brain_route_metrics: operation must be list or summary");
 }
 
 // ----- brain_retrieval_plan (shadow-only retrieval advisor, t_3ffb021c) -----
@@ -535,8 +535,7 @@ async function toolBrainTokenImpact(
   if (operation === "summary") {
     return { vault_path: vaultPathField(ctx), ...summarizeTokenImpact(ctx.vault, filter) };
   }
-  throw new MCPError(
-    INVALID_PARAMS,
+  throw unknownOperationError(
     "brain_token_impact: operation must be record, outcome, list, or summary",
   );
 }
@@ -747,8 +746,7 @@ async function toolBrainContextPackOutcome(
   if (operation === "summary") {
     return { vault_path: vaultPathField(ctx), ...summarizeContextPackOutcomes(ctx.vault, filter) };
   }
-  throw new MCPError(
-    INVALID_PARAMS,
+  throw unknownOperationError(
     "brain_context_pack_outcome: operation must be post, list, or summary",
   );
 }
@@ -956,7 +954,9 @@ function resolveSessionGrepBounds(
       Date.now(),
     );
   } catch (exc) {
-    if (exc instanceof SearchError) throw new MCPError(INVALID_PARAMS, exc.message);
+    if (exc instanceof SearchError) {
+      throw new MCPError(INVALID_PARAMS, exc.message, searchErrorData(exc));
+    }
     throw exc;
   }
 }
