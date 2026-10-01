@@ -668,7 +668,11 @@ export function resolveSkillsDir(configPath?: string): string | null {
  */
 function resolveConfigFlag(envKey: string, configKey: string, configPath?: string): boolean {
   const env = process.env[envKey]?.trim();
-  const raw = env || discoverConfig(configPath).data[configKey]?.trim();
+  return isFlagOn(env || discoverConfig(configPath).data[configKey]?.trim());
+}
+
+/** The one parse every boolean switch in this file shares. */
+function isFlagOn(raw: string | undefined): boolean {
   return raw === "true" || raw === "1";
 }
 
@@ -1116,6 +1120,44 @@ export function resolveMaintenanceEmbeddings(configPath?: string): boolean {
     MAINTENANCE_EMBEDDINGS_CONFIG_KEY,
     configPath,
   );
+}
+
+/**
+ * Env var and config key of the maintenance lane's custom-task master
+ * switch. Named because the lane quotes them back: `status` says which
+ * of the two turned declared custom tasks off.
+ */
+export const MAINTENANCE_CUSTOM_TASKS_ENV = "OPEN_SECOND_BRAIN_MAINTENANCE_CUSTOM_TASKS";
+export const MAINTENANCE_CUSTOM_TASKS_CONFIG_KEY = "maintenance_custom_tasks";
+
+/** Which source decided a boolean switch: the env override, the config key, or neither. */
+export type MaintenanceSwitchSource = "env" | "config" | "unset";
+
+/**
+ * Whether the maintenance lane may run the install-owned custom tasks
+ * declared as `maintenance_custom_<name>` keys in this config file, and
+ * the source that decided it, so `status` can name the env override when
+ * that is what turned the declared tasks off. Default OFF: a declared
+ * command is operator-authored shell, so it runs only behind an explicit
+ * opt-in, and `..._CUSTOM_TASKS=0` in the env turns it off on one host
+ * without editing the shared file. The commands themselves are read from
+ * this machine config only, never from the vault. Same parse as every
+ * other flag in this file. A caller that already parsed the config passes
+ * its `data`, so the switch and the declarations come from one snapshot.
+ */
+export function resolveMaintenanceCustomTasksSwitch(
+  configPath?: string,
+  data: Readonly<Record<string, string>> = discoverConfig(configPath).data,
+): {
+  readonly enabled: boolean;
+  readonly source: MaintenanceSwitchSource;
+} {
+  const env = process.env[MAINTENANCE_CUSTOM_TASKS_ENV]?.trim();
+  const fromConfig = data[MAINTENANCE_CUSTOM_TASKS_CONFIG_KEY]?.trim();
+  return {
+    enabled: isFlagOn(env || fromConfig),
+    source: env ? "env" : fromConfig ? "config" : "unset",
+  };
 }
 
 /**

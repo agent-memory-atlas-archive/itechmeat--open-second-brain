@@ -32,9 +32,14 @@
 
 import {
   operatorScriptPath,
+  parseRecipeFormat,
   renderCronRecipe,
+  renderSystemdTimer,
+  shellQuote,
+  singleLinePath,
   type CronRecipeOptions,
   type CronRecipeSpec,
+  type RecipeFormat,
 } from "./cron-recipe.ts";
 import { CODEGRAPH_CLI } from "../core/partner/codegraph.ts";
 import { GRAPH_HEALTH_CODES } from "../core/partner/codegraph-health.ts";
@@ -71,6 +76,9 @@ const FAIL_ON_HEALTH_FLAG = "--fail-on-health";
 /** Flag that makes the report machine-readable. */
 const JSON_FLAG = "--json";
 
+/** Label the line-break refusal names the repository path with. */
+const PROJECT_LABEL = "project";
+
 /** The JSON parser the health gate requires. */
 const JSON_PARSER = "jq";
 
@@ -98,7 +106,7 @@ function renderResyncBody(o2bBin: string, projectPath: string): string {
     "",
     "# The repository this recipe keeps indexed, baked in when the recipe",
     "# was rendered. Re-render for a different repository.",
-    'project="' + projectPath + '"',
+    "project=" + shellQuote(singleLinePath(PROJECT_LABEL, projectPath)),
     'stamp_dir="' + STAMP_DIR_EXPRESSION + '"',
     'stamp_file="$stamp_dir/' + stampFileName(projectPath) + '"',
     "",
@@ -202,14 +210,25 @@ export const CODEGRAPH_RESYNC_RECIPE: CronRecipeSpec<CodegraphResyncOptions> = O
   buildVerifyCommand: ({ o2bBin }) => `${o2bBin} ${REPORT_COMMAND} ${FAIL_ON_HEALTH_FLAG}`,
 });
 
+/** Options for {@link renderCodegraphResyncTemplate}. */
+export interface RenderCodegraphResyncOptions extends CronRecipeOptions {
+  /** Recipe format; cron when omitted. */
+  readonly format?: RecipeFormat;
+}
+
 /**
- * Render the resync recipe for one repository. Pure text: nothing is
+ * Render the resync recipe for one repository, as a crontab and Hermes
+ * recipe (the default) or as a systemd user timer. Pure text: nothing is
  * created, spawned or scheduled here.
  */
 export function renderCodegraphResyncTemplate(
   projectPath: string,
   interval: string,
-  opts: CronRecipeOptions = {},
+  opts: RenderCodegraphResyncOptions = {},
 ): string {
-  return renderCronRecipe(CODEGRAPH_RESYNC_RECIPE, interval, { ...opts, projectPath });
+  const { format, ...rest } = opts;
+  const recipeOpts: CodegraphResyncOptions = { ...rest, projectPath };
+  return parseRecipeFormat(format) === "systemd"
+    ? renderSystemdTimer(CODEGRAPH_RESYNC_RECIPE, interval, recipeOpts)
+    : renderCronRecipe(CODEGRAPH_RESYNC_RECIPE, interval, recipeOpts);
 }

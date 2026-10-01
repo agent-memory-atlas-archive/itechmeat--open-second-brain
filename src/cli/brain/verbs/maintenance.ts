@@ -15,32 +15,20 @@
  * `status` renders the lease holder and recent journal. Designed as
  * the cron entry point: a dead dashboard hour surfaces as
  * skipped:window in the journal instead of a contended vault.
+ * `run --cron-template [--interval N] [--format cron|systemd]` prints
+ * the recipe that schedules this very verb and returns before the
+ * lease, the gates, the journal and the metrics: it installs nothing.
  *
  * Exit codes: see {@link MAINTENANCE_EXIT}.
  */
 
-import { dream } from "../../../core/brain/dream.ts";
-import {
-  discoverBridges,
-  readDismissedBridges,
-  writeBridgeProposals,
-} from "../../../core/brain/link-graph/bridge-discovery.ts";
-import {
-  detectCommunities,
-  materializeClusterNotes,
-} from "../../../core/brain/link-graph/communities.ts";
-import { appendMetric } from "../../../core/brain/metrics.ts";
 import {
   createSafeguard,
   OPERATION,
   resolveSafeguardTimeoutMs,
 } from "../../../core/brain/safeguard.ts";
-import { isoSecond } from "../../../core/brain/time.ts";
-import { Store } from "../../../core/search/store.ts";
 import { currentLease, MAINTENANCE_LEASE_NAME } from "../../../core/brain/maintenance/lease.ts";
 import {
-  isLaneTask,
-  LANE_TASK,
   MAINTENANCE_BUSY_MINUTES,
   MAINTENANCE_BUSY_MINUTES_MAX,
   MAINTENANCE_BUSY_THRESHOLD,
@@ -48,22 +36,29 @@ import {
   runMaintenance,
   type DailyWindow,
   type LaneTask,
-  type MaintenanceTask,
+  type LaneTaskId,
   type MaintenanceTaskResult,
 } from "../../../core/brain/maintenance/lane.ts";
 import { listJournal, MAINTENANCE_JOURNAL_CAP } from "../../../core/brain/maintenance/journal.ts";
-import { createLaneReindex } from "../../../core/brain/maintenance/reindex-task.ts";
+import {
+  customTasksOffNotice,
+  resolveCustomTasks,
+} from "../../../core/brain/maintenance/custom-tasks.ts";
+import { isCustomLaneTask } from "../../../core/brain/maintenance/custom-task-id.ts";
+import { buildLaneTasks } from "../../../core/brain/maintenance/lane-tasks.ts";
 import { resolveAgentName } from "../../../core/config.ts";
+import { CronTemplateError, parseRecipeFormat } from "../../cron-recipe.ts";
+import {
+  DEFAULT_MAINTENANCE_INTERVAL,
+  MAX_WINDOW_HOUR,
+  parseWindowBounds,
+  renderMaintenanceCronTemplate,
+} from "../../maintenance-cron.ts";
 import type { EmbeddingSpendPreview } from "../../../core/search/indexer.ts";
 import { resolveSearchConfig } from "../../../core/search/index.ts";
 import { onInterrupt } from "../../interrupt.ts";
 import { attachProgress, reportProgressRefusal } from "../../progress-rail.ts";
-import { brainVerbContext, fail, ok, okJson, parse } from "../helpers.ts";
-
-const USAGE =
-  "usage: o2b brain maintenance run [--force] [--retry <task>] [--window H-H] [--tz ZONE] " +
-  "[--busy-minutes N] [--busy-threshold N] [--force-cost] [--progress] | status [--limit N]  " +
-  "[--vault <path>] [--json]";
+import { MAINTENANCE_USAGE, brainVerbContext, fail, ok, okJson, parse } from "../helpers.ts";
 
 /**
  * What this verb's exit code says, and why a refusal has its own number.
@@ -93,6 +88,9 @@ const USAGE =
  * spend 6 on. Collapsing it into 1 told a nightly cron that a pass is
  * broken when the only proved fact is that the pass did not finish; the
  * timeout already names itself (and its budget) in the row's error.
+ * A `custom:<name>` task is the exception: its timeout is the command
+ * hanging, which the failure streak already counts as a failure, so it
+ * exits 1 and the exit code reads the row the way the journal does.
  *
  * Precedence follows `exitCodeForCheck` and `doctorExitCode`: a proved
  * failure keeps the generic code even when another task timed out or was
@@ -110,6 +108,23 @@ export const MAINTENANCE_EXIT = Object.freeze({
 
 export type MaintenanceExit = (typeof MAINTENANCE_EXIT)[keyof typeof MAINTENANCE_EXIT];
 
+/** Flags that shape a lane run and have no place in the printed recipe. */
+const RUN_ONLY_FLAGS = [
+  "force",
+  "retry",
+  "force-cost",
+  "busy-minutes",
+  "busy-threshold",
+  "agent",
+  "progress",
+  "json",
+] as const;
+
+/** A built-in task's safeguard timeout: the one row whose outcome is unmeasured. */
+function builtInTimeout(t: MaintenanceTaskResult): boolean {
+  return t.timed_out === true && !isCustomLaneTask(t.name);
+}
+
 /**
  * The run's exit code from the lane's task rows, keyed ONLY on rows the
  * lane itself distinguished: `timed_out` (safeguard deadline, outcome
@@ -119,10 +134,10 @@ export type MaintenanceExit = (typeof MAINTENANCE_EXIT)[keyof typeof MAINTENANCE
  * would make the exit 6 impossible to reach.
  */
 export function maintenanceExitCode(tasks: ReadonlyArray<MaintenanceTaskResult>): MaintenanceExit {
-  if (tasks.some((t) => !t.ok && t.refused !== true && t.timed_out !== true)) {
+  if (tasks.some((t) => !t.ok && t.refused !== true && !builtInTimeout(t))) {
     return MAINTENANCE_EXIT.failed;
   }
-  if (tasks.some((t) => t.timed_out === true)) return MAINTENANCE_EXIT.probeIncomplete;
+  if (tasks.some(builtInTimeout)) return MAINTENANCE_EXIT.probeIncomplete;
   return tasks.some((t) => t.refused === true) ? MAINTENANCE_EXIT.refused : MAINTENANCE_EXIT.ok;
 }
 
@@ -140,11 +155,53 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
     progress: { type: "boolean" },
     json: { type: "boolean" },
     "force-cost": { type: "boolean" },
+    "cron-template": { type: "boolean" },
+    interval: { type: "string" },
+    format: { type: "string" },
   });
   const op = positional[0];
   const asJson = flags["json"] === true;
   if (op !== "run" && op !== "status") {
-    process.stderr.write(`${USAGE}\n`);
+    process.stderr.write(`${MAINTENANCE_USAGE}\n`);
+    return MAINTENANCE_EXIT.usage;
+  }
+
+  const cronTemplate = flags["cron-template"] === true;
+  const intervalRaw = flags["interval"] as string | undefined;
+  const formatRaw = flags["format"] as string | undefined;
+  // Named, not ignored: a recipe flag on a verb that is not printing a
+  // recipe would otherwise be accepted and do nothing, and `status
+  // --cron-template` would render the journal to someone who asked for a
+  // schedule.
+  if (cronTemplate && op === "status") {
+    process.stderr.write(
+      "brain maintenance status: --cron-template applies to run only " +
+        "(o2b brain maintenance run --cron-template)\n",
+    );
+    return MAINTENANCE_EXIT.usage;
+  }
+  if (!cronTemplate && (intervalRaw !== undefined || formatRaw !== undefined)) {
+    process.stderr.write(
+      `brain maintenance ${op}: --interval and --format apply only with --cron-template\n`,
+    );
+    return MAINTENANCE_EXIT.usage;
+  }
+  // The reverse rule: the recipe has no place for a lane-run flag, so
+  // printing it with one would schedule something other than was asked.
+  const runOnly = cronTemplate
+    ? RUN_ONLY_FLAGS.filter((name) => {
+        const value = flags[name];
+        return (
+          value !== undefined && value !== false && !(Array.isArray(value) && value.length === 0)
+        );
+      })
+    : [];
+  if (runOnly.length > 0) {
+    process.stderr.write(
+      "brain maintenance run: --cron-template prints the recipe only and does not take " +
+        runOnly.map((name) => `--${name}`).join(", ") +
+        " (a lane-run flag)\n",
+    );
     return MAINTENANCE_EXIT.usage;
   }
 
@@ -168,8 +225,12 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
       }
       const lease = currentLease(vault, { name: MAINTENANCE_LEASE_NAME, now });
       const journal = listJournal(vault, limit);
-      if (asJson) okJson({ lease, journal });
+      // Declared and switched off is said once, here, rather than left to
+      // look like a lane that forgot the operator's tasks.
+      const customOff = customTasksOffNotice(resolveCustomTasks(config ?? undefined));
+      if (asJson) okJson({ lease, journal, ...(customOff !== null ? { notice: customOff } : {}) });
       else {
+        if (customOff !== null) ok(customOff);
         ok(lease === null ? "lease: free" : `lease: ${lease.holder} until ${lease.expiresAt}`);
         ok(`journal (${journal.length} recent):`);
         for (const e of journal) {
@@ -186,16 +247,23 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
     let window: DailyWindow | undefined;
     const windowRaw = flags["window"] as string | undefined;
     if (windowRaw !== undefined) {
-      const match = /^(\d{1,2})-(\d{1,2})$/.exec(windowRaw.trim());
-      const startHour = match ? Number(match[1]) : Number.NaN;
-      const endHour = match ? Number(match[2]) : Number.NaN;
-      if (!match || startHour > 23 || endHour > 23) {
+      // The recipe renderer's own parser, so the lane and the recipe it
+      // prints cannot disagree on what a window is.
+      const bounds = parseWindowBounds(windowRaw.trim());
+      if (bounds === null) {
         process.stderr.write(
-          `brain maintenance run: --window must be H-H with hours 0..23, got: ${windowRaw}\n`,
+          `brain maintenance run: --window must be H-H with hours 0..${MAX_WINDOW_HOUR}, got: ${windowRaw}\n`,
         );
         return MAINTENANCE_EXIT.usage;
       }
-      window = { startHour, endHour, tz: (flags["tz"] as string | undefined) ?? "UTC" };
+      window = { ...bounds, tz: (flags["tz"] as string | undefined) ?? "UTC" };
+    }
+    if (cronTemplate) {
+      // Before the busy flags, the lease and every gate: printing the
+      // recipe is not a lane pass, so it must leave no lease, no journal
+      // row and no metric behind. The window was validated above so a
+      // recipe never embeds a window the lane would refuse at 3 a.m.
+      return printMaintenanceRecipe(vault, intervalRaw, formatRaw, windowRaw, flags["tz"]);
     }
     // Same ceilings the MCP tool's schema declares and its handler
     // enforces, read from the same constants beside the defaults: one
@@ -232,12 +300,12 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
     // and then say nothing for the length of a full reindex, which is
     // the silence this release exists to remove - and it would ALSO
     // double-count, because each of the four already reports its own
-    // stages. Forwarding needs no change to `MaintenanceTask`: the tasks
-    // are built here, so the sink reaches them by closure, and every
+    // stages. Forwarding needs no change to `MaintenanceTask`: the shared
+    // builder hands the sink to each built-in task by closure, and every
     // record names the operation that emitted it, which is exactly what
     // tells a reader which task the lane is currently inside. The MCP
-    // lane took the same decision for the same reason; a second shape
-    // here would make the two surfaces disagree about one mechanism.
+    // lane passes its sink to the same builder; a second shape would
+    // make the two surfaces disagree about one mechanism.
     const observation =
       flags["progress"] === true
         ? attachProgress({ command: "brain", argv: ["maintenance"], jsonRequested: asJson })
@@ -271,29 +339,28 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
     let result: Awaited<ReturnType<typeof runMaintenance>>;
     try {
       // Built once and read twice - the lane runs these, and `--retry` is
-      // checked against their names. That intent is unchanged; what
-      // changed is where the names come from. They were four literals
-      // here and four more in `admin-tools.ts`, and the two lists drifted
-      // apart twice, so both are now built from `LANE_TASK` and `--retry`
-      // validates against the vocabulary rather than against whichever
-      // list happens to be nearest.
+      // checked against their names. The task bodies live in one shared
+      // builder that the MCP tool calls too: the two surfaces carried
+      // inline copies of the four built-ins and the copies drifted, so
+      // neither surface spells a task any more. `taskNames` is the
+      // vocabulary THIS install registered - the built-ins plus any
+      // declared custom tasks - which is what `--retry` validates against.
       //
       // Inside the `try`, because the check below can return: a return
       // between `onInterrupt()` and the `try` would skip `release`.
       //
-      // Spend is opt-in (`maintenance_embeddings`): the shared builder
-      // decides whether the pass may embed, announces the predicted spend
-      // inside the task and receipts what the phase priced. An offline or
-      // un-opted vault stays keyword-only and reaches no provider.
-      // `--force-cost` bypasses a positive gate for this run and is
-      // recorded on the receipt when it did override one.
-      const reindexTask = createLaneReindex({
+      // Spend is opt-in (`maintenance_embeddings`): the builder decides
+      // whether the reindex pass may embed, announces the predicted spend
+      // inside the task and receipts what the phase priced. `--force-cost`
+      // bypasses a positive gate for this run and is recorded on the
+      // receipt when it did override one.
+      const lane = buildLaneTasks({
         vault,
         ...(config ? { configPath: config } : {}),
         searchConfig,
         now,
         forceCost: flags["force-cost"] === true,
-        safeguard: () => laneSafeguard(OPERATION.reindex),
+        safeguardFor: laneSafeguard,
         signal: interrupt.signal,
         ...laneProgress,
         ...(asJson
@@ -303,91 +370,26 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
                 ok(formatSpendBanner(preview, searchConfig.semantic.costGateUsd)),
             }),
       });
-      const laneTasks: ReadonlyArray<MaintenanceTask> = [
-        {
-          name: LANE_TASK.dream,
-          run: async () => {
-            dream(vault, { now, safeguard: laneSafeguard(OPERATION.dream), ...laneProgress });
-          },
-        },
-        reindexTask.task,
-        // Link-recall-intelligence passes ride the same lease, after
-        // reindex so they see fresh edges. Both are fail-soft inside:
-        // a vault without embeddings simply proposes nothing.
-        {
-          name: LANE_TASK.bridges,
-          run: async () => {
-            const store = await Store.open(searchConfig, { mode: "read" });
-            try {
-              const report = discoverBridges(store, {
-                dismissed: readDismissedBridges(vault),
-                safeguard: laneSafeguard(OPERATION.bridges),
-                ...laneProgress,
-              });
-              writeBridgeProposals(vault, report, { now });
-              try {
-                appendMetric(vault, {
-                  surface: "bridge_discovery",
-                  runAt: isoSecond(now),
-                  payload: {
-                    proposals: report.proposals.length,
-                    scanned_candidates: report.scannedCandidates,
-                    vec_available: report.vecAvailable,
-                    lane: true,
-                  },
-                });
-              } catch {
-                // Metrics are observability, not correctness.
-              }
-            } finally {
-              await store.close();
-            }
-          },
-        },
-        {
-          name: LANE_TASK.clusters,
-          run: async () => {
-            const store = await Store.open(searchConfig, { mode: "read" });
-            try {
-              const communities = detectCommunities(store, {
-                safeguard: laneSafeguard(OPERATION.clusters),
-                ...laneProgress,
-              });
-              const materialized = materializeClusterNotes(vault, communities, { store, now });
-              try {
-                appendMetric(vault, {
-                  surface: "communities",
-                  runAt: isoSecond(now),
-                  payload: {
-                    communities: communities.length,
-                    sizes: communities.map((c) => c.size),
-                    written: materialized.written.length,
-                    removed: materialized.removed.length,
-                    lane: true,
-                  },
-                });
-              } catch {
-                // Metrics are observability, not correctness.
-              }
-            } finally {
-              await store.close();
-            }
-          },
-        },
-      ];
-      const requested = stringArrayFlag(flags["retry"]);
-      const unknownRetries = requested.filter((name) => !isLaneTask(name));
+      // Named, never dropped: a refused declaration journals nothing, and
+      // the valid tasks still run.
+      for (const reason of lane.custom.errors) {
+        process.stderr.write(`custom task refused: ${reason}\n`);
+      }
+      const registered = new Set<string>(lane.taskNames);
+      // Deduplicated, as the MCP tool does: naming a task twice retries it once.
+      const requested = [...new Set(stringArrayFlag(flags["retry"]))];
+      const unknownRetries = requested.filter((name) => !registered.has(name));
       if (unknownRetries.length > 0) {
         // Named, not ignored: a typo that silently retried nothing would
         // leave the operator reading a refusal they thought they had just
         // asked past.
         process.stderr.write(
           `brain maintenance run: --retry names no lane task: ${unknownRetries.join(", ")} ` +
-            `(tasks: ${laneTasks.map((task) => task.name).join(", ")})\n`,
+            `(tasks: ${lane.taskNames.join(", ")})\n`,
         );
         return MAINTENANCE_EXIT.usage;
       }
-      const retryTasks = requested.filter(isLaneTask);
+      const retryTasks = requested as LaneTaskId[];
       result = await runMaintenance(vault, {
         now,
         holder,
@@ -395,12 +397,12 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
         ...(window !== undefined ? { window } : {}),
         busy: { minutes: busyMinutes, threshold: busyThreshold },
         ...(retryTasks.length > 0 ? { retryTasks } : {}),
-        tasks: laneTasks,
+        tasks: lane.tasks,
       });
 
       // The run-level spend block: the banner this run announced and the
       // receipt its reindex pass returned, both absent when nothing spent.
-      const spend = reindexTask.spendBlock(result.tasks);
+      const spend = lane.reindex.spendBlock(result.tasks);
       if (asJson) {
         okJson({
           verdict: result.verdict,
@@ -439,6 +441,37 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
       return MAINTENANCE_EXIT.failed;
     }
     return fail(message);
+  }
+}
+
+/**
+ * Print the lane's cron or systemd recipe for `vault`. A bad interval or
+ * format is the lane's usage code 2, not the 1 the two older recipe
+ * surfaces return: in this verb's vocabulary 1 means "attempted and
+ * failed" (see {@link MAINTENANCE_EXIT}).
+ */
+function printMaintenanceRecipe(
+  vault: string,
+  intervalRaw: string | undefined,
+  formatRaw: string | undefined,
+  windowRaw: string | undefined,
+  tzRaw: unknown,
+): MaintenanceExit {
+  try {
+    const body = renderMaintenanceCronTemplate(intervalRaw ?? DEFAULT_MAINTENANCE_INTERVAL, {
+      vault,
+      format: parseRecipeFormat(formatRaw),
+      ...(windowRaw !== undefined ? { window: windowRaw.trim() } : {}),
+      ...(typeof tzRaw === "string" ? { tz: tzRaw } : {}),
+    });
+    process.stdout.write(body.endsWith("\n") ? body : `${body}\n`);
+    return MAINTENANCE_EXIT.ok;
+  } catch (err) {
+    if (err instanceof CronTemplateError) {
+      process.stderr.write(`brain maintenance run: ${err.message}\n`);
+      return MAINTENANCE_EXIT.usage;
+    }
+    throw err;
   }
 }
 

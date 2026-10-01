@@ -9,6 +9,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
+import { MAINTENANCE_USAGE, VERB_HELP } from "../../src/cli/brain/help-text.ts";
 import {
   MAINTENANCE_EXIT,
   formatSpendBanner,
@@ -21,11 +22,14 @@ import {
   type MaintenanceSpendReceipt,
   type MaintenanceTaskResult,
 } from "../../src/core/brain/maintenance/lane.ts";
+import { listJournal, MAINTENANCE_JOURNAL_CAP } from "../../src/core/brain/maintenance/journal.ts";
+import { currentLease, MAINTENANCE_LEASE_NAME } from "../../src/core/brain/maintenance/lease.ts";
 import { MAINTENANCE_EMBEDDINGS_ENV } from "../../src/core/config.ts";
 import { MAINTENANCE_FAILURE_STREAK_LIMIT_DEFAULT } from "../../src/core/brain/policy/blocks/maintenance.ts";
 import { sqliteVecLoadable } from "../helpers/sqlite-vec.ts";
 import { startFakeHttp, type FakeHttp } from "../helpers/fake-http.ts";
 import { FAKE_PROVIDER_KEY } from "../helpers/fake-credentials.ts";
+import { homeEnv } from "../helpers/platform.ts";
 import { runCli } from "../helpers/run-cli.ts";
 
 /**
@@ -111,9 +115,15 @@ test("a malformed window is a usage error", async () => {
   expect(result.returncode).toBe(2);
 });
 
-/** The per-test config, which alone names the test vault. */
+/**
+ * The per-test config, which alone names the test vault. The lane mints per-device state and runs custom tasks from the home
+ * directory, so every lane-running child gets a home of its own under
+ * the test's temp dir rather than the runner's.
+ */
 function baseEnv(): Record<string, string> {
-  return { OPEN_SECOND_BRAIN_CONFIG: configPath };
+  const home = join(tmp, "home");
+  mkdirSync(home, { recursive: true });
+  return { OPEN_SECOND_BRAIN_CONFIG: configPath, ...homeEnv(home) };
 }
 
 /** The local provider is configured, model-free and price-free, and the lane is opted in. */
@@ -192,6 +202,183 @@ test("--retry runs the refused task and names an unknown task as a usage error",
   expect(dream?.ok).toBe(true);
 });
 
+/** `run --cron-template` with `extra` flags against the test vault. */
+function recipe(extra: ReadonlyArray<string>) {
+  return runCli(["brain", "maintenance", "run", "--cron-template", "--vault", vault, ...extra], {
+    env: baseEnv(),
+  });
+}
+
+describe("run --cron-template prints the lane recipe and writes nothing", () => {
+  test("prints a recipe naming the job and the vault; no lease, no journal", async () => {
+    const printed = await recipe([]);
+    expect(printed.returncode).toBe(MAINTENANCE_EXIT.ok);
+    expect(printed.stdout).toContain("osb-maintenance");
+    expect(printed.stdout).toContain(`o2b brain maintenance run --vault '${vault}' --json`);
+    expect(printed.stdout).toContain("0 */1 * * *");
+    // Returned before the lease and the journal: printing a recipe is not
+    // a lane pass, so it must leave no trace a later status would read.
+    expect(currentLease(vault, { name: MAINTENANCE_LEASE_NAME, now: new Date() })).toBeNull();
+    expect(listJournal(vault, MAINTENANCE_JOURNAL_CAP)).toEqual([]);
+    expect(existsSync(join(vault, ".open-second-brain", "maintenance-runs.jsonl"))).toBe(false);
+  });
+
+  test("a bad interval or format is the lane's usage code, with the kernel's message", async () => {
+    const seconds = await recipe(["--interval", "30s"]);
+    expect(seconds.returncode).toBe(MAINTENANCE_EXIT.usage);
+    expect(seconds.stderr).toContain("second-level intervals are not supported");
+    const months = await recipe(["--interval", "90d"]);
+    expect(months.returncode).toBe(MAINTENANCE_EXIT.usage);
+    expect(months.stderr).toContain("an interval of 90 days cannot be expressed");
+    const launchd = await recipe(["--format", "launchd"]);
+    expect(launchd.returncode).toBe(MAINTENANCE_EXIT.usage);
+    expect(launchd.stderr).toContain("systemd");
+  });
+
+  test("a lane-run flag beside --cron-template is the usage code, named, and writes nothing", async () => {
+    const forced = await recipe(["--force"]);
+    expect(forced.returncode).toBe(MAINTENANCE_EXIT.usage);
+    expect(forced.stderr).toContain(
+      "--cron-template prints the recipe only and does not take --force (a lane-run flag)",
+    );
+    expect(forced.stdout).toBe("");
+    const several = await recipe(["--json", "--retry", "dream"]);
+    expect(several.returncode).toBe(MAINTENANCE_EXIT.usage);
+    expect(several.stderr).toContain("--retry, --json");
+    expect(currentLease(vault, { name: MAINTENANCE_LEASE_NAME, now: new Date() })).toBeNull();
+    expect(listJournal(vault, MAINTENANCE_JOURNAL_CAP)).toEqual([]);
+  });
+
+  test("the window is validated and carried into the printed body", async () => {
+    const bad = await recipe(["--window", "25-3"]);
+    expect(bad.returncode).toBe(MAINTENANCE_EXIT.usage);
+    const windowed = await recipe(["--window", "3-5", "--tz", "Europe/Berlin"]);
+    expect(windowed.returncode).toBe(MAINTENANCE_EXIT.ok);
+    expect(windowed.stdout).toContain("--window 3-5");
+    expect(windowed.stdout).toContain("--tz Europe/Berlin");
+    const unwindowed = await recipe([]);
+    expect(unwindowed.stdout).not.toContain("--window");
+  });
+
+  test("status refuses --cron-template", async () => {
+    const status = await runCli(
+      ["brain", "maintenance", "status", "--cron-template", "--vault", vault],
+      { env: baseEnv() },
+    );
+    expect(status.returncode).toBe(MAINTENANCE_EXIT.usage);
+    expect(status.stderr).toContain("--cron-template");
+  });
+
+  test("--format systemd prints a user timer at the default interval", async () => {
+    const timer = await recipe(["--format", "systemd"]);
+    expect(timer.returncode).toBe(MAINTENANCE_EXIT.ok);
+    expect(timer.stdout).toContain("OnUnitActiveSec=1h");
+    expect(timer.stdout).toContain(`o2b brain maintenance run --vault '${vault}' --json`);
+  });
+});
+
+/** Rewrite the per-test config with `lines` after the vault key. */
+function writeConfig(lines: ReadonlyArray<string>): void {
+  writeFileSync(configPath, [`vault: ${vault}`, ...lines].join("\n") + "\n");
+}
+
+async function initVault(): Promise<void> {
+  const init = await runCli(["brain", "init", "--vault", vault], { env: baseEnv() });
+  expect(init.returncode).toBe(0);
+}
+
+describe("declared custom tasks ride the lane", () => {
+  test("with the switch on, run reports the custom row after the built-ins", async () => {
+    writeConfig(["maintenance_custom_tasks: true", "maintenance_custom_tidy: exit 0"]);
+    await initVault();
+    const run = await runCli(["brain", "maintenance", "run", "--vault", vault, "--json"], {
+      env: baseEnv(),
+    });
+    expect(run.returncode).toBe(MAINTENANCE_EXIT.ok);
+    const payload = JSON.parse(run.stdout) as { tasks: Array<{ name: string; ok: boolean }> };
+    const tidy = payload.tasks.find((t) => t.name === "custom:tidy");
+    expect(tidy?.ok).toBe(true);
+    expect(payload.tasks.map((t) => t.name).toSorted()).toEqual(
+      [...LANE_TASKS, "custom:tidy"].toSorted(),
+    );
+  });
+
+  test("--retry accepts a declared custom task and names an undeclared one", async () => {
+    writeConfig(["maintenance_custom_tasks: true", "maintenance_custom_tidy: exit 0"]);
+    await initVault();
+    seedFailureStreak("custom:tidy", MAINTENANCE_FAILURE_STREAK_LIMIT_DEFAULT);
+
+    const refused = await runCli(["brain", "maintenance", "run", "--vault", vault], {
+      env: baseEnv(),
+    });
+    expect(refused.returncode).toBe(MAINTENANCE_EXIT.refused);
+    expect(refused.stdout).toContain("custom:tidy: REFUSED");
+
+    const unknown = await runCli(
+      ["brain", "maintenance", "run", "--retry", "custom:nope", "--vault", vault],
+      { env: baseEnv() },
+    );
+    expect(unknown.returncode).toBe(MAINTENANCE_EXIT.usage);
+    expect(unknown.stderr).toContain("custom:nope");
+    expect(unknown.stderr).toContain("custom:tidy");
+
+    const retried = await runCli(
+      ["brain", "maintenance", "run", "--retry", "custom:tidy", "--vault", vault, "--json"],
+      { env: baseEnv() },
+    );
+    expect(retried.returncode).toBe(MAINTENANCE_EXIT.ok);
+    const payload = JSON.parse(retried.stdout) as {
+      tasks: Array<{ name: string; ok: boolean; refused?: boolean }>;
+    };
+    const tidy = payload.tasks.find((t) => t.name === "custom:tidy");
+    expect(tidy?.refused).toBeUndefined();
+    expect(tidy?.ok).toBe(true);
+  });
+
+  test("a bad declaration is named on stderr and the valid tasks still run", async () => {
+    writeConfig([
+      "maintenance_custom_tasks: true",
+      "maintenance_custom_tidy: exit 0",
+      "maintenance_custom_Bad: exit 0",
+    ]);
+    await initVault();
+    const run = await runCli(["brain", "maintenance", "run", "--vault", vault, "--json"], {
+      env: baseEnv(),
+    });
+    expect(run.stderr).toContain("custom task refused:");
+    expect(run.stderr).toContain("Bad");
+    const payload = JSON.parse(run.stdout) as {
+      tasks: MaintenanceTaskResult[];
+    };
+    // A refused declaration journals nothing and is not a failed attempt:
+    // the run that only refused it exits 0.
+    expect(run.returncode).toBe(0);
+    expect(payload.tasks.find((t) => t.name === "custom:Bad")).toBeUndefined();
+    expect(payload.tasks.find((t) => t.name === "custom:tidy")?.ok).toBe(true);
+  });
+
+  test("status shows custom rows, and says when declared tasks are switched off", async () => {
+    writeConfig(["maintenance_custom_tasks: true", "maintenance_custom_tidy: exit 0"]);
+    await initVault();
+    const run = await runCli(["brain", "maintenance", "run", "--vault", vault], {
+      env: baseEnv(),
+    });
+    expect(run.returncode).toBe(MAINTENANCE_EXIT.ok);
+    const on = await runCli(["brain", "maintenance", "status", "--vault", vault], {
+      env: baseEnv(),
+    });
+    expect(on.stdout).toContain("custom:tidy ok");
+    expect(on.stdout).not.toContain("custom tasks declared but maintenance_custom_tasks is off");
+
+    writeConfig(["maintenance_custom_tidy: exit 0"]);
+    const off = await runCli(["brain", "maintenance", "status", "--vault", vault], {
+      env: baseEnv(),
+    });
+    expect(off.returncode).toBe(MAINTENANCE_EXIT.ok);
+    expect(off.stdout).toContain("custom tasks declared but maintenance_custom_tasks is off");
+  });
+});
+
 /** A clean task row, as the lane produces it. */
 function okRow(name: MaintenanceTaskResult["name"]): MaintenanceTaskResult {
   return { name, ok: true, duration_ms: 1 };
@@ -225,6 +412,24 @@ function refusedRow(name: MaintenanceTaskResult["name"]): MaintenanceTaskResult 
   };
 }
 
+describe("brain maintenance --help", () => {
+  test("opens with the verb's own usage line and names custom tasks and the recipe", () => {
+    const help = VERB_HELP["maintenance"]!;
+    expect(help.startsWith(`${MAINTENANCE_USAGE}\n`)).toBe(true);
+    for (const flag of [
+      "--cron-template",
+      "--interval",
+      "--format",
+      "--force-cost",
+      "--progress",
+    ]) {
+      expect(MAINTENANCE_USAGE).toContain(flag);
+    }
+    expect(help).toContain("custom:<name>");
+    expect(help).toContain("maintenance_custom_tasks: true");
+  });
+});
+
 describe("maintenanceExitCode", () => {
   test("a clean run exits 0 and a deterministic task fault exits 1", () => {
     expect(maintenanceExitCode([okRow(LANE_TASK.dream), okRow(LANE_TASK.reindex)])).toBe(
@@ -243,6 +448,13 @@ describe("maintenanceExitCode", () => {
     // The healthy tasks around it do not make the run clean.
     expect(maintenanceExitCode([timedOutRow(LANE_TASK.bridges), okRow(LANE_TASK.clusters)])).toBe(
       MAINTENANCE_EXIT.probeIncomplete,
+    );
+  });
+
+  test("a timed-out custom task exits 1: the streak counts its hang as a failure", () => {
+    expect(maintenanceExitCode([timedOutRow("custom:tidy")])).toBe(MAINTENANCE_EXIT.failed);
+    expect(maintenanceExitCode([timedOutRow("custom:tidy"), timedOutRow(LANE_TASK.bridges)])).toBe(
+      MAINTENANCE_EXIT.failed,
     );
   });
 

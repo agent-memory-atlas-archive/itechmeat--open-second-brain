@@ -31,6 +31,21 @@ import { DRAIN_STATE, RequestDrain, resolveDrainDeadlineMs, type DrainOutcome } 
 import { ORIGIN_CHANNEL, setOriginChannel } from "../core/origin-channel.ts";
 import { TRANSPORT_REACH, type TransportReach } from "../core/graph/transport-reach.ts";
 
+/**
+ * The process-level fault counts a served transport reports on `/health`.
+ *
+ * Typed here and filled by a getter the CLI injects
+ * ({@link ServeHttpOptions.faultCounts}): the guard that counts them is
+ * process-global and lives in `src/cli/mcp-fault-guard.ts`, and this
+ * module imports nothing from the CLI.
+ */
+export interface McpFaultCounts {
+  readonly unhandled_rejection: number;
+  readonly uncaught_exception: number;
+  /** ISO time of the latest fault of either kind, `null` before any. */
+  readonly last_fault_at: string | null;
+}
+
 export interface ServeHttpOptions {
   readonly host?: string;
   readonly port?: number;
@@ -41,6 +56,12 @@ export interface ServeHttpOptions {
    * Defaults to `O2B_MCP_DRAIN_MS`, and to ten seconds without it.
    */
   readonly drainDeadlineMs?: number;
+  /**
+   * The process-level fault counts, read on every `/health` request.
+   * Injected by `o2b mcp` from its fault guard; without it `/health`
+   * carries no `faults` field, exactly as before.
+   */
+  readonly faultCounts?: () => McpFaultCounts;
 }
 
 export interface HttpServerHandle {
@@ -114,7 +135,7 @@ export async function startHttp(
     // shutdown then waits for a client that is waiting for it.
     res.on("close", finish);
     try {
-      await handleHttpRequest(mcp, apiKey, host, drain, req, res);
+      await handleHttpRequest(mcp, apiKey, host, drain, opts.faultCounts, req, res);
     } catch (exc) {
       // This promise used to be floated. A throw from the dispatch left
       // the socket open with no response on it and no record anywhere;
@@ -218,6 +239,7 @@ async function handleHttpRequest(
   apiKey: string | null,
   boundHost: string,
   drain: RequestDrain,
+  faultCounts: (() => McpFaultCounts) | undefined,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
@@ -244,14 +266,18 @@ async function handleHttpRequest(
     // and wait, and the count says how long that wait has left in it.
     // The health probe itself is never refused during a drain - a
     // shutdown a supervisor cannot observe is a shutdown it will report
-    // as a crash. The drain counts this request like any other; it
-    // answers within the same tick, so it never holds one open.
+    // as a crash. The drain does not count this request (see the
+    // `untracked` note in `startHttp`), so `in_flight` never includes
+    // the act of reading it.
+    // `faults` only when the CLI injected a getter: a supervisor that
+    // parses this body today sees exactly the three fields it knows.
     res.writeHead(200, { "content-type": "application/json" });
     res.end(
       JSON.stringify({
         status: drain.draining ? DRAIN_STATE.draining : "ok",
         transport: "http",
         in_flight: drain.inFlight,
+        ...(faultCounts !== undefined ? { faults: faultCounts() } : {}),
       }) + "\n",
     );
     return;

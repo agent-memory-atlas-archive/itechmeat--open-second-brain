@@ -19,7 +19,9 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { CronTemplateError } from "../../src/cli/cron-recipe.ts";
 import { renderCodegraphResyncTemplate } from "../../src/cli/partner-codegraph-cron.ts";
+import { IS_WINDOWS } from "../helpers/platform.ts";
 import { runCli } from "../helpers/run-cli.ts";
 
 let tmp: string;
@@ -62,7 +64,7 @@ describe("the resync recipe renders", () => {
     expect(body).toContain("--name osb-codegraph-resync");
     expect(body).toContain("hermes cron create");
     expect(body).toContain('codegraph init "$project"');
-    expect(body).toContain('project="/srv/projects/demo"');
+    expect(body).toContain("project='/srv/projects/demo'");
   });
 
   test("the wrong-root guard precedes the indexer invocation", () => {
@@ -113,6 +115,42 @@ describe("the resync recipe renders", () => {
     expect(body).toContain("${XDG_STATE_HOME:-$HOME/.local/state}/open-second-brain");
   });
 
+  test("the systemd format carries the same script on the same cadence", () => {
+    const body = renderCodegraphResyncTemplate("/srv/projects/demo", "6h", { format: "systemd" });
+    expect(body).toContain("OnUnitActiveSec=6h");
+    expect(body).toContain('codegraph init "$project"');
+    expect(body).not.toContain("0 */6 * * *");
+  });
+
+  test.skipIf(IS_WINDOWS)(
+    "a project path with shell syntax reaches the script as a literal value",
+    () => {
+      // The first path is valid inside double quotes too, so only quoting
+      // that disables substitution keeps the marker from being created;
+      // the second adds the quote characters themselves.
+      for (const path of ["/srv/x$(touch marker)", "/srv/x$(touch marker)`id`\"q'y"]) {
+        const body = renderCodegraphResyncTemplate(path, "6h");
+        const line = body.split("\n").find((l) => l.startsWith("project="));
+        expect(line).toBeDefined();
+        // Evaluate exactly the line the script carries: nothing inside the
+        // value may run, and it must come back byte for byte.
+        const run = Bun.spawnSync(["bash", "-c", `${line}\nprintf %s "$project"`], { cwd: tmp });
+        expect(`marker created: ${existsSync(join(tmp, "marker"))}`).toBe("marker created: false");
+        expect(run.exitCode).toBe(0);
+        expect(run.stdout.toString()).toBe(path);
+      }
+    },
+  );
+
+  test("a project path with a line break is refused by name", () => {
+    for (const path of ["/srv/a\nOSBEOF", "/srv/a\rb"]) {
+      expect(() => renderCodegraphResyncTemplate(path, "6h")).toThrow(CronTemplateError);
+      expect(() => renderCodegraphResyncTemplate(path, "6h", { format: "systemd" })).toThrow(
+        /project path must not contain a line break/,
+      );
+    }
+  });
+
   test("two repositories get two stamp files", () => {
     const a = renderCodegraphResyncTemplate("/srv/projects/alpha", "6h");
     const b = renderCodegraphResyncTemplate("/srv/projects/beta", "6h");
@@ -128,7 +166,7 @@ describe("o2b partner codegraph resync (CLI)", () => {
     const res = await runCli(["partner", "codegraph", "resync", "--cron-template"], { cwd: repo });
     expect(res.returncode).toBe(0);
     expect(res.stdout).toContain("cat >~/.local/bin/osb-codegraph-resync.sh");
-    expect(res.stdout).toContain(`project="${repo}"`);
+    expect(res.stdout).toContain(`project='${repo}'`);
     expect(listTree(tmp)).toEqual(before);
   });
 
@@ -140,7 +178,7 @@ describe("o2b partner codegraph resync (CLI)", () => {
       { cwd: tmp },
     );
     expect(res.returncode).toBe(0);
-    expect(res.stdout).toContain(`project="${repo}"`);
+    expect(res.stdout).toContain(`project='${repo}'`);
     expect(listTree(tmp)).toEqual(before);
   });
 
@@ -163,6 +201,44 @@ describe("o2b partner codegraph resync (CLI)", () => {
     expect(res.stdout).toBe("");
     expect(existsSync(join(repo, ".codegraph"))).toBe(false);
     expect(listTree(tmp)).toEqual(before);
+  });
+
+  test("without --format the CLI prints the cron recipe, not the systemd pair", async () => {
+    const repo = makeRepo("repo");
+    const res = await runCli(["partner", "codegraph", "resync", "--cron-template"], {
+      cwd: repo,
+    });
+    expect(res.returncode).toBe(0);
+    expect(res.stdout).toContain("0 */6 * * *    ~/.local/bin/osb-codegraph-resync.sh");
+    expect(res.stdout).toContain("hermes cron create");
+    expect(res.stdout).not.toContain("OnUnitActiveSec=");
+  });
+
+  test("--format systemd prints a service and timer pair and writes nothing", async () => {
+    const repo = makeRepo("repo");
+    const before = listTree(tmp);
+    const res = await runCli(
+      ["partner", "codegraph", "resync", "--cron-template", "--format", "systemd"],
+      { cwd: repo },
+    );
+    expect(res.returncode).toBe(0);
+    expect(res.stdout).toContain("~/.config/systemd/user/osb-codegraph-resync.service");
+    expect(res.stdout).toContain("~/.config/systemd/user/osb-codegraph-resync.timer");
+    expect(res.stdout).toContain("OnUnitActiveSec=6h");
+    expect(res.stdout).toContain(`project='${repo}'`);
+    expect(res.stdout).not.toContain("hermes cron create");
+    expect(listTree(tmp)).toEqual(before);
+  });
+
+  test("--format launchd exits 1 naming the formats it knows", async () => {
+    const repo = makeRepo("repo");
+    const res = await runCli(
+      ["partner", "codegraph", "resync", "--cron-template", "--format", "launchd"],
+      { cwd: repo },
+    );
+    expect(res.returncode).toBe(1);
+    expect(res.stderr).toContain('unknown recipe format "launchd": expected cron or systemd');
+    expect(res.stdout).toBe("");
   });
 
   test("an interval cron cannot express exits 1 with the inherited parser error", async () => {

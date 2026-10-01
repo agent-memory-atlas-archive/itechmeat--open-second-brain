@@ -5,15 +5,21 @@
  * jobs.length transitions: 0 → 1 → 1 → 0 → 0
  *
  * OSB_HERMES_JOBS points at a tmp file so the user's real cron config
- * (/root/.hermes/cron/jobs.json) is never touched.
+ * (~/.hermes/cron/jobs.json of whoever runs the suite) is never touched.
+ * The default path itself is asserted through the pure resolver, which
+ * takes the environment and the home directory as arguments.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { HermesJobsPathError, resolveJobsFilePath } from "../../src/cli/discipline-install.ts";
 import { runCli } from "../helpers/run-cli.ts";
+
+const CLI_ENTRY = join(import.meta.dir, "..", "..", "src", "cli", "main.ts");
+const NO_HOME_PRELOAD = join(import.meta.dir, "..", "fixtures", "discipline-install", "no-home.ts");
 
 let tmp: string;
 let vault: string;
@@ -204,5 +210,60 @@ describe("o2b discipline install / uninstall", () => {
     const r = await runCli(["discipline", "uninstall", "--vault", vault], { env });
     expect(r.returncode).toBe(0);
     expect(readJobs().jobs.length).toBe(0);
+  });
+});
+
+describe("resolveJobsFilePath", () => {
+  const JOBS_TAIL = [".hermes", "cron", "jobs.json"] as const;
+
+  test("defaults to the Hermes jobs file under the given home", () => {
+    expect(resolveJobsFilePath({}, "/home/op")).toBe(join("/home/op", ...JOBS_TAIL));
+    // Root hosts keep the path they always had.
+    expect(resolveJobsFilePath({}, "/root")).toBe(join("/root", ...JOBS_TAIL));
+  });
+
+  test("OSB_HERMES_JOBS overrides the default, even without a home", () => {
+    expect(resolveJobsFilePath({ OSB_HERMES_JOBS: "/srv/jobs.json" }, "/home/op")).toBe(
+      "/srv/jobs.json",
+    );
+    expect(resolveJobsFilePath({ OSB_HERMES_JOBS: "/srv/jobs.json" }, "")).toBe("/srv/jobs.json");
+  });
+
+  test("an empty OSB_HERMES_JOBS is unset, not a path", () => {
+    expect(resolveJobsFilePath({ OSB_HERMES_JOBS: "" }, "/home/op")).toBe(
+      join("/home/op", ...JOBS_TAIL),
+    );
+  });
+
+  test("no home and no override is a named error that names the way out", () => {
+    let caught: unknown;
+    try {
+      resolveJobsFilePath({}, "");
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(HermesJobsPathError);
+    expect((caught as Error).name).toBe("HermesJobsPathError");
+    expect((caught as Error).message).toContain("OSB_HERMES_JOBS");
+  });
+});
+
+describe("o2b discipline on a host without a home directory", () => {
+  test("install and uninstall exit 1 naming OSB_HERMES_JOBS and write nothing", () => {
+    for (const verb of [
+      ["install", "--vault", vault, "--telegram-target", "telegram:-100123:42"],
+      ["uninstall", "--vault", vault],
+    ]) {
+      const env: Record<string, string> = { PATH: process.env["PATH"] ?? "", HOME: tmp };
+      if (process.env["SYSTEMROOT"]) env["SYSTEMROOT"] = process.env["SYSTEMROOT"];
+      const run = Bun.spawnSync(
+        [process.execPath, "--preload", NO_HOME_PRELOAD, CLI_ENTRY, "discipline", ...verb],
+        { cwd: tmp, env, stdout: "pipe", stderr: "pipe" },
+      );
+      expect(run.stderr.toString()).toContain("cannot resolve the home directory");
+      expect(run.stderr.toString()).toContain("OSB_HERMES_JOBS");
+      expect(run.exitCode).toBe(1);
+      expect(existsSync(join(tmp, ".hermes"))).toBe(false);
+    }
   });
 });
