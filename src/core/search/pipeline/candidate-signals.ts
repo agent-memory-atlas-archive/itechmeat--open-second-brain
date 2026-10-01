@@ -58,6 +58,14 @@ export interface CandidateSignals {
   readonly tierByDoc: ReadonlyMap<number, PageTier> | undefined;
   readonly reuseRateByChunk: ReadonlyMap<number, number> | undefined;
   readonly eventTimeMsByChunk: ReadonlyMap<number, number> | undefined;
+  /**
+   * The candidate documents the index MEASURED as pinned (t_f7bef96a),
+   * read through the store's pinned lookup - one SQL pass over the
+   * candidates' pinned rows, no query-time file reads. Undefined when no
+   * candidate is pinned, so the ranker's pinned layer stays unwired and
+   * every score and breakdown shape is byte-identical.
+   */
+  readonly pinnedDocIds: ReadonlySet<number> | undefined;
 }
 
 export function collectCandidateSignals(input: CandidateSignalsInput): CandidateSignals {
@@ -87,6 +95,17 @@ export function collectCandidateSignals(input: CandidateSignalsInput): Candidate
     ? collectActivationSignals(input)
     : { activationByChunk: undefined, coAccessByChunk: undefined };
 
+  // The pinned layer is always-on (a bounded signal over explicit operator
+  // state), so the lookup is not config-gated; a candidate set with no
+  // pinned document yields an empty set, reported as `undefined` by the
+  // module-wide omit-when-empty rule.
+  const candidateDocIds: number[] = [];
+  for (const id of ids) {
+    const chunk = input.hydrated.get(id);
+    if (chunk !== undefined) candidateDocIds.push(chunk.documentId);
+  }
+  const pinnedDocIds = store.pinnedDocumentIds(candidateDocIds);
+
   return {
     inboundLinkSources,
     tagsByDoc,
@@ -99,6 +118,7 @@ export function collectCandidateSignals(input: CandidateSignalsInput): Candidate
     tierByDoc: collectPageTier(input),
     reuseRateByChunk: collectReuseRates(input),
     eventTimeMsByChunk: input.temporalIntentActive ? collectDeclaredEventTimes(input) : undefined,
+    pinnedDocIds: pinnedDocIds.size > 0 ? pinnedDocIds : undefined,
   };
 }
 

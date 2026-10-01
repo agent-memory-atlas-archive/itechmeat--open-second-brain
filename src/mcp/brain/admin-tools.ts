@@ -12,7 +12,7 @@ import { relative } from "node:path";
 import { toPosix } from "../../core/path-safety.ts";
 import { reachView } from "../../core/brain/reach-view.ts";
 import { resolveAgentName } from "../../core/config.ts";
-import { indexVault, resolveSearchConfig } from "../../core/search/index.ts";
+import { resolveSearchConfig } from "../../core/search/index.ts";
 import { Store } from "../../core/search/store.ts";
 import {
   assignNoteLabel,
@@ -41,6 +41,7 @@ import type { ProgressSink } from "../../core/brain/progress.ts";
 import { requiredStringArg, toolSafeguard } from "./shared.ts";
 import { currentLease } from "../../core/brain/maintenance/lease.ts";
 import { listJournal, MAINTENANCE_JOURNAL_CAP } from "../../core/brain/maintenance/journal.ts";
+import { createLaneReindex } from "../../core/brain/maintenance/reindex-task.ts";
 import {
   isLaneTask,
   LANE_TASK,
@@ -450,6 +451,21 @@ async function toolBrainMaintenance(
   // tasks itself: every event names the operation that emitted it, which
   // is what tells a reader which of the four the lane is currently in.
   const laneProgress = onProgress ? { onProgress } : {};
+  // Spend parity with the CLI lane: the same builder decides whether the
+  // pass may embed (`maintenance_embeddings` opt-in plus a reachable
+  // provider), computes the preview inside the task - so a run a gate
+  // skips reads nothing and reports no banner - and receipts what the
+  // phase priced. `force_cost` bypasses a positive gate for this run and
+  // is recorded on the receipt when it did.
+  const reindexTask = createLaneReindex({
+    vault: ctx.vault,
+    ...(ctx.configPath ? { configPath: ctx.configPath } : {}),
+    searchConfig,
+    now,
+    forceCost: args["force_cost"] === true,
+    safeguard: () => laneSafeguard(LANE_TASK.reindex),
+    ...laneProgress,
+  });
   const result = await runMaintenance(ctx.vault, {
     now,
     holder: `${agent}@${process.pid}`,
@@ -464,15 +480,7 @@ async function toolBrainMaintenance(
           dream(ctx.vault, { now, safeguard: laneSafeguard(LANE_TASK.dream), ...laneProgress });
         },
       },
-      {
-        name: LANE_TASK.reindex,
-        run: async () => {
-          await indexVault(searchConfig, {
-            safeguard: laneSafeguard(LANE_TASK.reindex),
-            ...laneProgress,
-          });
-        },
-      },
+      reindexTask.task,
       // Same lane contract as the CLI verb (link-recall-intelligence):
       // bridges and clusters run after reindex so they see fresh
       // edges; both are fail-soft without embeddings, and a metrics
@@ -539,7 +547,13 @@ async function toolBrainMaintenance(
       },
     ],
   });
-  return { verdict: result.verdict, tasks: result.tasks };
+  // The run-level spend block, the CLI JSON payload's shape.
+  const spend = reindexTask.spendBlock(result.tasks);
+  return {
+    verdict: result.verdict,
+    tasks: result.tasks,
+    ...(spend !== undefined ? { spend } : {}),
+  };
 }
 
 // ----- brain_bridges (t_ab540afe) --------------------------------------------
@@ -620,7 +634,7 @@ export const ADMIN_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: "brain_maintenance",
     description:
-      "Quiet-window, lease-guarded heavy maintenance lane: run executes dream, reindex, bridges and clusters stale-first behind the window, busy, host-pressure and streak gates and an expiring lease (force bypasses all of those but the lease); status renders the lease holder and recent journal.",
+      "Quiet-window, lease-guarded maintenance lane: run executes dream, reindex, bridges, clusters behind window, busy, pressure and streak gates; status renders lease and journal. Reindex is keyword-only unless config maintenance_embeddings is true; then spend is announced, receipted and cost-gated.",
     inputSchema: {
       type: "object",
       properties: {
@@ -639,6 +653,11 @@ export const ADMIN_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           items: { type: "string" },
           maxItems: MAX_RETRY_TASKS,
           description: `Tasks to retry past their streak refusal, this run only; gates still apply. Known: ${LANE_TASKS.join(", ")}. An unknown name is refused.`,
+        },
+        force_cost: {
+          type: "boolean",
+          description:
+            "Bypass a positive embedding cost gate for this run's reindex (run); recorded on the spend receipt when it overrode a gate that would have refused.",
         },
         busy_minutes: {
           type: "integer",

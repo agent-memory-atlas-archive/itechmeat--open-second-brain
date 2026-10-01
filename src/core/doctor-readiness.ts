@@ -56,7 +56,25 @@
  * `needs-llm-step` envelopes). The only model-inference credential the
  * system itself resolves is the embedding provider's API key, so the
  * "LLM key" probe resolves that.
+ *
+ * The `registered_commands` probe (t_3477c9e8) re-reads what the install
+ * manifest recorded and asks one question per registered client config:
+ * does the Open Second Brain command it registered still resolve to an
+ * executable? It is read-only - a registration that stopped resolving is
+ * reported with the `o2b install <target> --apply` recovery line, never
+ * rewritten.
+ *
+ * The `writeback_contract` probe (t_7c01bb39) is check-only in the same
+ * way: it audits whether the workspace agent-instruction file(s) carry
+ * the same-turn atomic-fact memory write gate. The contract itself - the
+ * managed-block detection, the clause keywords in the marker write-back
+ * guardrail's own vocabulary, and the symlink refusal - lives in
+ * `brain/writeback-contract.ts`, whose docblock is the settled marker
+ * contract an installed block must satisfy. No repair or installer is
+ * built here, so a file without the block is skipped, not failed.
  */
+
+import { readFileSync } from "node:fs";
 
 import { discoverConfig } from "./config.ts";
 import { resolveDecisionModelConfig } from "./decision-model/config.ts";
@@ -70,10 +88,25 @@ import {
 import { providerProducesVectors } from "./search/embeddings/contract.ts";
 import { makeProvider } from "./search/embeddings/provider.ts";
 import { resolveSearchConfig } from "./search/index.ts";
+import {
+  COMMAND_PROBE_VERDICT,
+  CommandProbeError,
+  probeCommandResolvability,
+  type CommandProbeContext,
+  type CommandProbeOutcome,
+} from "./install/command-probe.ts";
+import { OSB_KEY_FULL, OSB_KEY_WRITER } from "./install/json-merge.ts";
+import { readManifest } from "./install/manifest.ts";
 import { buildPayload } from "./install/payload.ts";
 import { defaultRegistry } from "./install/registry.ts";
 import { registerAllAdapters } from "./install/adapters/all.ts";
-import type { InstallEnv } from "./install/types.ts";
+import {
+  AGENT_INSTRUCTION_FILES,
+  WRITEBACK_CONTRACT_FINDING,
+  auditWorkspaceWritebackContract,
+  type WritebackContractFinding,
+} from "./brain/writeback-contract.ts";
+import type { InstallEnv, ManifestEntry } from "./install/types.ts";
 
 // ----- Constants ------------------------------------------------------------
 
@@ -86,6 +119,8 @@ export const READINESS_PROBE = {
   embeddingProvider: "embedding_provider",
   runtimeAdapterWiring: "runtime_adapter_wiring",
   installedRuntimes: "installed_runtimes",
+  registeredCommands: "registered_commands",
+  writebackContract: "writeback_contract",
   decisionModel: "decision_model",
 } as const;
 
@@ -596,6 +631,500 @@ function flattenReason(message: string): string {
   return message.replace(/\s+/g, " ").trim();
 }
 
+// ----- Registered-command probe (t_3477c9e8) --------------------------------
+
+/**
+ * Top-level JSON objects an Open Second Brain MCP registration may live under: the
+ * json-merge default (`mcpServers` - cursor, kiro, gemini-cli and the
+ * generic printout) and opencode's `mcp`.
+ */
+const JSON_MCP_TOP_LEVEL_KEYS: ReadonlyArray<string> = ["mcpServers", "mcp"];
+
+/** The Open Second Brain entry names, as JSON keys and as `[mcp_servers.<name>]` tables. */
+const OSB_ENTRY_KEYS: ReadonlySet<string> = new Set([OSB_KEY_FULL, OSB_KEY_WRITER]);
+
+/** Matches exactly the `[mcp_servers.<name>]` table header grok/codex write. */
+const TOML_MCP_SERVER_HEADER = /^\[mcp_servers\.([^[\]]+)\]$/;
+
+/**
+ * One registered command extracted from a client config: the Open Second Brain entry
+ * name plus the `command`/`args` exactly as the config records them.
+ */
+interface RegisteredCommandEntry {
+  readonly key: string;
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+}
+
+/**
+ * What one recorded config file yielded. `none` and `malformed` are
+ * distinct on purpose: a config with no Open Second Brain command entry has nothing to
+ * probe (and registration drift is the installed-runtimes probe's
+ * finding), while Open Second Brain entries that exist but carry no usable command stop
+ * the measurement - which is the `unknown` vocabulary, not a skip.
+ */
+type CommandExtraction =
+  | { readonly kind: "entries"; readonly entries: ReadonlyArray<RegisteredCommandEntry> }
+  | { readonly kind: "none" }
+  | { readonly kind: "malformed"; readonly reason: string };
+
+/** Worst-first severity order over the readiness statuses. */
+const READINESS_SEVERITY: ReadonlyArray<ReadinessStatus> = [
+  READINESS_STATUS.fail,
+  READINESS_STATUS.unknown,
+  READINESS_STATUS.skipped,
+  READINESS_STATUS.pass,
+];
+
+function readinessRank(status: ReadinessStatus): number {
+  return READINESS_SEVERITY.indexOf(status);
+}
+
+function countByStatus(statuses: ReadonlyArray<ReadinessStatus>): Record<ReadinessStatus, number> {
+  const counts: Record<ReadinessStatus, number> = { pass: 0, fail: 0, unknown: 0, skipped: 0 };
+  for (const status of statuses) counts[status] += 1;
+  return counts;
+}
+
+function statusForProbeOutcome(outcome: CommandProbeOutcome): ReadinessStatus {
+  switch (outcome.verdict) {
+    case COMMAND_PROBE_VERDICT.resolves:
+      return READINESS_STATUS.pass;
+    case COMMAND_PROBE_VERDICT.absent:
+      return READINESS_STATUS.fail;
+    case COMMAND_PROBE_VERDICT.unresolved:
+      return READINESS_STATUS.unknown;
+  }
+}
+
+/**
+ * What is registered, and does it still resolve? Reads the install
+ * manifest, re-reads every recorded client config, extracts the Open Second Brain
+ * `command`/`args` the install wrote (JSON `mcpServers`/`mcp` keys, or the
+ * `[mcp_servers.*]` TOML tables grok and codex write), and probes each
+ * command word via `command-probe.ts`.
+ *
+ * The verdict is worst-of per entry, then worst-of overall
+ * (`fail` > `unknown` > `skipped` > `pass`), with the full per-target
+ * table in the detail and the counts travelling with the winning bucket -
+ * the same shape {@link probeInstalledRuntimes} reports in. Every row is
+ * read-only: the only command printed is the recovery line
+ * `o2b install <target> --apply`.
+ *
+ * Grading follows the false-alarm bound the design settles. A
+ * proved-absent path-form command is a `fail` carrying the recovery line.
+ * A bare name this process's PATH does not carry is `unknown` - the host
+ * client spawns with its own PATH, which may still resolve it. A recorded
+ * config that is gone, or that cannot be read into a command, is
+ * `unknown` (unmeasured, not broken); a config with no Open Second Brain command entry
+ * at all is `skipped` by name - nothing-to-probe is a verdict, not
+ * silence.
+ */
+export async function probeRegisteredCommands(opts: ReadinessOptions): Promise<ReadinessVerdict> {
+  let manifest;
+  try {
+    manifest = readManifest(opts.vault);
+  } catch (err) {
+    return {
+      status: READINESS_STATUS.unknown,
+      detail:
+        "install manifest could not be read, so no registered command could be probed: " +
+        flattenReason((err as Error).message),
+    };
+  }
+  const installs = Object.values(manifest.installs);
+  if (installs.length === 0) {
+    return {
+      status: READINESS_STATUS.skipped,
+      detail: "install manifest records no installs; nothing to probe",
+    };
+  }
+  const env = installEnvFor(opts);
+  const context: CommandProbeContext = { env: env.env, cwd: env.cwd };
+  const rows = installs.map((entry) => registeredCommandRow(entry, context));
+  const counts = countByStatus(rows.map((row) => row.status));
+  // Worst rows lead the detail; toSorted is stable, so within one bucket
+  // the manifest's own order stands.
+  const ordered = rows.toSorted((a, b) => readinessRank(a.status) - readinessRank(b.status));
+  const rowText = ordered.map((row) => `${row.target}: ${row.detail}`).join("; ");
+  const census =
+    `(${counts.pass} pass, ${counts.fail} fail, ` +
+    `${counts.unknown} unknown, ${counts.skipped} skipped)`;
+  if (counts.fail > 0) {
+    return {
+      status: READINESS_STATUS.fail,
+      detail: `${counts.fail} registered command(s) proved unresolvable ${census}: ${rowText}`,
+    };
+  }
+  if (counts.unknown > 0) {
+    return {
+      status: READINESS_STATUS.unknown,
+      detail: `could not confirm ${counts.unknown} registered command(s) ${census}: ${rowText}`,
+    };
+  }
+  if (counts.skipped > 0) {
+    return {
+      status: READINESS_STATUS.skipped,
+      detail:
+        `nothing to probe for ${counts.skipped} of ${rows.length} registered target(s) ` +
+        `${census}: ${rowText}`,
+    };
+  }
+  return {
+    status: READINESS_STATUS.pass,
+    detail: `${counts.pass} registered command(s) resolve ${census}: ${rowText}`,
+  };
+}
+
+/** One manifest entry's answer: what was registered and whether it resolves. */
+interface RegisteredCommandRow {
+  readonly target: string;
+  readonly status: ReadinessStatus;
+  readonly detail: string;
+}
+
+function registeredCommandRow(
+  entry: ManifestEntry,
+  context: CommandProbeContext,
+): RegisteredCommandRow {
+  const target = entry.target;
+  if (entry.config_path === null) {
+    return {
+      target,
+      status: READINESS_STATUS.skipped,
+      detail: "no config_path recorded - nothing to probe",
+    };
+  }
+  const configPath = entry.config_path;
+  let raw: string;
+  try {
+    raw = readFileSync(configPath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return {
+        target,
+        status: READINESS_STATUS.unknown,
+        detail:
+          `recorded config ${configPath} does not exist; ` +
+          `'o2b install ${target} --check' answers whether the registration is gone`,
+      };
+    }
+    return {
+      target,
+      status: READINESS_STATUS.unknown,
+      detail:
+        `recorded config ${configPath} could not be read: ` + flattenReason((err as Error).message),
+    };
+  }
+  const extraction = extractRegisteredCommands(raw);
+  switch (extraction.kind) {
+    case "none":
+      return {
+        target,
+        status: READINESS_STATUS.skipped,
+        detail: `no Open Second Brain command entry found in ${configPath} - nothing to probe`,
+      };
+    case "malformed":
+      return {
+        target,
+        status: READINESS_STATUS.unknown,
+        detail:
+          `registered Open Second Brain entry in ${configPath} is not a usable command: ` +
+          flattenReason(extraction.reason),
+      };
+    case "entries":
+      return probeRegisteredEntries(target, configPath, extraction.entries, context);
+  }
+}
+
+function probeRegisteredEntries(
+  target: string,
+  configPath: string,
+  entries: ReadonlyArray<RegisteredCommandEntry>,
+  context: CommandProbeContext,
+): RegisteredCommandRow {
+  const summaries: string[] = [];
+  let worst: ReadinessStatus = READINESS_STATUS.pass;
+  for (const entry of entries) {
+    let outcome: CommandProbeOutcome;
+    try {
+      outcome = probeCommandResolvability(entry.command, entry.args, context);
+    } catch (err) {
+      if (err instanceof CommandProbeError) {
+        return {
+          target,
+          status: READINESS_STATUS.unknown,
+          detail:
+            `registered command in ${configPath} could not be probed: ` +
+            flattenReason(err.message),
+        };
+      }
+      throw err;
+    }
+    const status = statusForProbeOutcome(outcome);
+    // The recovery line rides exactly the rows that proved their fault.
+    const summary =
+      `command '${entry.command}': ${outcome.detail}` +
+      (outcome.verdict === COMMAND_PROBE_VERDICT.absent
+        ? ` - fix: o2b install ${target} --apply`
+        : "");
+    if (!summaries.includes(summary)) summaries.push(summary);
+    if (readinessRank(status) < readinessRank(worst)) worst = status;
+  }
+  return { target, status: worst, detail: summaries.join("; ") };
+}
+
+function extractRegisteredCommands(raw: string): CommandExtraction {
+  const fromJson = extractFromJsonConfig(raw);
+  if (fromJson !== null) return fromJson;
+  return extractFromTomlConfig(raw);
+}
+
+/**
+ * Read the Open Second Brain entries out of a JSON client config. Returns `null` when
+ * the text is not JSON at all, so the TOML reader gets its turn - grok
+ * and codex record the very same Open Second Brain names as `[mcp_servers.*]` tables.
+ */
+function extractFromJsonConfig(raw: string): CommandExtraction | null {
+  // Editors may save a BOM at the head; JSON.parse refuses it (the same
+  // tolerance json-merge applies when writing these files).
+  const stripped = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripped);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { kind: "none" };
+  }
+  const root = parsed as Record<string, unknown>;
+  const entries: RegisteredCommandEntry[] = [];
+  const malformed: string[] = [];
+  for (const topKey of JSON_MCP_TOP_LEVEL_KEYS) {
+    const block = root[topKey];
+    if (block === null || typeof block !== "object" || Array.isArray(block)) continue;
+    for (const [key, value] of Object.entries(block as Record<string, unknown>)) {
+      if (!OSB_ENTRY_KEYS.has(key)) continue;
+      const normalized = normalizeOnDiskEntry(value);
+      if (normalized === null) malformed.push(`${topKey}.${key}`);
+      else entries.push({ key, ...normalized });
+    }
+  }
+  if (entries.length > 0) return { kind: "entries", entries };
+  if (malformed.length > 0) {
+    return {
+      kind: "malformed",
+      reason: `Open Second Brain entries ${malformed.join(", ")} carry no usable command/args`,
+    };
+  }
+  return { kind: "none" };
+}
+
+/**
+ * The two on-disk entry shapes this repo writes: `{command, args}` and
+ * opencode's whole-argv form `{command: [bin, ...args]}`. Anything else
+ * is not a command this probe can judge.
+ */
+function normalizeOnDiskEntry(
+  value: unknown,
+): { command: string; args: ReadonlyArray<string> } | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record["command"] === "string" && record["command"].length > 0) {
+    const args = stringArgsOrEmpty(record["args"]);
+    return args === null ? null : { command: record["command"], args };
+  }
+  const argv = stringArgsOrEmpty(record["command"]);
+  if (argv !== null && argv.length > 0 && argv[0]!.length > 0) {
+    return { command: argv[0]!, args: argv.slice(1) };
+  }
+  return null;
+}
+
+/** A string array as stored, `[]` when absent, `null` when malformed. */
+function stringArgsOrEmpty(candidate: unknown): ReadonlyArray<string> | null {
+  if (candidate === undefined) return [];
+  if (!Array.isArray(candidate) || !candidate.every((a) => typeof a === "string")) return null;
+  return candidate as string[];
+}
+
+/**
+ * Read the Open Second Brain entries out of a grok/codex-style TOML config, by
+ * line-section and only for the value shapes `grok-config.ts` writes: a
+ * quoted-string `command` and a single-line string-array `args`. Codex's
+ * CLI-serialized layout has no published grammar and is not guessed at -
+ * a table whose values do not parse reports `malformed`, naming it.
+ */
+function extractFromTomlConfig(raw: string): CommandExtraction {
+  const tables = new Map<string, { command: string | null; args: ReadonlyArray<string> | null }>();
+  let current: string | null = null;
+  for (const rawLine of raw.split("\n")) {
+    const line = rawLine.trim();
+    if (line.startsWith("[")) {
+      const header = TOML_MCP_SERVER_HEADER.exec(line);
+      current = header !== null && OSB_ENTRY_KEYS.has(header[1]!) ? header[1]! : null;
+      continue;
+    }
+    if (current === null || line.length === 0 || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const field = line.slice(0, eq).trim();
+    const value = line.slice(eq + 1).trim();
+    const table = tables.get(current) ?? { command: null, args: null };
+    tables.set(current, table);
+    if (field === "command") table.command = parseTomlBasicString(value);
+    else if (field === "args") table.args = parseTomlStringArray(value);
+  }
+  const entries: RegisteredCommandEntry[] = [];
+  const malformed: string[] = [];
+  for (const [name, table] of tables) {
+    if (typeof table.command === "string" && table.command.length > 0) {
+      entries.push({ key: name, command: table.command, args: table.args ?? [] });
+    } else {
+      malformed.push(name);
+    }
+  }
+  if (entries.length > 0) return { kind: "entries", entries };
+  if (malformed.length > 0) {
+    return {
+      kind: "malformed",
+      reason: `Open Second Brain tables ${malformed.join(", ")} declare no parseable command`,
+    };
+  }
+  return { kind: "none" };
+}
+
+/** TOML basic string, or a literal string (no escapes) between single quotes. */
+function parseTomlBasicString(value: string): string | null {
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      return typeof parsed === "string" ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+    return value.slice(1, -1);
+  }
+  return null;
+}
+
+function parseTomlStringArray(value: string): ReadonlyArray<string> | null {
+  if (value.length < 2 || !value.startsWith("[") || !value.endsWith("]")) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === "string")) return null;
+    return parsed as ReadonlyArray<string>;
+  } catch {
+    return null;
+  }
+}
+
+// ----- Write-back contract probe (t_7c01bb39) -------------------------------
+
+/**
+ * Map one audited instruction file onto the readiness vocabulary. The two
+ * measured faults of a PRESENT block (`malformed-block`, `missing-clauses`)
+ * are `fail` - the block was installed and read, so this is a verdict
+ * about the surface. `missing-block` and `absent` are `skipped` - an
+ * ordinary instruction file that never had the block installed, or no
+ * file at all, is not a contract violation.
+ * `symlink` and `unreadable` are `unknown` - the read was refused or
+ * failed, which is evidence about the probe's reach, never about the gate.
+ */
+function statusForContractFinding(finding: WritebackContractFinding): ReadinessStatus {
+  switch (finding) {
+    case WRITEBACK_CONTRACT_FINDING.conforming:
+      return READINESS_STATUS.pass;
+    case WRITEBACK_CONTRACT_FINDING.malformedBlock:
+    case WRITEBACK_CONTRACT_FINDING.missingClauses:
+      return READINESS_STATUS.fail;
+    case WRITEBACK_CONTRACT_FINDING.missingBlock:
+    case WRITEBACK_CONTRACT_FINDING.absent:
+      return READINESS_STATUS.skipped;
+    case WRITEBACK_CONTRACT_FINDING.symlink:
+    case WRITEBACK_CONTRACT_FINDING.unreadable:
+      return READINESS_STATUS.unknown;
+  }
+}
+
+/**
+ * Does the vault's workspace agent-instruction file(s) carry the same-turn
+ * atomic-fact memory write gate? Reads the candidates
+ * {@link AGENT_INSTRUCTION_FILES} at the vault root through
+ * `brain/writeback-contract.ts`, which owns the whole contract: the
+ * managed-block detection, the clause keywords, and the symlink refusal.
+ * This probe is only the verdict mapping and aggregation - a second copy
+ * of the contract here is exactly how the check and the runtime would
+ * drift apart.
+ *
+ * The vault root, not the CLI's cwd, is the audited workspace: it is where
+ * this tree already locates instruction files (the instruction-file
+ * ceiling and the removed-tool sweep both read them at `join(vault, ...)`),
+ * and a readiness probe must grade the surface an agent actually reads,
+ * not whichever directory the `o2b` invocation happened to start in.
+ *
+ * Grading per file follows the probe rule: a file whose installed block is
+ * broken or lacks the gate is a `fail` whose row carries the recovery
+ * clause (nothing is rewritten here). A file with no block at all is
+ * `skipped` with the reason that the block is not installed. A refused or
+ * unreadable read is `unknown` by name. A vault with NO instruction file
+ * at all is `skipped` - nothing installed is not a contract violation -
+ * while one conforming file among absent peers passes: the absent
+ * candidates did not participate, and the census in the detail says so
+ * rather than hiding them.
+ */
+export async function probeWritebackContract(opts: ReadinessOptions): Promise<ReadinessVerdict> {
+  const workspace = opts.vault;
+  const audits = auditWorkspaceWritebackContract(workspace);
+  const rows = audits.map((audit) => ({
+    path: audit.path,
+    status: statusForContractFinding(audit.finding),
+    detail: audit.detail,
+  }));
+  const counts = countByStatus(rows.map((row) => row.status));
+  // Worst rows lead the detail; toSorted is stable, so within one bucket
+  // the candidate list's priority order stands.
+  const ordered = rows.toSorted((a, b) => readinessRank(a.status) - readinessRank(b.status));
+  const rowText = ordered.map((row) => `${row.path}: ${row.detail}`).join("; ");
+  const census =
+    `(${counts.pass} pass, ${counts.fail} fail, ` +
+    `${counts.unknown} unknown, ${counts.skipped} skipped)`;
+  if (counts.fail > 0) {
+    return {
+      status: READINESS_STATUS.fail,
+      detail: `${counts.fail} agent-instruction file(s) fail the write-back contract ${census}: ${rowText}`,
+    };
+  }
+  if (counts.unknown > 0) {
+    return {
+      status: READINESS_STATUS.unknown,
+      detail: `could not measure ${counts.unknown} agent-instruction file(s) ${census}: ${rowText}`,
+    };
+  }
+  if (counts.pass === 0 && audits.some((a) => a.finding !== WRITEBACK_CONTRACT_FINDING.absent)) {
+    return {
+      status: READINESS_STATUS.skipped,
+      detail: `the ambient write-back managed block is not installed ${census}: ${rowText}`,
+    };
+  }
+  if (counts.pass === 0) {
+    return {
+      status: READINESS_STATUS.skipped,
+      detail:
+        `no agent-instruction file in ${workspace} ` +
+        `(checked ${AGENT_INSTRUCTION_FILES.join(", ")}) - nothing installed is ` +
+        "not a contract violation",
+    };
+  }
+  return {
+    status: READINESS_STATUS.pass,
+    detail: `${counts.pass} agent-instruction file(s) carry the write-back contract ${census}: ${rowText}`,
+  };
+}
+
 // ----- Runner ---------------------------------------------------------------
 
 export interface NamedProbe {
@@ -609,6 +1138,8 @@ export const DEFAULT_PROBES: ReadonlyArray<NamedProbe> = [
   { name: READINESS_PROBE.embeddingProvider, fn: probeEmbeddingProvider },
   { name: READINESS_PROBE.runtimeAdapterWiring, fn: probeRuntimeAdapterWiring },
   { name: READINESS_PROBE.installedRuntimes, fn: probeInstalledRuntimes },
+  { name: READINESS_PROBE.registeredCommands, fn: probeRegisteredCommands },
+  { name: READINESS_PROBE.writebackContract, fn: probeWritebackContract },
   { name: READINESS_PROBE.decisionModel, fn: probeDecisionModel },
 ];
 

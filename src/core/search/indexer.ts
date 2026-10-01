@@ -36,11 +36,16 @@ import {
   estimateCostUsd,
   estimateTokens,
   evaluateCostGate,
+  isStaleSignature,
   pricePerMillionTokens,
   LOCAL_EMBEDDING_MODEL,
+  MODEL_NATIVE_DIMENSION,
+  type EmbeddingIdentity,
 } from "./embeddings/signature.ts";
+import { LOCAL_DEFAULT_DIMENSION } from "./embeddings/local-provider.ts";
 import { resolveEventAnchor } from "./event-anchor.ts";
 import { extractLinks } from "./links.ts";
+import { resolveDocumentEventTimeWindow } from "./pipeline/event-time.ts";
 import {
   probeProvider,
   PROVIDER_PROBE,
@@ -51,10 +56,12 @@ import {
 import { extractFrontmatterRelations } from "../graph/frontmatter-relations.ts";
 import { loadSchemaPack, type SchemaPack } from "../brain/schema-pack.ts";
 import { tieredFieldsForKind } from "../brain/frontmatter-tiers.ts";
+import { parsePinned } from "../brain/preference.ts";
 import { normalizeSchemaToken } from "../brain/schema-vocab.ts";
 import type { DegradationNotice } from "../integrity/degradation.ts";
 import { parseFrontmatterTextWithNotices } from "../vault.ts";
 import { appendMetric } from "../brain/metrics.ts";
+import type { MaintenanceSpendReceipt } from "../brain/maintenance/journal.ts";
 import {
   OPERATION,
   progressCounter,
@@ -102,6 +109,7 @@ import type {
   ResolvedSearchConfig,
   VisibilityHonestyFinding,
 } from "./types.ts";
+import type { ValidityWindow } from "./validity.ts";
 import { REMOTE_DENY_VISIBILITY_TOKEN, pageVisibility } from "../graph/visibility.ts";
 import { closeDatabase } from "../sqlite-close.ts";
 import { renameWithRetry, unlinkWithRetry } from "../fs-atomic.ts";
@@ -168,6 +176,13 @@ interface MutableStats {
   deferredReason: IndexStats["deferredReason"];
   /** Null until the census runs, and null whenever it has nothing to report. */
   chunkWindow: ChunkWindowCensus | null;
+  /**
+   * The embedding phase's own cost-gate result, set when that phase ran
+   * its census (t_9d155d0e). Undefined when nothing was pending or the
+   * phase never engaged; a phase that throws mid-spend leaves the run
+   * throwing, so a receipt can only ever be read off a completed pass.
+   */
+  spend: MaintenanceSpendReceipt | undefined;
 }
 
 function newStats(): MutableStats {
@@ -193,7 +208,21 @@ function newStats(): MutableStats {
     deferredReason: null,
     // Taken at the end of the run, over the index the run left behind.
     chunkWindow: null,
+    // Set by the embedding phase when it ran its census; absent otherwise.
+    spend: undefined,
   };
+}
+
+/**
+ * The spend receipt an index run's embedding phase recorded, if any.
+ * Present only when a phase ran over a non-empty pending census and the
+ * run completed - a run that threw has no stats to read, and the lane
+ * journaling the receipt must not price a pass it cannot vouch for.
+ * The field's declared home is `IndexStats.spend`; this accessor keeps
+ * the "completed run only" reading in one named place.
+ */
+export function embeddingSpendOf(stats: IndexStats): MaintenanceSpendReceipt | undefined {
+  return stats.spend;
 }
 
 function freezeStats(s: MutableStats, durationMs: number): IndexStats {
@@ -217,6 +246,9 @@ function freezeStats(s: MutableStats, durationMs: number): IndexStats {
     // with no oversize chunks and a declared window produces the exact
     // statistics object it produced before this field existed.
     ...(s.chunkWindow === null ? {} : { chunkWindow: s.chunkWindow }),
+    // Same additive-absent convention: a run whose embedding phase did
+    // not engage carries no receipt.
+    ...(s.spend === undefined ? {} : { spend: s.spend }),
     durationMs,
   });
 }
@@ -277,6 +309,30 @@ function aliasesFromFrontmatter(frontmatter: Record<string, unknown>): string[] 
   const raw = frontmatter["aliases"];
   if (!Array.isArray(raw)) return [];
   return raw.filter((v): v is string => typeof v === "string");
+}
+
+/**
+ * The persisted half of the shared event-time resolution (v13,
+ * t_9e1a4b3f): the two column bounds for the window
+ * `resolveDocumentEventTimeWindow` resolved under the rung order the
+ * query side applies.
+ *
+ * A null window (nothing declared anywhere) and an INVALID declared
+ * window (a `valid_from`/`valid_until` that failed to parse) both persist
+ * null/null - the unmeasured state, because that is exactly how
+ * `eventTimeInRange` judges both: by storage mtime. Persisting anything
+ * else for a broken declaration would make the census disagree with what
+ * queries actually apply. A null SIDE on a valid window is a declared
+ * open one, and is persisted as the null it is.
+ */
+function persistedEventTimeBounds(window: ValidityWindow | null): {
+  eventTimeMinMs: number | null;
+  eventTimeMaxMs: number | null;
+} {
+  if (window === null || window.invalid) {
+    return { eventTimeMinMs: null, eventTimeMaxMs: null };
+  }
+  return { eventTimeMinMs: window.validFromMs, eventTimeMaxMs: window.validUntilMs };
 }
 
 /**
@@ -466,6 +522,10 @@ async function indexIntoRun(
           path: file.relPath,
         });
         for (const n of fmNotices) stats.frontmatterNotices.push(n);
+        // Resolved once, consumed twice: the materialised anchor column
+        // and the resolved event-time window below must come from the
+        // same anchor answer.
+        const eventAnchor = resolveEventAnchor(frontmatter, body);
         const docId = store.upsertDocument({
           path: file.relPath,
           title: chunkResult.title,
@@ -485,7 +545,24 @@ async function indexIntoRun(
           // it safe to store behind the two content-identity fastpaths
           // above: unchanged content can only ever resolve to the same
           // anchor, so declining to recompute it cannot stale it.
-          eventAnchor: resolveEventAnchor(frontmatter, body),
+          eventAnchor,
+          // The document's RESOLVED event-time window (v13,
+          // t_9e1a4b3f), resolved from the already-parsed frontmatter
+          // and the materialised anchor above through the SHARED
+          // per-document resolver - the query side's own rung order, so
+          // the persisted bounds and the filter that consumes them
+          // cannot drift. Like the anchor, a pure function of this
+          // file's content, safe behind the same fastpaths; bounds
+          // refresh on each document's next content change, which is
+          // the lazy backfill the migration plans for.
+          ...persistedEventTimeBounds(resolveDocumentEventTimeWindow(frontmatter, eventAnchor)),
+          // What this run MEASURED of the page's `pinned` frontmatter
+          // flag (t_f7bef96a), coerced by the preference parser's own
+          // rule so ranking and the preference flows read one
+          // spelling. Every upserted document is measured; the column's
+          // NULL state is reserved for rows the v13 migration carried
+          // over and no run has re-examined yet.
+          pinned: parsePinned(frontmatter),
           // What this run MEASURED of the page's visibility declaration,
           // from the frontmatter already parsed above (v12). The indexer
           // marks; it never skips. A `continue` here would be a live
@@ -903,6 +980,14 @@ const INDEX_STAGE = Object.freeze({
 export interface EmbeddingPhaseTally {
   embeddingsComputed: number;
   embeddingsRetries: number;
+  /**
+   * The cost gate's own verdict for this phase's census, set just before
+   * the first provider call (t_9d155d0e). `forced` is true only when a
+   * force bypass overrode a gate that would have refused the spend, so a
+   * receipt can name its own bypass. Optional and undefined until then:
+   * a tally an embedding-free caller owns never carries one.
+   */
+  spend?: MaintenanceSpendReceipt;
 }
 
 export interface EmbeddingPhaseOptions {
@@ -977,13 +1062,18 @@ export async function runEmbeddingPhase(
   // Cost gate: estimate the spend for the whole pending set up front and
   // refuse the run when it exceeds the configured ceiling, unless forced.
   // The local provider (price 0) and unknown-price models never block.
+  //
+  // The gate is evaluated UNFORCED so the refusal and the receipt read
+  // one verdict: `blocked && !forceCost` is exactly the blocked flag
+  // `evaluateCostGate` would have returned for `forced: forceCost`, and
+  // `blocked && forceCost` is the honest meaning of the receipt's
+  // `forced` - this run overrode a gate that would have refused it.
   const gate = evaluateCostGate({
     texts: pending.map((p) => p.content),
     model,
     gateUsd: config.semantic.costGateUsd,
-    forced: forceCost,
   });
-  if (gate.blocked) {
+  if (gate.blocked && !forceCost) {
     throw new SearchError(
       "EMBEDDING_COST_GATE",
       `estimated embedding cost $${gate.estimatedUsd.toFixed(4)} for ${pending.length} chunk(s) ` +
@@ -991,6 +1081,12 @@ export async function runEmbeddingPhase(
         `Re-run with --force-cost to proceed or raise the gate.`,
     );
   }
+  stats.spend = {
+    model,
+    tokens: gate.tokens,
+    estimatedUsd: gate.estimatedUsd,
+    forced: gate.blocked && forceCost,
+  };
   const batchSize = Math.max(1, config.semantic.batchSize);
   // Hand the provider a super-batch large enough to keep its internal
   // `embedding_concurrency` semaphore busy. Without this multiplier the
@@ -1038,6 +1134,74 @@ export async function runEmbeddingPhase(
       store.vecUpsert(chunkId, vec, model, dim, embHash);
       stats.embeddingsComputed++;
     }
+  }
+}
+
+/** What an embedding pass about to run on this config is predicted to spend. */
+export interface EmbeddingSpendPreview {
+  /** The model the pass would name; null when the config leaves it unset. */
+  readonly model: string | null;
+  /** Chunks the phase's own anti-join still finds vectorless. */
+  readonly pendingChunks: number;
+  readonly tokens: number;
+  readonly estimatedUsd: number;
+  /**
+   * True when the configured gate would refuse this spend unforced - the
+   * fact a `--force-cost` receipt is honest about.
+   */
+  readonly blocked: boolean;
+}
+
+/**
+ * The spend preview the maintenance lane announces before its reindex
+ * task and records on its journal row after it (t_9d155d0e).
+ *
+ * Deliberately a READ over the same census and the same cost kernel
+ * {@link runEmbeddingPhase} gates on - the phase's guards, in its order,
+ * and its own `findChunksWithoutEmbeddings` anti-join and
+ * `evaluateCostGate` - so what a run ANNOUNCES and what it later RECORDS
+ * cannot drift from what would actually be refused or embedded. This
+ * function never spends: the phase remains the only spender, and a
+ * refusal it would throw stays its to throw.
+ *
+ * Null means "this run cannot spend", per guard: semantic not configured
+ * or its credential missing; the index missing entirely (the next pass
+ * builds it, so the pending census does not exist yet); sqlite-vec not
+ * loadable; or nothing pending. Every one of those is a verdict the
+ * caller may print or omit - never an error - and for that reason the
+ * banner it feeds is printed ONLY when this returns a preview.
+ */
+export async function estimatePendingEmbeddingSpend(
+  config: ResolvedSearchConfig,
+): Promise<EmbeddingSpendPreview | null> {
+  if (semanticCapabilityIsBlocked(resolveSemanticCapability(config.semantic))) return null;
+  let store: Store;
+  try {
+    store = await Store.open(config, { mode: "read" });
+  } catch (e) {
+    if (e instanceof SearchError && e.code === "INDEX_MISSING") return null;
+    throw e;
+  }
+  try {
+    if (!store.vecLoaded()) return null;
+    const pending = store.findChunksWithoutEmbeddings();
+    if (pending.length === 0) return null;
+    const provider = makeProvider(config.semantic);
+    const model = config.semantic.model ?? provider.model;
+    const gate = evaluateCostGate({
+      texts: pending.map((p) => p.content),
+      model,
+      gateUsd: config.semantic.costGateUsd,
+    });
+    return {
+      model,
+      pendingChunks: pending.length,
+      tokens: gate.tokens,
+      estimatedUsd: gate.estimatedUsd,
+      blocked: gate.blocked,
+    };
+  } finally {
+    await store.close();
   }
 }
 
@@ -1106,14 +1270,19 @@ async function reindexInto(
     let resume = false;
     if (config.resumeReindex) {
       const signature = reindexStagingSignature(config, opts?.embeddings === true);
+      // An unknown-identity embedding component (an unnamed model) is
+      // compatible with nothing, including a staging build stamped under
+      // the same unknown identity: such a build always rebuilds.
       if (existsSync(newPath)) {
         resume = await stagingSignatureMatches(tempConfig, signature);
       }
       if (!resume) tryUnlink(newPath);
       // Stamp the signature so an interruption leaves a build a later run
-      // can recognise and resume.
+      // can recognise and resume. An unknown-identity signature is stamped
+      // too: it documents the identity, and the comparison above never
+      // lets it match.
       await withStagingStore(tempConfig, (store) =>
-        store.setState(REINDEX_SIGNATURE_KEY, signature),
+        store.setState(REINDEX_SIGNATURE_KEY, JSON.stringify(signature)),
       );
     } else {
       tryUnlink(newPath);
@@ -1162,34 +1331,116 @@ async function reindexInto(
 /** index_state key carrying the staging-build compatibility signature. */
 const REINDEX_SIGNATURE_KEY = "reindex_signature";
 
+/** Embedding component of the staging signature when no embeddings are computed. */
+const STAGING_EMBEDDING_OFF = "off";
+
+/**
+ * Embedding component when the active signature cannot be resolved at
+ * all (semantic search off while embeddings were requested). Carried
+ * over from the pre-suite fallback rendering.
+ */
+const STAGING_EMBEDDING_UNRESOLVED = "active";
+
+/** Embedding components that are markers, not embedding signatures. */
+const STAGING_EMBEDDING_MARKERS: ReadonlySet<string> = new Set([
+  STAGING_EMBEDDING_OFF,
+  STAGING_EMBEDDING_UNRESOLVED,
+]);
+
+/** The parts of a staging signature, compared field by field on resume. */
+interface StagingSignature {
+  readonly schema: number;
+  readonly chunker: number;
+  readonly chunkSize: number;
+  readonly chunkOverlap: number;
+  readonly chunkMinSize: number;
+  readonly embedding: string;
+}
+
+/**
+ * The dimension the staging identity is judged by: the configured one;
+ * the local embedder's fixed default; for a named remote model with none
+ * configured, the model's own native width ({@link MODEL_NATIVE_DIMENSION}).
+ * Null only for an unnamed model, whose identity stays unknown.
+ */
+function stagingEmbeddingDimension(
+  config: ResolvedSearchConfig,
+  model: string | null,
+): EmbeddingIdentity["dimension"] {
+  if (config.semantic.dimension !== null) return config.semantic.dimension;
+  if (config.semantic.provider === "local") return LOCAL_DEFAULT_DIMENSION;
+  return model === null ? null : MODEL_NATIVE_DIMENSION;
+}
+
+/**
+ * The embedding component of the staging compatibility signature: the
+ * active embedding signature under the effective dimension, or one of
+ * the named markers above.
+ */
+function stagingEmbeddingComponent(config: ResolvedSearchConfig, embeddings: boolean): string {
+  if (!embeddings) return STAGING_EMBEDDING_OFF;
+  if (!config.semantic.enabled) return STAGING_EMBEDDING_UNRESOLVED;
+  const model = activeEmbeddingModel(config);
+  return embeddingSignature({
+    provider: config.semantic.provider,
+    model,
+    dimension: stagingEmbeddingDimension(config, model),
+  });
+}
+
 /**
  * Compatibility signature for a staging rebuild: a resume is safe only
  * when the schema version, chunker rules, chunk parameters, and (when embeddings are
  * computed) the active embedding signature all match the partial build.
  * Any drift invalidates the staging DB and forces a fresh rebuild.
  */
-function reindexStagingSignature(config: ResolvedSearchConfig, embeddings: boolean): string {
-  const embedding = embeddings ? (activeEmbeddingSignature(config) ?? "active") : "off";
-  return JSON.stringify({
+function reindexStagingSignature(
+  config: ResolvedSearchConfig,
+  embeddings: boolean,
+): StagingSignature {
+  return {
     schema: LATEST_SCHEMA_VERSION,
     chunker: CHUNKER_VERSION,
     chunkSize: config.chunkSize,
     chunkOverlap: config.chunkOverlap,
     chunkMinSize: config.chunkMinSize,
-    embedding,
-  });
+    embedding: stagingEmbeddingComponent(config, embeddings),
+  };
+}
+
+/**
+ * Whether a stamped staging marker is compatible with the active
+ * signature. The embedding component goes through
+ * {@link isStaleSignature}, so an unknown identity (an unnamed model)
+ * never compares equal to anything, not even its own stamp; the named
+ * markers and every other field compare by value.
+ */
+function stagingSignatureCompatible(active: StagingSignature, storedRaw: string): boolean {
+  let stored: Partial<StagingSignature>;
+  try {
+    stored = JSON.parse(storedRaw) as Partial<StagingSignature>;
+  } catch {
+    return false;
+  }
+  if (typeof stored.embedding !== "string") return false;
+  const { embedding: activeEmbedding, ...activeRest } = active;
+  const { embedding: storedEmbedding, ...storedRest } = stored;
+  if (JSON.stringify(activeRest) !== JSON.stringify(storedRest)) return false;
+  if (STAGING_EMBEDDING_MARKERS.has(activeEmbedding)) return activeEmbedding === storedEmbedding;
+  return !isStaleSignature(activeEmbedding, storedEmbedding);
 }
 
 /** Read the staging signature from an existing `.new`; false on any
  * read error (a corrupt or partial staging DB is rebuilt, not trusted). */
 async function stagingSignatureMatches(
   tempConfig: ResolvedSearchConfig,
-  signature: string,
+  signature: StagingSignature,
 ): Promise<boolean> {
   try {
     const store = await Store.open(tempConfig, { mode: "write", loadVec: false });
     try {
-      return store.getState(REINDEX_SIGNATURE_KEY) === signature;
+      const stored = store.getState(REINDEX_SIGNATURE_KEY);
+      return stored !== null && stagingSignatureCompatible(signature, stored);
     } finally {
       await store.close();
     }

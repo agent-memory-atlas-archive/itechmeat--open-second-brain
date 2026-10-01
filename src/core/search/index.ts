@@ -11,6 +11,7 @@ import {
   parseInteger as parseIntegerShared,
 } from "../validate.ts";
 import { resolveVaultScope } from "../vault-scope/index.ts";
+import { DEFAULT_HYBRID_DEADLINE_MS } from "./pipeline/request.ts";
 import { resolveIndexPath, SEARCH_DB_CONFIG_KEY, SEARCH_DB_ENV } from "./paths.ts";
 import { buildFtsTokenize } from "./schema.ts";
 import { isFusionMode, DEFAULT_RRF_K } from "./fusion.ts";
@@ -148,7 +149,15 @@ export {
   type IndexVaultOptions,
   type IndexProgressEvent,
 } from "./indexer.ts";
+export {
+  EVENT_TIME_RECENT_WINDOW_DAYS,
+  eventTimeStatus,
+  renderEventTimeStatus,
+  serializeEventTimeStatus,
+  type EventTimeStatus,
+} from "./event-time-status.ts";
 export { search, SEARCH_LIMIT_MIN, SEARCH_LIMIT_MAX } from "./search.ts";
+export { DEFAULT_HYBRID_DEADLINE_MS } from "./pipeline/request.ts";
 export { expandHit } from "./cards.ts";
 export { planReadShortlist, planRead } from "./graph-prepass.ts";
 export type { GraphPrepassOptions, GraphPrepassResult, ShouldReadEntry } from "./graph-prepass.ts";
@@ -403,6 +412,15 @@ function validateResolvedConfig(config: ResolvedSearchConfig): void {
   validateIntegerRange(config.semantic.timeoutMs, "embedding_timeout_ms", {
     min: 1,
   });
+  // Optional (configs written before the knob construct this shape
+  // literally); a present value validates exactly like the per-lane
+  // timeouts, except `0` is legal because it is the documented off
+  // switch, not a misconfiguration (t_bdc24171).
+  if (config.hybridDeadlineMs !== undefined) {
+    validateIntegerRange(config.hybridDeadlineMs, "search_hybrid_deadline_ms", {
+      min: 0,
+    });
+  }
   validateIntegerRange(config.semantic.concurrency, "embedding_concurrency", {
     min: 1,
   });
@@ -587,6 +605,22 @@ export function resolveSearchConfig(opts: {
     "embedding_timeout_ms",
     { min: 1 },
   );
+  // Composite hybrid deadline (t_bdc24171): one wall-clock budget over
+  // embed -> semanticTopK -> rerank -> second pass, defaulting to the sum
+  // of the two lane budgets above/below. The range starts at 0, unlike the
+  // per-lane timeouts, because 0 is the documented off switch - a budget
+  // of zero is not "expire immediately", it is "no composite deadline".
+  const hybridDeadlineMs = parseInteger(
+    envOrConfig(
+      env,
+      config,
+      "OPEN_SECOND_BRAIN_SEARCH_HYBRID_DEADLINE",
+      "search_hybrid_deadline_ms",
+    ),
+    DEFAULT_HYBRID_DEADLINE_MS,
+    "search_hybrid_deadline_ms",
+    { min: 0 },
+  );
   const concurrency = parseInteger(
     envOrConfig(env, config, "OPEN_SECOND_BRAIN_EMBEDDING_CONCURRENCY", "embedding_concurrency"),
     DEFAULTS.concurrency,
@@ -723,6 +757,21 @@ export function resolveSearchConfig(opts: {
     DEFAULTS.rerankMinScore,
     "search_rerank_min_score",
   );
+  // Relational rerank pin (t_d9f863e9). Off by default: the cross-encoder
+  // is the last word on ordering as shipped. When true, the rerank may
+  // promote relational-origin candidates but never sink them below their
+  // pre-rerank heuristic order - enforced at the hand-off in the pipeline,
+  // with `search_rerank_min_score` still applying unchanged.
+  const relationalRerankPin = parseBool(
+    envOrConfig(
+      env,
+      config,
+      "OPEN_SECOND_BRAIN_SEARCH_RELATIONAL_RERANK_PIN",
+      "search_relational_rerank_pin",
+    ),
+    false,
+    "search_relational_rerank_pin",
+  );
   const rerankKindRaw = envOrConfig(
     env,
     config,
@@ -766,6 +815,10 @@ export function resolveSearchConfig(opts: {
     ...(rerankAllowInsecureHttp ? { allowInsecureHttp: true } : {}),
     topK: rerankTopK,
     minScore: rerankMinScore,
+    // Absent reads as off, matching this block's other opt-outs: the field
+    // is optional so configs written before the knob stay valid, and the
+    // exact-shape assertions on the resolved config keep holding.
+    ...(relationalRerankPin ? { relationalRerankPin: true } : {}),
     ...(rerankDecisionModel !== null ? { decisionModel: rerankDecisionModel } : {}),
   });
 
@@ -867,6 +920,20 @@ export function resolveSearchConfig(opts: {
     ),
     false,
     "search_relational_arm_enabled",
+  );
+  // Metadata-boost lexical-vote gate (t_d9f863e9). Off by default: additive
+  // metadata/structural boosts apply to every query as shipped. When true,
+  // a query whose keyword lane returned no hits contributes exactly zero
+  // from those layers, with the suppression named in the rank receipts.
+  const metadataBoostGateEnabled = parseBool(
+    envOrConfig(
+      env,
+      config,
+      "OPEN_SECOND_BRAIN_SEARCH_METADATA_BOOST_GATE",
+      "search_metadata_boost_gate",
+    ),
+    false,
+    "search_metadata_boost_gate",
   );
   const retrievalTrustGateEnabled = parseBool(
     envOrConfig(env, config, "OPEN_SECOND_BRAIN_SEARCH_TRUST_GATE", "search_trust_gate_enabled"),
@@ -1005,6 +1072,7 @@ export function resolveSearchConfig(opts: {
     cacheTtlSeconds,
     relationPolarityEnabled,
     relationalArmEnabled,
+    metadataBoostGateEnabled,
     retrievalTrustGateEnabled,
     supersedeFadeEnabled,
     learnedWeightsEnabled,
@@ -1035,6 +1103,7 @@ export function resolveSearchConfig(opts: {
     rerank,
     shutdownGraceMs: shutdownGraceSeconds * 1000,
     resumeReindex,
+    hybridDeadlineMs,
     ftsTokenize,
   });
 

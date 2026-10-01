@@ -19,6 +19,11 @@
  *     through a vault-wide merge map (see `lint-consolidate.ts`).
  *   - broken Brain-artifact wikilink against `collectAllBasenames`, the
  *     readdir-only basename index the doctor already builds (6 ms).
+ *   - {@link NEAR_DUPLICATE_CODE}, the authored body compared against the
+ *     pages it could plausibly duplicate - the SAME directory AND the SAME
+ *     composite scope bucket - through the shared `tokenise`/`jaccard`
+ *     primitives (t_d30c0548). A bounded, deterministic candidate set per
+ *     write; the finding rides the receipt and never gates the write.
  *
  * `demote-stale-stable` is deliberately EXCLUDED, not overlooked: its
  * trigger is the page's creation age against the staleness cap, so it can
@@ -36,6 +41,12 @@
  *     entirely, so nothing here sees their bytes.
  *   - Log appends (`append_log_line`, `apply_evidence`) name no note path
  *     and are not linted: the log line is machine-composed, not authored.
+ *   - Body normalization on the write boundary is a recorded REFUSAL
+ *     (t_d30c0548), not an omission: every candidate set (whitespace
+ *     collapse, smart-quote folding, trailing-space trim) changes authored
+ *     bytes that receipts, dedup and byte-stability tests pin. The
+ *     near-duplicate score is computed over the body exactly as authored,
+ *     and frontmatter is never compared and never touched.
  *
  * ## Shape
  *
@@ -69,11 +80,13 @@
  * absent `lint` key must mean clean, and only that.
  */
 
-import { readFileSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { posix, resolve } from "node:path";
 
 import { vaultRelative } from "../path-safety.ts";
+import { compositeScopeKey, scopeFromFrontmatter } from "../scope-key.ts";
 import { parseFrontmatterText } from "../vault.ts";
+import type { FrontmatterMap } from "../types.ts";
 import { collectAllBasenames } from "./doctor/records.ts";
 import {
   LINT_CONSOLIDATE_KIND,
@@ -83,6 +96,7 @@ import {
 import { nextCommandField, type NextCommandField } from "./next-step.ts";
 import { loadSchemaPack } from "./schema-pack.ts";
 import type { BrainSchemaVocabulary } from "./schema-vocab.ts";
+import { jaccard, tokenise } from "./similarity.ts";
 import type { DoctorSeverity } from "./types.ts";
 import { WIKILINK_TARGET_RE, isBrainArtifactId, normaliseWikilinkTarget } from "./wikilink.ts";
 import { ARTIFACT_MAX_BYTES, validateArtifact } from "./write-session/validate.ts";
@@ -103,6 +117,42 @@ export const PAGE_LINT_UNAVAILABLE_CODE = "page-lint-unavailable";
 
 /** The doctor code an unresolvable Brain wikilink is already reported as. */
 const BROKEN_WIKILINK_CODE = "broken-wikilink";
+
+/**
+ * Near-duplicate bar (t_d30c0548): the jaccard score at or above which the
+ * authored body counts as closely matching an existing page. Deliberately
+ * high - near-DUPLICATE claims near-identity, unlike the 0.5 contradiction
+ * precedent that answers "same subject" - and a named constant rather than
+ * config, so promoting it after real-world noise is a one-line change.
+ */
+export const NEAR_DUPLICATE_JACCARD = 0.8;
+
+/** Code the near-duplicate detector reports under. */
+export const NEAR_DUPLICATE_CODE = "near-duplicate";
+
+/**
+ * Most sibling pages one directory contributes as near-duplicate
+ * candidates: the newest by mtime. Every sibling is stat'ed (cheap), but
+ * only these are read and tokenised, so a write into a folder of
+ * thousands of notes costs a bounded read. Siblings past the cap are
+ * counted on the report as `candidates_skipped`, never dropped silently.
+ */
+export const NEAR_DUPLICATE_MAX_CANDIDATES = 200;
+
+/** Extension every candidate page on disk carries. */
+const MARKDOWN_EXT = ".md";
+
+/**
+ * Canonical prefix of a vault-relative spelling that leaves the vault.
+ * The write kernel refuses traversal, so such a page can only reach this
+ * module from a caller - but the candidate walk must not depend on that:
+ * enumerating outside the vault would read the operator's filesystem for
+ * a receipt about the vault.
+ */
+const VAULT_ESCAPE_PREFIX = "../";
+
+/** Absent-directory case for a candidate lookup: an empty list, never a miss. */
+const NO_CANDIDATES: ReadonlyArray<NearDuplicateCandidate> = Object.freeze([]);
 
 /** Why a written page was not linted. Never a silent omission. */
 export const PAGE_LINT_SKIP_REASON = Object.freeze({
@@ -171,7 +221,13 @@ export interface PageLintFinding extends NextCommandField {
   readonly code: string;
   /** Vault-relative path of the page the finding is about. */
   readonly page: string;
-  /** Location within the document: `body`, `frontmatter`, `tags`, or a link target. */
+  /**
+   * Location within the document: `body`, `frontmatter`, `tags`, or the
+   * thing the finding points at - a link target for the link detectors,
+   * the resembling page's vault-relative path for {@link NEAR_DUPLICATE_CODE}
+   * (evidence in the same spirit the write-conflict advisory renders
+   * `[[pref-id]] jaccard=…` into its log events).
+   */
   readonly path: string;
   readonly message: string;
 }
@@ -207,6 +263,26 @@ export interface PageLintReport {
   readonly skipped: ReadonlyArray<PageLintSkip>;
   /** Present iff the lint could not run; the counters above are then zero. */
   readonly unavailable?: PageLintUnavailable;
+  /**
+   * Sibling pages the near-duplicate check did not compare against
+   * because their directory exceeded {@link NEAR_DUPLICATE_MAX_CANDIDATES}.
+   * Present only when the cap applied.
+   */
+  readonly candidates_skipped?: number;
+  /** Sibling pages the near-duplicate check could not read, each named. Present only when any. */
+  readonly candidates_unreadable?: ReadonlyArray<PageLintCandidateSkip>;
+}
+
+/** A sibling page the near-duplicate check could not read, and the errno code why. */
+export interface PageLintCandidateSkip {
+  readonly page: string;
+  readonly detail: string;
+}
+
+/** What building the near-duplicate candidate index left out, by count and by name. */
+export interface NearDuplicateCensus {
+  readonly candidatesSkipped: number;
+  readonly unreadable: ReadonlyArray<PageLintCandidateSkip>;
 }
 
 /**
@@ -237,17 +313,14 @@ function finding(
 /**
  * The schema type the document declares, or `null`. Mirrors
  * `assertValidDocument`: the validator judges the declared type against
- * the pack, and a document whose frontmatter will not parse is already
- * reported by the validator itself.
+ * the pack. Fed the frontmatter {@link parseFrontmatterText} already
+ * produced for the near-duplicate scan, so one page parses exactly once;
+ * that parse is total (a document without frontmatter parses to an empty
+ * map), so the null case is simply a document that declares nothing.
  */
-function declaredSchemaType(raw: string): string | null {
-  try {
-    const [meta] = parseFrontmatterText(raw);
-    const declared = meta["type"];
-    return typeof declared === "string" && declared.trim() !== "" ? declared : null;
-  } catch {
-    return null;
-  }
+function declaredSchemaType(meta: FrontmatterMap): string | null {
+  const declared = meta["type"];
+  return typeof declared === "string" && declared.trim() !== "" ? declared : null;
 }
 
 /**
@@ -266,6 +339,22 @@ function distinctLinkTargets(raw: string): ReadonlyArray<string> {
 }
 
 /**
+ * One page that can serve the near-duplicate detector as a candidate: its
+ * vault-relative path, composite scope bucket, and body tokens, read once
+ * per call. The written pages themselves are in here too - a batch can
+ * write two near-identical pages into one directory and each should see
+ * the other - so self-comparison is excluded at detection time, not here.
+ */
+export interface NearDuplicateCandidate {
+  /** Vault-relative path of the candidate page. */
+  readonly page: string;
+  /** The page's composite scope bucket, `compositeScopeKey` spelling. */
+  readonly scopeKey: string;
+  /** The authored body through the shared `tokenise` primitive. */
+  readonly tokens: ReadonlySet<string>;
+}
+
+/**
  * Everything the lint computes once per call and threads per page.
  *
  * Exported with {@link lintPagesWithContext} so the per-page failure path can
@@ -278,11 +367,56 @@ export interface LintContext {
   readonly basenames: ReadonlySet<string>;
   readonly vocabulary: BrainSchemaVocabulary;
   readonly mergedLinks: MergedLinkResolver;
+  /**
+   * The near-duplicate candidates, keyed by the vault-relative directory
+   * they live in. Built once per call from exactly the directories the
+   * written pages landed in - the bounded candidate set (same directory,
+   * same scope bucket) needs nothing vault-wide.
+   */
+  readonly nearDuplicateCandidates: ReadonlyMap<string, ReadonlyArray<NearDuplicateCandidate>>;
+  /** What the candidate index left out; absent means nothing was. */
+  readonly nearDuplicateCensus?: NearDuplicateCensus;
+}
+
+/**
+ * The near-duplicate findings for one written page: the authored body
+ * against every candidate in the same directory and the same composite
+ * scope bucket, at or above {@link NEAR_DUPLICATE_JACCARD}. The page
+ * itself is never its own candidate - a batch can write two lookalikes,
+ * but a single write cannot resemble itself - and the score rides the
+ * message so an operator judgement call is informed.
+ */
+function nearDuplicateFindings(
+  ctx: LintContext,
+  page: string,
+  meta: FrontmatterMap,
+  body: string,
+): PageLintFinding[] {
+  const out: PageLintFinding[] = [];
+  const scopeKey = compositeScopeKey(scopeFromFrontmatter(meta));
+  const tokens = tokenise(body);
+  for (const candidate of ctx.nearDuplicateCandidates.get(posix.dirname(page)) ?? NO_CANDIDATES) {
+    if (candidate.page === page) continue;
+    if (candidate.scopeKey !== scopeKey) continue;
+    const sim = jaccard(tokens, candidate.tokens);
+    if (sim < NEAR_DUPLICATE_JACCARD) continue;
+    out.push(
+      finding(
+        "warning",
+        NEAR_DUPLICATE_CODE,
+        page,
+        candidate.page,
+        `body resembles [[${candidate.page}]] jaccard=${sim.toFixed(3)} (threshold ${NEAR_DUPLICATE_JACCARD})`,
+      ),
+    );
+  }
+  return out;
 }
 
 function lintOnePage(ctx: LintContext, page: string, raw: string): PageLintFinding[] {
   const out: PageLintFinding[] = [];
-  const schemaType = declaredSchemaType(raw);
+  const [meta, body] = parseFrontmatterText(raw);
+  const schemaType = declaredSchemaType(meta);
   for (const violation of validateArtifact(raw, { schemaType, vocabulary: ctx.vocabulary })) {
     out.push(finding("error", violation.code, page, violation.path, violation.message));
   }
@@ -328,6 +462,7 @@ function lintOnePage(ctx: LintContext, page: string, raw: string): PageLintFindi
       );
     }
   }
+  out.push(...nearDuplicateFindings(ctx, page, meta, body));
   return out;
 }
 
@@ -348,6 +483,87 @@ function emptyReport(unavailable?: PageLintUnavailable): PageLintReport {
 }
 
 /**
+ * The vault-relative spelling of a page, whatever spelling the caller
+ * handed in. The ONE derivation for every string that names a page on
+ * this report - findings, skips, and near-duplicate candidates alike -
+ * so the map keys and the page strings compared against them can never
+ * drift into two normalizations.
+ */
+function canonicalPage(vault: string, page: string): string {
+  return vaultRelative(resolve(vault, page), vault);
+}
+
+/**
+ * The near-duplicate candidate index for one call: every Markdown page in
+ * exactly the directories the written pages landed in, keyed by that
+ * directory, each carrying its composite scope bucket and body tokens.
+ *
+ * Only the newest {@link NEAR_DUPLICATE_MAX_CANDIDATES} siblings per
+ * directory are read; the rest are counted in the census. A candidate
+ * that cannot be read is not a candidate - it cannot provide evidence -
+ * but it is NAMED in the census with its errno code, never skipped
+ * silently. A candidate over the artifact byte cap is
+ * skipped for the same cost reason a written page over the cap is skipped
+ * rather than validated. The directory enumerations themselves are NOT
+ * guarded: the write just committed into them, so a failure to list one
+ * is a failure of the lint's inputs and belongs in the report's
+ * `unavailable` slot like every other context-building failure. A page
+ * spelled outside the vault ({@link VAULT_ESCAPE_PREFIX}) collects no
+ * candidates at all: the walk stops at the vault boundary.
+ */
+function collectNearDuplicateCandidates(
+  vault: string,
+  pages: ReadonlyArray<string>,
+): {
+  readonly index: ReadonlyMap<string, ReadonlyArray<NearDuplicateCandidate>>;
+  readonly census: NearDuplicateCensus;
+} {
+  const directories = new Set<string>();
+  for (const named of pages) {
+    const canonical = canonicalPage(vault, named);
+    if (canonical.startsWith(VAULT_ESCAPE_PREFIX)) continue;
+    directories.add(posix.dirname(canonical));
+  }
+  const index = new Map<string, NearDuplicateCandidate[]>();
+  const unreadable: PageLintCandidateSkip[] = [];
+  let candidatesSkipped = 0;
+  for (const directory of directories) {
+    // Stat every sibling (cheap), then read only the newest few.
+    const siblings: Array<{ absolute: string; size: number; mtimeMs: number }> = [];
+    for (const name of readdirSync(resolve(vault, directory))) {
+      if (!name.endsWith(MARKDOWN_EXT)) continue;
+      const absolute = resolve(vault, directory, name);
+      try {
+        const stat = statSync(absolute);
+        siblings.push({ absolute, size: stat.size, mtimeMs: stat.mtimeMs });
+      } catch (err) {
+        unreadable.push({ page: canonicalPage(vault, absolute), detail: failureCode(err) });
+      }
+    }
+    const newest = siblings.toSorted((a, b) => b.mtimeMs - a.mtimeMs);
+    candidatesSkipped += Math.max(0, newest.length - NEAR_DUPLICATE_MAX_CANDIDATES);
+    const candidates: NearDuplicateCandidate[] = [];
+    for (const sibling of newest.slice(0, NEAR_DUPLICATE_MAX_CANDIDATES)) {
+      // Size from the inode: reading an over-cap page to find that out is
+      // the cost the cap exists to avoid.
+      if (sibling.size > ARTIFACT_MAX_BYTES) continue;
+      try {
+        const [meta, body] = parseFrontmatterText(readFileSync(sibling.absolute, "utf8"));
+        candidates.push({
+          page: canonicalPage(vault, sibling.absolute),
+          scopeKey: compositeScopeKey(scopeFromFrontmatter(meta)),
+          tokens: tokenise(body),
+        });
+      } catch (err) {
+        unreadable.push({ page: canonicalPage(vault, sibling.absolute), detail: failureCode(err) });
+      }
+    }
+    index.set(directory, candidates);
+  }
+  return { index, census: { candidatesSkipped, unreadable } };
+}
+
+/**
  * Lint exactly the pages a write committed, reading what is on disk.
  *
  * Runs AFTER the commit on purpose: the batch kernel wrote the bytes and
@@ -360,16 +576,21 @@ function emptyReport(unavailable?: PageLintUnavailable): PageLintReport {
  *
  * Cost discipline: the basename index and the schema pack are computed
  * ONCE per call and threaded, the merge resolver memoises per call, and
- * nothing here walks vault content.
+ * nothing here walks vault content beyond the written pages' own
+ * directories - the near-duplicate candidate index reads each of those
+ * once per call, sized against the same artifact cap as the pages.
  */
 export function lintWrittenPages(vault: string, pages: ReadonlyArray<string>): PageLintReport {
   if (pages.length === 0) return emptyReport();
   let ctx: LintContext;
   try {
+    const nearDuplicates = collectNearDuplicateCandidates(vault, pages);
     ctx = {
       basenames: collectAllBasenames(vault),
       vocabulary: loadSchemaPack(vault).vocabulary,
       mergedLinks: createMergedLinkResolver(vault),
+      nearDuplicateCandidates: nearDuplicates.index,
+      nearDuplicateCensus: nearDuplicates.census,
     };
   } catch (err) {
     return emptyReport({
@@ -394,12 +615,12 @@ export function lintPagesWithContext(
   const detected: PageLintFinding[] = [];
   const skipped: PageLintSkip[] = [];
   for (const named of pages) {
-    // Rendered through the same helper every other reporting surface uses,
-    // so the page a finding names is vault-relative whichever spelling the
-    // caller handed in - an absolute path here would be the operator's home
-    // directory in a write receipt.
-    const absolute = resolve(vault, named);
-    const page = vaultRelative(absolute, vault);
+    // Rendered through the same derivation every other reporting surface
+    // uses, so the page a finding names is vault-relative whichever
+    // spelling the caller handed in - an absolute path here would be the
+    // operator's home directory in a write receipt.
+    const page = canonicalPage(vault, named);
+    const absolute = resolve(vault, page);
     let raw: string;
     try {
       // Size first, from the inode: an over-cap page must be REPORTED as
@@ -435,12 +656,19 @@ export function lintPagesWithContext(
 
   const ranked = detected.toSorted(comparePageLintFindings);
   const returned = ranked.slice(0, PAGE_LINT_MAX_FINDINGS);
+  const census = ctx.nearDuplicateCensus;
   return Object.freeze({
     findings: Object.freeze(returned),
     total: ranked.length,
     returned: returned.length,
     truncated: ranked.length > returned.length,
     skipped: Object.freeze(skipped),
+    ...(census !== undefined && census.candidatesSkipped > 0
+      ? { candidates_skipped: census.candidatesSkipped }
+      : {}),
+    ...(census !== undefined && census.unreadable.length > 0
+      ? { candidates_unreadable: Object.freeze([...census.unreadable]) }
+      : {}),
   });
 }
 
@@ -451,7 +679,13 @@ const NO_PAGE_LINT: PageLintField = Object.freeze({});
 
 /** Whether a report carries anything a caller needs to see. */
 function hasSomethingToSay(report: PageLintReport): boolean {
-  return report.total > 0 || report.skipped.length > 0 || report.unavailable !== undefined;
+  return (
+    report.total > 0 ||
+    report.skipped.length > 0 ||
+    report.unavailable !== undefined ||
+    report.candidates_skipped !== undefined ||
+    report.candidates_unreadable !== undefined
+  );
 }
 
 /**

@@ -118,6 +118,16 @@ describe("o2b doctor --readiness end to end", () => {
     expect(r.returncode).toBe(DOCTOR_EXIT.ok);
   });
 
+  test("a vault with a plain AGENTS.md exits 0 and grades the write-back probe skipped", async () => {
+    writeFileSync(join(tmp, "AGENTS.md"), "# Workspace\n\nplain instructions\n", "utf8");
+    const r = await runCli(["doctor", "--vault", tmp, "--readiness", "--json"], { env: env() });
+    expect(r.returncode).toBe(DOCTOR_EXIT.ok);
+    const parsed = JSON.parse(r.stdout);
+    expect(
+      parsed.readiness.find((p: { name: string }) => p.name === "writeback_contract")?.status,
+    ).toBe(READINESS_STATUS.skipped);
+  });
+
   test("--json carries the same three-way answer the exit code does", async () => {
     mkdirSync(join(tmp, ".open-second-brain"), { recursive: true });
     writeFileSync(manifestPath(tmp), "{ this is not json", "utf8");
@@ -125,7 +135,9 @@ describe("o2b doctor --readiness end to end", () => {
     const r = await runCli(["doctor", "--vault", tmp, "--readiness", "--json"], { env: env() });
     expect(r.returncode).toBe(DOCTOR_EXIT.probeIncomplete);
     const parsed = JSON.parse(r.stdout);
-    expect(parsed.readiness_summary.unknown).toBe(1);
+    // Both readiness probes honestly report unknown for the same
+    // unreadable manifest: installed_runtimes and registered_commands.
+    expect(parsed.readiness_summary.unknown).toBe(2);
     expect(parsed.readiness_summary.failed).toBe(0);
     expect(
       parsed.readiness.some(

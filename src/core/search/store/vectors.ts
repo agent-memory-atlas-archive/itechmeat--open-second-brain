@@ -10,8 +10,14 @@
 
 import { Database } from "bun:sqlite";
 
+import {
+  resolveSemanticCapability,
+  SEMANTIC_CAPABILITY_TIER,
+  type SemanticCapabilityTier,
+} from "../capability-tier.ts";
+import { LOCAL_EMBEDDING_MODEL } from "../embeddings/signature.ts";
 import { dropVecTable, ensureVecTable } from "../schema.ts";
-import { SearchError } from "../types.ts";
+import { SearchError, type ResolvedEmbeddingConfig, type SearchErrorCode } from "../types.ts";
 import { assertValidVector } from "../vector-guard.ts";
 import {
   deleteState,
@@ -44,6 +50,18 @@ export interface ModelChangeOutcome {
   readonly previousDimension: number | null;
   readonly currentModel: string | null;
   readonly currentDimension: number | null;
+  /**
+   * Present when the verify-before-replace gate refused a clear: the
+   * stored vectors and the recorded model were kept, and the store opened
+   * anyway so keyword indexing goes on. The same sentence is logged.
+   */
+  readonly refusal?: EmbeddingRebuildRefusal;
+}
+
+/** A refused clear, named by the blocked tier's error code. */
+export interface EmbeddingRebuildRefusal {
+  readonly code: SearchErrorCode;
+  readonly message: string;
 }
 
 /** What an open connection knows about sqlite-vec. */
@@ -284,10 +302,115 @@ export function clearEmbeddings(db: Database, vecLoaded: boolean): void {
 }
 
 /**
+ * Evidence a caller must hand the model-change gate: the resolved
+ * embedding configuration of THIS process, from which the gate derives
+ * the one capability verdict (`resolveSemanticCapability`) that decides
+ * whether a cleared corpus could actually be rebuilt.
+ *
+ * Callers that open write connections (the `Store` wrapper every
+ * production path funnels through) must pass `{ semantic }` from their
+ * resolved config. A caller that passes no gate supplies no capability
+ * evidence, and the legacy clear contract applies unchanged - the gate
+ * is evidence-driven, so absence of evidence is never read as evidence
+ * of rebuildability.
+ */
+export interface EmbeddingRebuildGate {
+  readonly semantic: ResolvedEmbeddingConfig;
+}
+
+/**
+ * The typed error each blocked capability tier refuses with. Both codes
+ * pre-exist in the closed `SEARCH_ERROR_CODES` union and carry exactly
+ * these meanings: a `disabled` configuration computes no embeddings at
+ * all, and a `credential-missing` one cannot reach its provider.
+ */
+const BLOCKED_TIER_ERROR_CODE: Readonly<
+  Record<Exclude<SemanticCapabilityTier, "configured">, SearchErrorCode>
+> = Object.freeze({
+  [SEMANTIC_CAPABILITY_TIER.disabled]: "EMBEDDING_DISABLED",
+  [SEMANTIC_CAPABILITY_TIER.credentialMissing]: "EMBEDDING_KEY_MISSING",
+});
+
+/**
+ * Whether any `chunks` rows exist - the source-material half of the
+ * verify-before-replace gate.
+ *
+ * Deliberately a local query rather than an import of `countChunks`
+ * from `./chunks.ts`: that module already imports this one for the vec
+ * purge helpers, and a back-import would close a module cycle for one
+ * SQL line. The census spelling stays `countChunks`; this predicate
+ * only answers presence.
+ */
+function hasChunkRows(db: Database): boolean {
+  const row = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM chunks").get();
+  return (row?.n ?? 0) > 0;
+}
+
+/**
+ * The verify-before-replace gate (t_2fbdaf70): a clear that destroys
+ * stored vectors must not run unless the corpus can be rebuilt.
+ *
+ * Loss-bearing trigger: the stored embeddings row count. A store without
+ * embeddings loses nothing to a clear. In an FK-enforced store
+ * (`PRAGMA foreign_keys = ON`, `embeddings.chunk_id REFERENCES chunks`)
+ * stored embeddings imply chunk rows, so the design's chunk-material
+ * assertion cannot flip the verdict in a healthy store - it surfaces in
+ * the refusal detail instead, naming the one corruption state
+ * (embeddings without chunks) where the rebuild would have no source.
+ *
+ * The verdict is the capability tier: a `disabled` or
+ * `credential-missing` configuration cannot recompute the vectors, so
+ * the clear would be destruction without a recovery path. The refusal
+ * is returned, named by the tier's error code, BEFORE any mutation: the
+ * old vectors and the old recorded model both survive, the store still
+ * opens (keyword indexing does not depend on vectors), and every later
+ * open names it again until the operator restores a rebuilding
+ * configuration or reverts the model.
+ */
+function rebuildRefusalBeforeClear(
+  db: Database,
+  gate: EmbeddingRebuildGate | undefined,
+  context: {
+    readonly previousModel: string | null;
+    readonly previousDimension: number | null;
+    readonly model: string | null;
+    readonly dimension: number | null;
+  },
+): EmbeddingRebuildRefusal | null {
+  if (gate === undefined) return null;
+  const stored = countEmbeddings(db);
+  if (stored === 0) return null;
+  const capability = resolveSemanticCapability(gate.semantic);
+  if (capability.tier === SEMANTIC_CAPABILITY_TIER.configured) return null;
+  const material = hasChunkRows(db) ? "" : "; no chunk material remains to rebuild from";
+  return {
+    code: BLOCKED_TIER_ERROR_CODE[capability.tier],
+    message:
+      `embedding model change from ${context.previousModel}/${context.previousDimension} to ` +
+      `${context.model}/${context.dimension} refused: ${stored} stored embedding(s) cannot be ` +
+      `rebuilt while the semantic capability is ${capability.tier}${material}; the stored ` +
+      `embeddings and the recorded model are kept; restore the previous model or the provider ` +
+      `credential, then reindex`,
+  };
+}
+
+/**
  * Compare the configured embedding model/dimension with what was
  * recorded in `index_state` on the last index run. If they differ
  * and both old + new are non-null, drop embeddings + vec table and
  * log one line per design §13. First-time set just records state.
+ *
+ * Two guarded edges (t_2fbdaf70):
+ * - The clear is gated on rebuildability when the caller passes an
+ *   {@link EmbeddingRebuildGate}: with stored vectors present and a
+ *   capability tier that cannot recompute them, the clear is refused:
+ *   nothing is mutated, the refusal is logged and returned on the
+ *   outcome under the tier's error code, and the caller's open goes on.
+ * - A named-model -> null-model transition is not a detected change
+ *   (the ladder requires both sides non-null), but under the gate's own
+ *   logic it must not clear either - rebuildability cannot be verified
+ *   with no model configured. It warns one line naming the last recorded
+ *   model and keeps the vectors; with nothing stored it stays silent.
  */
 export function ensureEmbeddingModel(
   db: Database,
@@ -295,6 +418,7 @@ export function ensureEmbeddingModel(
   model: string | null,
   dimension: number | null,
   prefixes?: EmbeddingPrefixPair,
+  gate?: EmbeddingRebuildGate,
 ): ModelChangeOutcome {
   const prevModel = getState(db, EMBEDDING_MODEL_STATE_KEY);
   const prevDimRaw = getState(db, EMBEDDING_DIMENSION_STATE_KEY);
@@ -303,6 +427,12 @@ export function ensureEmbeddingModel(
   const modelChanged = prevModel !== null && model !== null && prevModel !== model;
   const dimChanged =
     prevDim !== null && dimension !== null && Number.isFinite(prevDim) && prevDim !== dimension;
+  // A named-model -> null-model transition (t_2fbdaf70). The local
+  // embedder's model is implicit - the config never names it - so a
+  // recorded LOCAL_EMBEDDING_MODEL meeting a null incoming model is the
+  // steady state of every local-provider vault, not a removed model;
+  // warning there would be recurring noise on every write open.
+  const modelRemoved = prevModel !== null && model === null && prevModel !== LOCAL_EMBEDDING_MODEL;
 
   // A prefix change invalidates stored vectors exactly as a model/dimension
   // change does: vectors embedded under the old prefix are not comparable to
@@ -322,6 +452,29 @@ export function ensureEmbeddingModel(
     (effectivePrevQueryPrefix !== prefixes.query ||
       effectivePrevPassagePrefix !== prefixes.passage);
 
+  const refusalContext = {
+    previousModel: prevModel,
+    previousDimension: prevDim,
+    model,
+    dimension,
+  };
+  const refusal =
+    modelChanged || dimChanged || (!modelRemoved && prefixChanged)
+      ? rebuildRefusalBeforeClear(db, gate, refusalContext)
+      : null;
+  if (refusal !== null) {
+    // eslint-disable-next-line no-console
+    console.error(`${refusal.code}: ${refusal.message}`);
+    return Object.freeze({
+      wasChanged: false,
+      previousModel: prevModel,
+      previousDimension: prevDim,
+      currentModel: prevModel,
+      currentDimension: prevDim,
+      refusal,
+    });
+  }
+
   if (modelChanged || dimChanged) {
     clearEmbeddings(db, vec.loaded);
     // eslint-disable-next-line no-console
@@ -334,6 +487,16 @@ export function ensureEmbeddingModel(
     // just cleared, so it must not outlive them: leaving it would
     // claim an ABI for storage that no longer holds any.
     deleteState(db, EMBEDDING_VEC_VERSION_STATE_KEY);
+  } else if (modelRemoved && countEmbeddings(db) > 0) {
+    // Named-model -> null-model: never a clear (see docblock), never silent.
+    // This branch also deliberately precedes the prefix branch: with no
+    // model configured there is nothing to verify a prefix clear against.
+    // eslint-disable-next-line no-console
+    console.error(
+      `embedding model removed from config (was ${prevModel}); ` +
+        `${countEmbeddings(db)} stored embedding(s) kept - rebuildability cannot be verified ` +
+        `with no model configured`,
+    );
   } else if (prefixChanged) {
     // Model/dimension unchanged: the prefix change alone triggers the clear.
     clearEmbeddings(db, vec.loaded);

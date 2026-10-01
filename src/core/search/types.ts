@@ -20,6 +20,7 @@ import type { DegradationNotice } from "../integrity/degradation.ts";
 import type { StampMismatch } from "../integrity/stamp.ts";
 import type { ReconciliationOutcome, ReconciliationReport } from "../reconciliation-report.ts";
 import type { VaultPathRule, VaultScopeRules } from "../vault-scope/defaults.ts";
+import type { MaintenanceSpendReceipt } from "../brain/maintenance/journal.ts";
 import type { DegreePredicate } from "./property-filter.ts";
 import type { TemporalIntent } from "./temporal-intent.ts";
 import type { FtsMatchMode } from "./fts-match-mode.ts";
@@ -333,6 +334,18 @@ export interface IndexStats {
    * it emitted before this field existed.
    */
   readonly chunkWindow?: ChunkWindowCensus;
+  /**
+   * The embedding phase's own cost-gate result for this run
+   * (t_9d155d0e), priced by the cost kernel over the census the phase
+   * actually embedded. Present only when a phase ran over a non-empty
+   * pending census and the run COMPLETED - a run that threw has no stats
+   * to read, and a caller journaling the receipt must not price a pass
+   * it cannot vouch for. `forced` is true only when a force bypass
+   * overrode a gate that would have refused the spend. Absent on every
+   * run whose embedding phase did not engage, so a run that could not
+   * spend emits the shape it always emitted.
+   */
+  readonly spend?: MaintenanceSpendReceipt;
   readonly durationMs: number;
 }
 
@@ -1285,6 +1298,16 @@ export interface ResolvedRerankConfig {
    */
   readonly minScore: number;
   /**
+   * Relational rerank pin (t_d9f863e9), resolved from
+   * `search_relational_rerank_pin`. Off by default: when true, rerank may
+   * PROMOTE relational-origin candidates but never SINK them below their
+   * pre-rerank heuristic order - a protect rule at the cross-encoder
+   * hand-off, not a second floor beside {@link minScore}, which still
+   * applies unchanged. Absent (configs written before the knob construct
+   * this shape literally) reads as false.
+   */
+  readonly relationalRerankPin?: boolean;
+  /**
    * The resolved decision-model config. Present only when `kind` is
    * "decision-model"; `enabled` is false unless that config is active and
    * its `rerank` use is not `off`.
@@ -1453,6 +1476,16 @@ export interface ResolvedRecallConfig {
    * of the corpus (low selectivity - not worth widening the pool). [0, 1].
    */
   readonly trigramPrefilterMaxSelectivity: number;
+  /**
+   * Metadata-boost lexical-vote gate (t_d9f863e9), resolved from
+   * `search_metadata_boost_gate`. Off by default: when true, a query whose
+   * keyword lane returned no hits (no lexical vote) contributes exactly
+   * zero from every additive metadata/structural boost layer, so a
+   * vector-only answer is never floated by layers calibrated over a
+   * lexical candidate set. Absent (configs written before the knob
+   * construct this shape literally) reads as false.
+   */
+  readonly metadataBoostGateEnabled?: boolean;
 }
 
 export interface ResolvedSearchConfig {
@@ -1506,6 +1539,23 @@ export interface ResolvedSearchConfig {
    * signalling the abort, without awaiting. Default 5000.
    */
   readonly shutdownGraceMs: number;
+  /**
+   * Wall-clock budget (ms) over the whole composite hybrid path - embed ->
+   * semanticTopK -> rerank -> second pass (t_bdc24171). Resolved from
+   * `search_hybrid_deadline_ms` /
+   * `OPEN_SECOND_BRAIN_SEARCH_HYBRID_DEADLINE`; the default is the sum of
+   * the two named lane budgets (the 10s embedding timeout and the 5s
+   * rerank timeout), so normal operations never reach it and the deadline
+   * bounds exactly the phases with no budget of their own. On expiry the
+   * search completes keyword-only and reports
+   * `RETRIEVAL_DEGRADATION.hybridDeadlineExceeded`. `0` disables the
+   * deadline. Optional so configs written before the knob (test fixtures
+   * construct this shape literally) keep compiling; the default is applied
+   * by `resolveSearchConfig`, so a config constructed WITHOUT the field
+   * runs with no composite deadline - a hand-built config that names no
+   * deadline opts out by omission.
+   */
+  readonly hybridDeadlineMs?: number;
   /**
    * When true, an interrupted full `reindexVault` rebuild resumes a
    * compatible `brain.sqlite.new` staging build instead of discarding

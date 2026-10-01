@@ -6,7 +6,12 @@
  * bridges, and clusters stale-first; --force bypasses the soft gates
  * and every streak refusal but never the lease, while --retry <task>
  * (repeatable) bypasses the streak refusal for that task alone and
- * leaves every gate in force.
+ * leaves every gate in force. The reindex pass stays keyword-only
+ * unless `maintenance_embeddings` opts the lane into the embedding phase
+ * and the resolved config can reach a provider: then the pass announces
+ * its predicted spend before it runs, receipts what the phase actually
+ * priced after it, and --force-cost bypasses a positive embedding cost
+ * gate for this run alone - recorded on the receipt when it did.
  * `status` renders the lease holder and recent journal. Designed as
  * the cron entry point: a dead dashboard hour surfaces as
  * skipped:window in the journal instead of a contended vault.
@@ -44,17 +49,20 @@ import {
   type DailyWindow,
   type LaneTask,
   type MaintenanceTask,
+  type MaintenanceTaskResult,
 } from "../../../core/brain/maintenance/lane.ts";
 import { listJournal, MAINTENANCE_JOURNAL_CAP } from "../../../core/brain/maintenance/journal.ts";
+import { createLaneReindex } from "../../../core/brain/maintenance/reindex-task.ts";
 import { resolveAgentName } from "../../../core/config.ts";
-import { indexVault, resolveSearchConfig } from "../../../core/search/index.ts";
+import type { EmbeddingSpendPreview } from "../../../core/search/indexer.ts";
+import { resolveSearchConfig } from "../../../core/search/index.ts";
 import { onInterrupt } from "../../interrupt.ts";
 import { attachProgress, reportProgressRefusal } from "../../progress-rail.ts";
 import { brainVerbContext, fail, ok, okJson, parse } from "../helpers.ts";
 
 const USAGE =
   "usage: o2b brain maintenance run [--force] [--retry <task>] [--window H-H] [--tz ZONE] " +
-  "[--busy-minutes N] [--busy-threshold N] [--progress] | status [--limit N]  " +
+  "[--busy-minutes N] [--busy-threshold N] [--force-cost] [--progress] | status [--limit N]  " +
   "[--vault <path>] [--json]";
 
 /**
@@ -62,7 +70,8 @@ const USAGE =
  *
  * 0 covers a gate skip as well as a clean pass: a quiet hour, a busy
  * vault and a loaded host are self-resolving conditions and cron must
- * not alarm on them. 1 means a task was ATTEMPTED and failed.
+ * not alarm on them. 1 means a task was ATTEMPTED and failed for a
+ * reason the error names.
  *
  * A streak refusal is neither. Nothing ran, so 1 would report a failure
  * this run did not have - the same collapse the lane's own row avoids by
@@ -78,18 +87,44 @@ const USAGE =
  * probe could not find out" on both of those surfaces and this run found
  * out precisely: it names the task and the streak.
  *
- * Precedence follows `exitCodeForCheck`: a proved failure keeps the
- * generic code even when another task was also refused, so the specific
- * number never masks the more basic finding.
+ * A safeguard timeout is the 6 case, by the docblock's own reasoning: the
+ * task was killed mid-run at a checkpoint, so its outcome is unmeasured -
+ * precisely "could not find out", the same condition those two surfaces
+ * spend 6 on. Collapsing it into 1 told a nightly cron that a pass is
+ * broken when the only proved fact is that the pass did not finish; the
+ * timeout already names itself (and its budget) in the row's error.
+ *
+ * Precedence follows `exitCodeForCheck` and `doctorExitCode`: a proved
+ * failure keeps the generic code even when another task timed out or was
+ * refused, and an attempted-but-unmeasured pass outranks a refusal
+ * (something ran, where a refusal records that nothing did) - so the
+ * specific number never masks the more basic finding.
  */
 export const MAINTENANCE_EXIT = Object.freeze({
   ok: 0,
   failed: 1,
   usage: 2,
+  probeIncomplete: 6,
   refused: 7,
 } as const);
 
 export type MaintenanceExit = (typeof MAINTENANCE_EXIT)[keyof typeof MAINTENANCE_EXIT];
+
+/**
+ * The run's exit code from the lane's task rows, keyed ONLY on rows the
+ * lane itself distinguished: `timed_out` (safeguard deadline, outcome
+ * unmeasured), `refused` (streak refusal, nothing ran) and the plain
+ * failed attempt. A timed-out row carries `ok: false` like any failure,
+ * so the timeout check must come off `timed_out` - reading `ok` here
+ * would make the exit 6 impossible to reach.
+ */
+export function maintenanceExitCode(tasks: ReadonlyArray<MaintenanceTaskResult>): MaintenanceExit {
+  if (tasks.some((t) => !t.ok && t.refused !== true && t.timed_out !== true)) {
+    return MAINTENANCE_EXIT.failed;
+  }
+  if (tasks.some((t) => t.timed_out === true)) return MAINTENANCE_EXIT.probeIncomplete;
+  return tasks.some((t) => t.refused === true) ? MAINTENANCE_EXIT.refused : MAINTENANCE_EXIT.ok;
+}
 
 export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
   const { flags, positional } = parse(argv, {
@@ -104,6 +139,7 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
     agent: { type: "string" },
     progress: { type: "boolean" },
     json: { type: "boolean" },
+    "force-cost": { type: "boolean" },
   });
   const op = positional[0];
   const asJson = flags["json"] === true;
@@ -244,6 +280,29 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
       //
       // Inside the `try`, because the check below can return: a return
       // between `onInterrupt()` and the `try` would skip `release`.
+      //
+      // Spend is opt-in (`maintenance_embeddings`): the shared builder
+      // decides whether the pass may embed, announces the predicted spend
+      // inside the task and receipts what the phase priced. An offline or
+      // un-opted vault stays keyword-only and reaches no provider.
+      // `--force-cost` bypasses a positive gate for this run and is
+      // recorded on the receipt when it did override one.
+      const reindexTask = createLaneReindex({
+        vault,
+        ...(config ? { configPath: config } : {}),
+        searchConfig,
+        now,
+        forceCost: flags["force-cost"] === true,
+        safeguard: () => laneSafeguard(OPERATION.reindex),
+        signal: interrupt.signal,
+        ...laneProgress,
+        ...(asJson
+          ? {}
+          : {
+              onBanner: (preview: EmbeddingSpendPreview) =>
+                ok(formatSpendBanner(preview, searchConfig.semantic.costGateUsd)),
+            }),
+      });
       const laneTasks: ReadonlyArray<MaintenanceTask> = [
         {
           name: LANE_TASK.dream,
@@ -251,16 +310,7 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
             dream(vault, { now, safeguard: laneSafeguard(OPERATION.dream), ...laneProgress });
           },
         },
-        {
-          name: LANE_TASK.reindex,
-          run: async () => {
-            await indexVault(searchConfig, {
-              safeguard: laneSafeguard(OPERATION.reindex),
-              signal: interrupt.signal,
-              ...laneProgress,
-            });
-          },
-        },
+        reindexTask.task,
         // Link-recall-intelligence passes ride the same lease, after
         // reindex so they see fresh edges. Both are fail-soft inside:
         // a vault without embeddings simply proposes nothing.
@@ -348,17 +398,18 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
         tasks: laneTasks,
       });
 
-      if (asJson) okJson({ verdict: result.verdict, tasks: result.tasks });
-      else {
+      // The run-level spend block: the banner this run announced and the
+      // receipt its reindex pass returned, both absent when nothing spent.
+      const spend = reindexTask.spendBlock(result.tasks);
+      if (asJson) {
+        okJson({
+          verdict: result.verdict,
+          tasks: result.tasks,
+          ...(spend !== undefined ? { spend } : {}),
+        });
+      } else {
         ok(`maintenance: ${result.verdict}`);
-        for (const t of result.tasks) {
-          // A refused task never ran, so it is neither `ok` nor FAILED and
-          // has no duration to report - printing `in 0ms` would describe an
-          // attempt that did not happen. The lane's row omits `ok` for the
-          // same reason; this line agrees with it.
-          if (t.refused === true) ok(`  ${t.name}: REFUSED (${t.error})`);
-          else ok(`  ${t.name}: ${t.ok ? "ok" : `FAILED (${t.error})`} in ${t.duration_ms}ms`);
-        }
+        for (const t of result.tasks) ok(`  ${renderTaskLine(t)}`);
       }
       // A stopped lane is reported as stopped, not as four failures. The
       // lane catches each task's abort and journals it, so without this the
@@ -374,11 +425,10 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
         interrupt.acknowledge();
         return interrupt.exitCode();
       }
-      // An attempted failure outranks a refusal: see {@link MAINTENANCE_EXIT}.
-      if (result.tasks.some((t) => !t.ok && t.refused !== true)) return MAINTENANCE_EXIT.failed;
-      return result.tasks.some((t) => t.refused === true)
-        ? MAINTENANCE_EXIT.refused
-        : MAINTENANCE_EXIT.ok;
+      // An attempted failure outranks a refusal, and a pass the safeguard
+      // killed mid-run is reported as unmeasured, not broken: the table and
+      // its reasoning live on {@link MAINTENANCE_EXIT}.
+      return maintenanceExitCode(result.tasks);
     } finally {
       interrupt.release();
     }
@@ -390,6 +440,46 @@ export async function cmdBrainMaintenance(argv: string[]): Promise<number> {
     }
     return fail(message);
   }
+}
+
+/**
+ * One task row of the human run report. A refusal is rendered as neither
+ * `ok` nor FAILED and carries no duration - the task never ran, and
+ * printing `in 0ms` would describe an attempt that did not happen (the
+ * lane's row omits `ok` for the same reason; this line agrees with it).
+ * A safeguard timeout is rendered TIMED OUT rather than FAILED for the
+ * same reason the exit code says 6 and not 1: the pass was killed at a
+ * checkpoint, and the row's error - not this renderer - is what names
+ * the safeguard and the budget it spent. A receipt rides the line as a
+ * parenthetical, because the row that did the spending is the row an
+ * operator reads first.
+ */
+export function renderTaskLine(t: MaintenanceTaskResult): string {
+  if (t.refused === true) return `${t.name}: REFUSED (${t.error})`;
+  const outcome =
+    t.timed_out === true ? `TIMED OUT (${t.error})` : t.ok ? "ok" : `FAILED (${t.error})`;
+  const line = `${t.name}: ${outcome} in ${t.duration_ms}ms`;
+  if (t.receipt === undefined) return line;
+  return (
+    `${line} (tokens=${t.receipt.tokens}, ` +
+    `estimatedUsd=${t.receipt.estimatedUsd.toFixed(4)}, model=${t.receipt.model ?? "unknown"})`
+  );
+}
+
+/**
+ * The pre-spend banner for an embedding pass about to run. The estimate
+ * is INFORMATION, not only a refusal message: a zero gate (the default)
+ * never blocks, and the operator still sees what the pass is predicted
+ * to spend at the resolved model. Money formatting follows the cost
+ * gate's own refusal message - four fixed decimals - so the banner and
+ * the refusal that can follow it print one spelling.
+ */
+export function formatSpendBanner(preview: EmbeddingSpendPreview, gateUsd: number): string {
+  const gate = gateUsd > 0 ? `$${gateUsd.toFixed(4)}` : "off";
+  return (
+    `embedding spend: model ${preview.model ?? "unknown"}, ${preview.pendingChunks} chunks pending, ` +
+    `estimated $${preview.estimatedUsd.toFixed(4)} (gate: ${gate})`
+  );
 }
 
 /** A repeatable flag's values; a flag never passed is an empty list. */

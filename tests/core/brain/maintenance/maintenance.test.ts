@@ -38,6 +38,7 @@ import {
 } from "../../../../src/core/brain/maintenance/host-pressure.ts";
 import { MAINTENANCE_FAILURE_STREAK_LIMIT_DEFAULT } from "../../../../src/core/brain/policy/blocks/maintenance.ts";
 import { brainConfigPath } from "../../../../src/core/brain/paths.ts";
+import { SafeguardTimeoutError } from "../../../../src/core/brain/safeguard.ts";
 import {
   emitRecallTelemetry,
   RECALL_CHANNEL,
@@ -239,6 +240,61 @@ describe("runMaintenance", () => {
     expect(listJournal(vault).some((e) => e.task === "reindex" && e.ok === false)).toBe(true);
   });
 
+  test("a safeguard deadline marks the row timed_out; the lane still runs the rest", async () => {
+    const result = await runMaintenance(vault, {
+      now: NOW,
+      holder: "worker-a",
+      tasks: [
+        {
+          name: LANE_TASK.dream,
+          run: async () => {
+            throw new SafeguardTimeoutError(LANE_TASK.dream, 120_000);
+          },
+        },
+        { name: LANE_TASK.clusters, run: async () => {} },
+      ],
+    });
+    const dream = result.tasks.find((t) => t.name === LANE_TASK.dream);
+    expect(dream?.ok).toBe(false);
+    expect(dream?.timed_out).toBe(true);
+    expect(dream?.error).toContain("safeguard timeout");
+    // The lane deliberately runs every task regardless of prior failures:
+    // the unmeasured pass must not stop the measured ones.
+    expect(result.tasks.find((t) => t.name === LANE_TASK.clusters)?.ok).toBe(true);
+  });
+
+  test("a task that returns a spend receipt has it carried on the row and the journal line", async () => {
+    const receipt = {
+      model: "text-embedding-3-small",
+      tokens: 38_110,
+      estimatedUsd: 0.0076,
+      forced: false,
+    };
+    const result = await runMaintenance(vault, {
+      now: NOW,
+      holder: "worker-a",
+      tasks: [{ name: LANE_TASK.reindex, run: async () => receipt }],
+    });
+    expect(result.tasks[0]?.ok).toBe(true);
+    expect(result.tasks[0]?.receipt).toEqual(receipt);
+
+    const row = listJournal(vault).find((e) => e.task === LANE_TASK.reindex);
+    expect(row?.ok).toBe(true);
+    expect(row?.receipt).toEqual(receipt);
+  });
+
+  test("a task that returns nothing records no receipt", async () => {
+    const result = await runMaintenance(vault, {
+      now: NOW,
+      holder: "worker-a",
+      tasks: [{ name: LANE_TASK.dream, run: async () => {} }],
+    });
+    expect(result.tasks[0]?.receipt).toBeUndefined();
+    const rows = listJournal(vault).filter((e) => e.task === LANE_TASK.dream);
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) expect(row.receipt).toBeUndefined();
+  });
+
   test("gate refusals are journaled; --force bypasses window but never the lease", async () => {
     const window = { startHour: 10, endHour: 12, tz: "UTC" as const };
     const skipped = await runMaintenance(vault, {
@@ -388,6 +444,55 @@ describe("the consecutive-failure streak", () => {
     expect(row?.streak).toBe(MAINTENANCE_FAILURE_STREAK_LIMIT_DEFAULT);
     // A refusal is not an attempt: it must not deepen the streak it reports.
     expect(consecutiveTaskFailures(vault, TASK)).toBe(MAINTENANCE_FAILURE_STREAK_LIMIT_DEFAULT);
+  });
+
+  test("journaled timeouts are reported but never refuse the task", async () => {
+    let ran = 0;
+    const timingOut = () =>
+      runMaintenance(vault, {
+        now: NOW,
+        holder: "worker-a",
+        tasks: [
+          {
+            name: TASK,
+            run: async () => {
+              ran += 1;
+              throw new SafeguardTimeoutError(TASK, 600_000);
+            },
+          },
+        ],
+      });
+    for (let i = 0; i < MAINTENANCE_FAILURE_STREAK_LIMIT_DEFAULT; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      const run = await timingOut();
+      expect(run.tasks[0]!.timed_out).toBe(true);
+    }
+    const timeouts = listJournal(vault).filter((e) => e.task === TASK);
+    expect(timeouts.length).toBe(MAINTENANCE_FAILURE_STREAK_LIMIT_DEFAULT);
+    expect(timeouts.every((e) => e.ok === false && e.timed_out === true)).toBe(true);
+    expect(consecutiveTaskFailures(vault, TASK)).toBe(0);
+
+    const next = await timingOut();
+    expect(next.tasks[0]!.refused).toBeUndefined();
+    expect(ran).toBe(MAINTENANCE_FAILURE_STREAK_LIMIT_DEFAULT + 1);
+  });
+
+  test("a timeout between failures neither counts nor resets the streak", async () => {
+    await laneRun(false);
+    await runMaintenance(vault, {
+      now: NOW,
+      holder: "worker-a",
+      tasks: [
+        {
+          name: TASK,
+          run: async () => {
+            throw new SafeguardTimeoutError(TASK, 600_000);
+          },
+        },
+      ],
+    });
+    await laneRun(false);
+    expect(consecutiveTaskFailures(vault, TASK)).toBe(2);
   });
 
   test("a single success resets the streak", async () => {

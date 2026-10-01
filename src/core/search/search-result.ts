@@ -31,11 +31,31 @@ export interface ScoreBreakdown {
   readonly coAccess: number;
   /** Observed-reuse boost (t_65588d8b); 0 when no verdicts apply. */
   readonly reuse: number;
+  /**
+   * Pinned-document boost (t_f7bef96a): the capped layer over the
+   * `documents.pinned` flag. 0 for a measured not-pinned document;
+   * absent - not zero - when the row was never measured (a pre-column
+   * index) or the layer was not wired, so "not pinned" and "nobody
+   * looked" stay distinguishable here exactly as they are in the store.
+   */
+  readonly pinned?: number;
   readonly link: number;
   readonly recency: number;
   readonly tier: number;
   readonly trend: number;
   readonly sessionFocus: number;
+  /**
+   * Metadata-boost lexical-vote gate receipt (t_d9f863e9). Present only
+   * when the gate is CONFIGURED on (`search_metadata_boost_gate`); `active`
+   * says whether it bit for this query and `suppressedLayers` names the
+   * boost layers whose raw contribution was nonzero and were zeroed. The
+   * gate off leaves the key absent, byte-identical to pre-feature shape.
+   */
+  readonly gate?: {
+    readonly active: boolean;
+    readonly lexicalVote: boolean;
+    readonly suppressedLayers: ReadonlyArray<string>;
+  };
   /**
    * Query-side temporal-intent boost (t_58fc4720). Present ONLY when the
    * query declared a time window; absent - not zero - for every query
@@ -112,6 +132,15 @@ export interface BrainSearchResult {
    */
   readonly authoredAt?: number;
   readonly searchType: "keyword" | "semantic" | "hybrid" | "link";
+  /**
+   * The typed-edge relational arm contributed this candidate (t_09b7ccea,
+   * consumed by the relational rerank pin t_d9f863e9). Present only when
+   * the arm actually surfaced the chunk, so an arm-off pipeline produces
+   * rows byte-identical to pre-feature ones. `searchType` "link" names only
+   * the arm-EXCLUSIVE admissions; this flag carries the full contribution
+   * set, including candidates the keyword or semantic lane also matched.
+   */
+  readonly relationalOrigin?: boolean;
   /**
    * Explainable recall: one entry per scoring layer that contributed
    * to `score`, formatted `"<layer>: <fixed-precision value>"`. Layers

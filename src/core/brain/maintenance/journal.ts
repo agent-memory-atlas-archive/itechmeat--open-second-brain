@@ -73,13 +73,54 @@ export interface MaintenanceJournalEntry {
   readonly ok?: boolean;
   readonly duration_ms?: number;
   readonly error?: string;
+  /**
+   * True on a failed row whose task hit its safeguard deadline. Journaled
+   * and reported like any failure, but not counted toward the streak that
+   * refuses the task: a pass that ran out of time is not a broken pass,
+   * and refusing it would stop the keyword index from refreshing at all.
+   */
+  readonly timed_out?: boolean;
   /** Host pressure the gate read, on a `skipped:pressure` row. */
   readonly pressure_percent?: number;
   /** Why the gate could not read one, on a `pressure:unmeasurable` row. */
   readonly pressure_reason?: HostPressureUnmeasurableReason;
   /** Consecutive journaled failures behind a `refused:streak` row. */
   readonly streak?: number;
+  /**
+   * Model spend the task's run accounted for, on a row whose pass
+   * completed and returned a receipt (t_9d155d0e). Priced by the cost
+   * kernel before the provider was called; `forced` is true only when a
+   * `--force-cost` bypass overrode a positive gate that would have
+   * blocked the run. A failed attempt records no receipt: the spend of a
+   * pass killed mid-flight is unmeasured, and the row says so by
+   * carrying the failure without one.
+   */
+  readonly receipt?: MaintenanceSpendReceipt;
 }
+
+/**
+ * What one model-spending pass spent, as the cost kernel priced it
+ * before the provider was called. Lives beside the journal entry it
+ * persists on, because the row is the audit unit the lane renders - and
+ * journal.ts is the lower layer both the lane and its surfaces already
+ * read, so the shape cannot grow a second definition.
+ */
+export interface MaintenanceSpendReceipt {
+  /** The model the pass named; null when the config leaves it unset. */
+  readonly model: string | null;
+  readonly tokens: number;
+  readonly estimatedUsd: number;
+  /** True when `--force-cost` overrode a positive gate that would have blocked the run. */
+  readonly forced: boolean;
+}
+
+/**
+ * The metrics surface a completed reindex pass's spend receipt is
+ * recorded under. Both lane front doors (`o2b brain maintenance` and
+ * `brain_maintenance`) append here, so one surface name covers a run's
+ * spend whatever door ran it.
+ */
+export const MAINTENANCE_SPEND_METRIC = "maintenance_spend";
 
 /** The journal's shard stem: `maintenance-runs[.<deviceId>].jsonl`. */
 export const MAINTENANCE_JOURNAL_STEM = "maintenance-runs";
@@ -184,6 +225,9 @@ export function listJournal(vault: string, limit?: number): MaintenanceJournalEn
  *   - only rows that record a completed ATTEMPT are counted. A gate
  *     refusal and a lease skip are not attempts, so they cannot deepen a
  *     streak.
+ *   - a failure that is a safeguard TIMEOUT (`timed_out`) is skipped: it
+ *     neither deepens the streak nor ends it, so a long pass that keeps
+ *     running out of budget is reported every night but never refused.
  *
  * A row that ran but recorded no outcome stops the walk as well: refusing
  * work on evidence this build cannot read is the wrong direction to err.
@@ -224,6 +268,8 @@ export function consecutiveTaskFailures(vault: string, task: string): number {
     }
     if (entry.verdict !== MAINTENANCE_VERDICT.run) continue;
     if (entry.ok !== false) break;
+    // A timeout neither counts nor ends the streak: see `timed_out`.
+    if (entry.timed_out === true) continue;
     streak += 1;
   }
   return streak;

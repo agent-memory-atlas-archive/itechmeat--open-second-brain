@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
+  DEFAULT_PROBES,
   DEFAULT_READINESS_TIMEOUT_MS,
   READINESS_PROBE,
   READINESS_STATUS,
@@ -13,11 +14,14 @@ import {
   probeEmbeddingProvider,
   probeInstalledRuntimes,
   probeLlmKey,
+  probeRegisteredCommands,
   probeRuntimeAdapterWiring,
+  probeWritebackContract,
   runReadinessProbes,
   withReadinessTimeout,
 } from "../../src/core/doctor-readiness.ts";
 import { buildPayload } from "../../src/core/install/payload.ts";
+import { serializeMcpServerTable } from "../../src/core/install/grok-config.ts";
 import { registerAllAdapters } from "../../src/core/install/adapters/all.ts";
 import { manifestPath } from "../../src/core/install/manifest.ts";
 
@@ -72,6 +76,53 @@ function writeInstallManifest(body: string): void {
   const path = manifestPath(tmp);
   mkdirSync(join(tmp, ".open-second-brain"), { recursive: true });
   writeFileSync(path, body);
+}
+
+/** A client config whose Open Second Brain entries carry the given command word. */
+function clientConfig(
+  path: string,
+  command: unknown,
+  topKey = "mcpServers",
+  extraEntry: Record<string, unknown> = {},
+): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(
+    path,
+    JSON.stringify(
+      {
+        [topKey]: {
+          "open-second-brain": { command, args: ["mcp", "--vault", tmp], ...extraEntry },
+          "open-second-brain-writer": {
+            command,
+            args: ["mcp", "--writer-only", "--vault", tmp],
+            ...extraEntry,
+          },
+        },
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+/** The manifest entry shape the install layer records for `target`. */
+function manifestEntry(
+  target: string,
+  recordedConfigPath: string | null,
+  operation = "json-merge",
+): Record<string, unknown> {
+  return {
+    target,
+    applied_at: new Date().toISOString(),
+    operation,
+    config_path: recordedConfigPath,
+    owned_keys:
+      recordedConfigPath === null ? [] : ["open-second-brain", "open-second-brain-writer"],
+  };
+}
+
+function writeManifestEntries(installs: Record<string, unknown>): void {
+  writeInstallManifest(JSON.stringify({ schema_version: 1, installs }));
 }
 
 describe("probeLlmKey", () => {
@@ -259,7 +310,10 @@ describe("withReadinessTimeout", () => {
 describe("runReadinessProbes", () => {
   test("runs every default probe and reports a failed count and durations", async () => {
     writeConfig("search_semantic_enabled: true\nembedding_provider: local\n");
-    const report = await runReadinessProbes({ vault: tmp, config: configPath, home });
+    // cwd pins the workspace the writeback-contract probe audits: without
+    // it the run would read the checkout's real instruction files and the
+    // fixture's "nothing failed" expectation would depend on the host.
+    const report = await runReadinessProbes({ vault: tmp, config: configPath, home, cwd: tmp });
     expect(report.probes.length).toBe(Object.keys(READINESS_PROBE).length);
     const names = report.probes.map((p) => p.name);
     expect(names).toContain(READINESS_PROBE.llmKey);
@@ -369,5 +423,324 @@ describe("runReadinessProbes", () => {
 
   test("exposes a sane default per-check timeout constant", () => {
     expect(DEFAULT_READINESS_TIMEOUT_MS).toBeGreaterThan(0);
+  });
+});
+
+describe("probeRegisteredCommands", () => {
+  /**
+   * The probe reads install.lock.json (`readManifest`) and re-reads every
+   * recorded `config_path`, so each test pins its own manifest plus the
+   * client configs it names. Bare-name legs get a PATH that resolves
+   * nothing (`opts.env`), so a developer shell cannot flip a verdict.
+   */
+  const noPathEnv = { PATH: "/nonexistent-osb-probe-bin" };
+
+  test("an absent install manifest is skipped, never a pass", async () => {
+    writeConfig("");
+    const v = await probeRegisteredCommands(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.skipped);
+    expect(v.detail).toContain("nothing to probe");
+  });
+
+  test("an unreadable install manifest is unknown, naming the manifest fault", async () => {
+    writeConfig("");
+    writeInstallManifest("{ this is not json");
+    const v = await probeRegisteredCommands(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.unknown);
+    expect(v.detail).toContain("manifest");
+  });
+
+  test("entries whose registered command resolves pass, naming target and command", async () => {
+    writeConfig("");
+    const launcher = join(tmp, "bin", "o2b");
+    mkdirSync(dirname(launcher), { recursive: true });
+    writeFileSync(launcher, "");
+    const cursorConfig = join(home, ".cursor", "mcp.json");
+    clientConfig(cursorConfig, launcher);
+    writeManifestEntries({ cursor: manifestEntry("cursor", cursorConfig) });
+    const v = await probeRegisteredCommands(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.pass);
+    expect(v.detail).toContain("cursor");
+    expect(v.detail).toContain(launcher);
+  });
+
+  test("a proved-absent command path fails with the o2b install recovery line", async () => {
+    writeConfig("");
+    const stale = join(tmp, "bin", "gone-o2b");
+    const cursorConfig = join(home, ".cursor", "mcp.json");
+    clientConfig(cursorConfig, stale);
+    writeManifestEntries({ cursor: manifestEntry("cursor", cursorConfig) });
+    const v = await probeRegisteredCommands(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.fail);
+    expect(v.detail).toContain("cursor");
+    expect(v.detail).toContain("does not exist");
+    expect(v.detail).toContain("o2b install cursor --apply");
+  });
+
+  test("a bare name that does not resolve is unknown and never a fail", async () => {
+    writeConfig("");
+    const cursorConfig = join(home, ".cursor", "mcp.json");
+    clientConfig(cursorConfig, "o2b");
+    writeManifestEntries({ cursor: manifestEntry("cursor", cursorConfig) });
+    const v = await probeRegisteredCommands({ ...installedRuntimeOpts(), env: noPathEnv });
+    expect(v.status).toBe(READINESS_STATUS.unknown);
+    expect(v.status).not.toBe(READINESS_STATUS.fail);
+    expect(v.detail).toContain("spawn PATH");
+  });
+
+  test("a config_path of null is skipped with a named nothing-to-probe verdict", async () => {
+    writeConfig("");
+    writeManifestEntries({ pi: manifestEntry("pi", null, "symlink") });
+    const v = await probeRegisteredCommands(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.skipped);
+    expect(v.detail).toContain("pi");
+    expect(v.detail).toContain("nothing to probe");
+  });
+
+  test("a recorded config that no longer exists is unknown, not a fail", async () => {
+    writeConfig("");
+    const missing = join(home, ".cursor", "mcp.json");
+    writeManifestEntries({ cursor: manifestEntry("cursor", missing) });
+    const v = await probeRegisteredCommands(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.unknown);
+    expect(v.detail).toContain(missing);
+  });
+
+  test("a config without an Open Second Brain command entry is skipped per-entry, naming the file", async () => {
+    writeConfig("");
+    const aiderConf = join(home, ".aider.conf.yml");
+    mkdirSync(dirname(aiderConf), { recursive: true });
+    writeFileSync(aiderConf, "model: gpt-4o\n");
+    writeManifestEntries({ aider: manifestEntry("aider", aiderConf, "managed-block") });
+    const v = await probeRegisteredCommands(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.skipped);
+    expect(v.detail).toContain("aider");
+    expect(v.detail).toContain(aiderConf);
+  });
+
+  test("the opencode array-command shape is extracted and probed", async () => {
+    writeConfig("");
+    const launcher = join(tmp, "bin", "o2b");
+    mkdirSync(dirname(launcher), { recursive: true });
+    writeFileSync(launcher, "");
+    const config = join(home, ".config", "opencode", "opencode.json");
+    mkdirSync(dirname(config), { recursive: true });
+    writeFileSync(
+      config,
+      JSON.stringify({
+        mcp: {
+          "open-second-brain": { type: "local", command: [launcher, "mcp"], enabled: true },
+        },
+      }),
+    );
+    writeManifestEntries({ opencode: manifestEntry("opencode", config) });
+    const v = await probeRegisteredCommands(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.pass);
+    expect(v.detail).toContain("opencode");
+    expect(v.detail).toContain(launcher);
+  });
+
+  test("the grok/codex TOML shape is extracted and a missing runner script fails", async () => {
+    writeConfig("");
+    const bun = join(tmp, "bin", "bun");
+    mkdirSync(dirname(bun), { recursive: true });
+    writeFileSync(bun, "");
+    const script = join(tmp, "old-repo", "src", "cli", "main.ts");
+    const toml = join(home, ".grok", "config.toml");
+    mkdirSync(dirname(toml), { recursive: true });
+    writeFileSync(
+      toml,
+      // Serialize through the product's own TOML writer - byte for byte
+      // what `o2b install grok --apply` records. A template that inlines
+      // the raw platform paths is NOT valid TOML on Windows: a basic
+      // string's backslash is an escape sequence, so `C:\Users\...` fails
+      // the value parse and the probe can only answer "malformed"
+      // (unknown) - it never reaches the command it was meant to judge.
+      serializeMcpServerTable("open-second-brain", {
+        command: bun,
+        args: ["run", script, "mcp", "--vault", tmp],
+      }) +
+        serializeMcpServerTable("open-second-brain-writer", {
+          command: bun,
+          args: ["run", script, "mcp", "--writer-only", "--vault", tmp],
+        }),
+    );
+    writeManifestEntries({ grok: manifestEntry("grok", toml, "managed-block") });
+    const v = await probeRegisteredCommands(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.fail);
+    expect(v.detail).toContain("grok");
+    expect(v.detail).toContain(script);
+    expect(v.detail).toContain("o2b install grok --apply");
+  });
+
+  test("the aggregate is worst-of fail over unknown, skipped and pass", async () => {
+    writeConfig("");
+    const launcher = join(tmp, "bin", "o2b");
+    mkdirSync(dirname(launcher), { recursive: true });
+    writeFileSync(launcher, "");
+    const staleConfig = join(home, ".cursor", "mcp.json");
+    clientConfig(staleConfig, join(tmp, "bin", "gone-o2b"));
+    const bareConfig = join(home, ".kiro", "mcp.json");
+    clientConfig(bareConfig, "o2b");
+    const okConfig = join(home, ".gemini", "settings.json");
+    clientConfig(okConfig, launcher);
+    const aiderConf = join(home, ".aider.conf.yml");
+    mkdirSync(dirname(aiderConf), { recursive: true });
+    writeFileSync(aiderConf, "model: gpt-4o\n");
+    writeManifestEntries({
+      cursor: manifestEntry("cursor", staleConfig),
+      kiro: manifestEntry("kiro", bareConfig),
+      "gemini-cli": manifestEntry("gemini-cli", okConfig),
+      aider: manifestEntry("aider", aiderConf, "managed-block"),
+    });
+    const v = await probeRegisteredCommands({ ...installedRuntimeOpts(), env: noPathEnv });
+    expect(v.status).toBe(READINESS_STATUS.fail);
+    for (const target of ["cursor", "kiro", "gemini-cli", "aider"]) {
+      expect(v.detail).toContain(target);
+    }
+    // The winning bucket's census travels with the verdict.
+    expect(v.detail).toContain("1 pass");
+    expect(v.detail).toContain("1 fail");
+    expect(v.detail).toContain("1 unknown");
+    expect(v.detail).toContain("1 skipped");
+  });
+
+  test("the probe is registered in DEFAULT_PROBES beside installed_runtimes", () => {
+    const names = DEFAULT_PROBES.map((p) => p.name);
+    expect(names).toContain(READINESS_PROBE.registeredCommands);
+    expect(names.indexOf(READINESS_PROBE.registeredCommands)).toBe(
+      names.indexOf(READINESS_PROBE.installedRuntimes) + 1,
+    );
+  });
+
+  test("a default readiness run includes the probe verdict", async () => {
+    writeConfig("");
+    const report = await runReadinessProbes({ vault: tmp, config: configPath, home });
+    const probe = report.probes.find((p) => p.name === READINESS_PROBE.registeredCommands);
+    expect(probe).toBeDefined();
+    expect(probe!.status).toBe(READINESS_STATUS.skipped);
+  });
+});
+
+describe("probeWritebackContract", () => {
+  /**
+   * The probe audits the workspace agent-instruction file(s) at
+   * `opts.cwd`, so each test writes its candidates into `tmp` (which
+   * `installedRuntimeOpts` already passes as cwd). A managed block whose
+   * body carries every contract clause is the conforming fixture.
+   */
+  const CONFORMING_BLOCK = [
+    "# >>> open-second-brain managed >>>",
+    "Memory write gate: write every durable fact you learn to the Open Second",
+    "Brain in the same turn, as an atomic fact, through the note tools;",
+    "@osb set mutations require guardrails.marker_writeback in _brain.yaml.",
+    "# <<< open-second-brain managed <<<",
+  ].join("\n");
+
+  test("no agent-instruction file in the workspace is skipped, naming what was checked", async () => {
+    writeConfig("");
+    const v = await probeWritebackContract(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.skipped);
+    expect(v.detail).toContain("nothing installed");
+    expect(v.detail).toContain("AGENTS.md");
+  });
+
+  test("a present file without the managed block is skipped, naming file and recovery", async () => {
+    writeConfig("");
+    const agents = join(tmp, "AGENTS.md");
+    writeFileSync(agents, "# Workspace\n\nplain instructions\n");
+    const v = await probeWritebackContract(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.skipped);
+    expect(v.detail).toContain(agents);
+    expect(v.detail).toContain("managed block is not installed");
+    expect(v.detail).toContain("0 fail");
+    expect(v.detail).toContain("ambient write-back managed block");
+  });
+
+  test("a managed block without the gate clauses fails naming the missing piece", async () => {
+    writeConfig("");
+    writeFileSync(
+      join(tmp, "AGENTS.md"),
+      [
+        "# >>> open-second-brain managed >>>",
+        "use the open-second-brain note tools",
+        "# <<< open-second-brain managed <<<",
+      ].join("\n"),
+    );
+    const v = await probeWritebackContract(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.fail);
+    expect(v.detail).toContain("missing");
+  });
+
+  test("a conforming file passes", async () => {
+    writeConfig("");
+    writeFileSync(join(tmp, "AGENTS.md"), `# W\n\n${CONFORMING_BLOCK}\n`);
+    const v = await probeWritebackContract(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.pass);
+    expect(v.detail).toContain("AGENTS.md");
+  });
+
+  test("a symlinked instruction file is unknown, never a fail", async () => {
+    writeConfig("");
+    const real = join(tmp, "real-instructions.md");
+    writeFileSync(real, "no block here\n");
+    symlinkSync(real, join(tmp, "AGENTS.md"));
+    const v = await probeWritebackContract(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.unknown);
+    expect(v.status).not.toBe(READINESS_STATUS.fail);
+    expect(v.detail).toContain("symbolic link");
+  });
+
+  test("a candidate path that cannot be read as a file is unknown with the reason", async () => {
+    writeConfig("");
+    mkdirSync(join(tmp, "AGENTS.md"));
+    const v = await probeWritebackContract(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.unknown);
+    expect(v.detail).toContain("could not");
+  });
+
+  test("the aggregate is worst-of fail over unknown and pass, with the census", async () => {
+    writeConfig("");
+    // A lone begin marker: a block that was installed and then broken.
+    writeFileSync(join(tmp, "AGENTS.md"), "# >>> open-second-brain managed >>>\nhalf a block\n");
+    const real = join(tmp, "claude-target.md");
+    writeFileSync(real, "irrelevant\n");
+    symlinkSync(real, join(tmp, "CLAUDE.md"));
+    writeFileSync(join(tmp, "GEMINI.md"), `# W\n\n${CONFORMING_BLOCK}\n`);
+    const v = await probeWritebackContract(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.fail);
+    expect(v.detail).toContain("1 pass");
+    expect(v.detail).toContain("1 fail");
+    expect(v.detail).toContain("1 unknown");
+    expect(v.detail).toContain("0 skipped");
+  });
+
+  test("one conforming file among absent peers passes - absent is not a violation", async () => {
+    writeConfig("");
+    writeFileSync(join(tmp, "AGENTS.md"), `# W\n\n${CONFORMING_BLOCK}\n`);
+    const v = await probeWritebackContract(installedRuntimeOpts());
+    expect(v.status).toBe(READINESS_STATUS.pass);
+    expect(v.detail).toContain("2 skipped");
+  });
+
+  test("the probe is registered in DEFAULT_PROBES beside registered_commands", () => {
+    const names = DEFAULT_PROBES.map((p) => p.name);
+    expect(names).toContain(READINESS_PROBE.writebackContract);
+    expect(names.indexOf(READINESS_PROBE.writebackContract)).toBe(
+      names.indexOf(READINESS_PROBE.registeredCommands) + 1,
+    );
+  });
+
+  test("a default readiness run includes the probe verdict", async () => {
+    writeConfig("");
+    const report = await runReadinessProbes({
+      vault: tmp,
+      config: configPath,
+      home,
+      cwd: tmp,
+    });
+    const probe = report.probes.find((p) => p.name === READINESS_PROBE.writebackContract);
+    expect(probe).toBeDefined();
+    expect(probe!.status).toBe(READINESS_STATUS.skipped);
   });
 });

@@ -331,6 +331,16 @@ export class Store {
   }
 
   /**
+   * The candidate documents the index measured as pinned (v13); see
+   * `documents.pinnedDocumentIds`. This facade is the reader the ranking
+   * path consumes: the query-side signal collector hands the set to the
+   * ranker's pinned boost layer (t_f7bef96a).
+   */
+  pinnedDocumentIds(documentIds: ReadonlyArray<number>): Set<number> {
+    return documents.pinnedDocumentIds(this.db, documentIds);
+  }
+
+  /**
    * The materialised event anchor of one path (v11), or null when the
    * document is absent or declared no readable date. The query-side
    * event-time resolver consults this instead of re-scanning the note's
@@ -521,6 +531,7 @@ export class Store {
       model,
       dimension,
       prefixes,
+      { semantic: this.config.semantic },
     );
   }
 
@@ -812,6 +823,18 @@ export class Store {
   counts(): census.StoreCounts {
     const baseline = census.staleBaseline(this.db, this.config.semantic);
     return census.counts(this.db, baseline.model, baseline.dimension);
+  }
+
+  /**
+   * How many documents carry a persisted event-time window, the instants
+   * those windows span, and how many intersect `[sinceMs, untilMs]` (a
+   * null edge is open). One aggregate; see `store/counts.ts`.
+   */
+  eventTimeWindowCensus(
+    sinceMs: number | null,
+    untilMs: number | null,
+  ): census.EventTimeWindowCensus {
+    return census.eventTimeWindowCensus(this.db, sinceMs, untilMs);
   }
 
   /**

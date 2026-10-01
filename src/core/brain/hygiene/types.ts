@@ -9,9 +9,37 @@
  * never throw past the scan boundary.
  */
 
-export const HYGIENE_DETECTOR_IDS = ["conflicts", "dedup", "freshness", "usefulness"] as const;
+export const HYGIENE_DETECTOR_IDS = [
+  "conflicts",
+  "dedup",
+  "freshness",
+  "usefulness",
+  "slug-collisions",
+  "tags",
+] as const;
 
 export type HygieneDetectorId = (typeof HYGIENE_DETECTOR_IDS)[number];
+
+/**
+ * Detectors included when a scan requests NO explicit subset - the
+ * default sweep. Distinct from {@link HYGIENE_DETECTOR_IDS}: a detector
+ * can be registered (valid subset member, wired into the scan) yet kept
+ * OUT of the default sweep when it is too noisy to run uninvited. One
+ * mechanism, two explicit policies: `slug-collisions` is default-on
+ * (fires only on actual same-stem groups), `tags` is opt-in (noisy on
+ * vaults that tag loosely), and further noisy detectors register as
+ * opt-in by staying out of this list.
+ *
+ * Members are compile-checked against the registered tuple; a registered
+ * id missing here is simply default-off, never an error.
+ */
+export const DEFAULT_SCAN_IDS: ReadonlyArray<HygieneDetectorId> = Object.freeze([
+  "conflicts",
+  "dedup",
+  "freshness",
+  "usefulness",
+  "slug-collisions",
+]);
 
 export type HygieneSeverity = "info" | "warning" | "action";
 

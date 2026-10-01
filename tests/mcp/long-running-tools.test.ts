@@ -37,13 +37,20 @@ import { join } from "node:path";
 
 import { bootstrapBrain } from "../../src/core/brain/init.ts";
 import { DREAM_STEP } from "../../src/core/brain/dream-step.ts";
+import type { MaintenanceSpendReceipt } from "../../src/core/brain/maintenance/journal.ts";
+import { LANE_TASKS } from "../../src/core/brain/maintenance/lane.ts";
+import { MAINTENANCE_EMBEDDINGS_CONFIG_KEY } from "../../src/core/config.ts";
 import { indexVault } from "../../src/core/search/indexer.ts";
 import { atomicWriteFileSync } from "../../src/core/fs-atomic.ts";
 import { makeConfig } from "../helpers/search-fixtures.ts";
+import { sqliteVecLoadable } from "../helpers/sqlite-vec.ts";
 import { JSONRPC_VERSION, MCPServer, PROTOCOL_VERSION } from "../../src/mcp/index.ts";
 import { PROGRESS_META_KEY, PROGRESS_NOTIFICATION_METHOD } from "../../src/mcp/progress.ts";
 import type { JsonRpcNotification } from "../../src/mcp/protocol.ts";
 import { PROGRESS_SCHEMA } from "../../src/core/brain/progress.ts";
+
+/** Whether sqlite-vec loaded in THIS process: the spend-surface test needs it. */
+const VEC_LOADABLE = sqliteVecLoadable();
 
 let tmp: string;
 let vault: string;
@@ -332,6 +339,89 @@ test("a live clock leaves all four tools running to completion", async () => {
   expect(lane.isError).toBe(false);
 });
 
+test.skipIf(!VEC_LOADABLE)(
+  "brain_maintenance announces and receipts the reindex pass's spend",
+  async () => {
+    // Pending vectorless chunks: a keyword-only index over one note.
+    writeFileSync(
+      join(vault, "Brain", "note.md"),
+      "# note\n\nprose long enough to cut at least one chunk for the index.\n",
+    );
+    await indexVault(
+      makeConfig({ vault, dbPath: join(vault, ".open-second-brain", "brain.sqlite") }),
+    );
+    // The local provider can reach no network and prices at zero, so the
+    // semantic lane is usable exactly as the CLI spend tests configure it.
+    atomicWriteFileSync(
+      configPath,
+      `vault: ${vault}\nagent_name: claude\nsearch_semantic_enabled: true\nembedding_provider: local\n` +
+        `${MAINTENANCE_EMBEDDINGS_CONFIG_KEY}: true\n`,
+    );
+    const server = new MCPServer({ vault, configPath });
+    await initialize(server);
+
+    const res = (await server.handleRequest({
+      jsonrpc: JSONRPC_VERSION,
+      id: 6,
+      method: "tools/call",
+      params: { name: "brain_maintenance", arguments: { operation: "run", force: true } },
+    })) as { result?: { isError?: boolean; structuredContent?: unknown } };
+    expect(res.result!.isError).toBe(false);
+    const payload = res.result!.structuredContent as {
+      spend?: {
+        banner: { model: string; pendingChunks: number; gateUsd: number };
+        receipt: MaintenanceSpendReceipt;
+      };
+      tasks: Array<{ name: string; ok: boolean; receipt?: MaintenanceSpendReceipt }>;
+    };
+    // The schema promises the spend is announced and receipted; both halves
+    // ride the answer, and the receipt is the row's own.
+    expect(payload.spend?.banner.model).toBe("hashing-ngram-v1");
+    expect(payload.spend?.banner.pendingChunks).toBeGreaterThan(0);
+    expect(payload.spend?.banner.gateUsd).toBe(0);
+    const reindex = payload.tasks.find((t) => t.name === "reindex");
+    expect(reindex?.ok).toBe(true);
+    expect(payload.spend?.receipt).toEqual(reindex?.receipt);
+    expect(payload.spend?.receipt.model).toBe("hashing-ngram-v1");
+    expect(payload.spend?.receipt.tokens).toBeGreaterThan(0);
+    expect(payload.spend?.receipt.forced).toBe(false);
+  },
+);
+
+test.skipIf(!VEC_LOADABLE)(
+  "brain_maintenance outside its window reports no spend block",
+  async () => {
+    writeFileSync(
+      join(vault, "Brain", "note.md"),
+      "# note\n\nprose long enough to cut at least one chunk for the index.\n",
+    );
+    await indexVault(
+      makeConfig({ vault, dbPath: join(vault, ".open-second-brain", "brain.sqlite") }),
+    );
+    atomicWriteFileSync(
+      configPath,
+      `vault: ${vault}\nagent_name: claude\nsearch_semantic_enabled: true\nembedding_provider: local\n` +
+        `${MAINTENANCE_EMBEDDINGS_CONFIG_KEY}: true\n`,
+    );
+    const server = new MCPServer({ vault, configPath });
+    await initialize(server);
+    // A one-hour window the current hour cannot fall in.
+    const start = (new Date().getUTCHours() + 2) % 24;
+    const lane = await callRaw(server, "brain_maintenance", {
+      operation: "run",
+      window_start_hour: start,
+      window_end_hour: (start + 1) % 24,
+    });
+    expect(lane.isError).toBe(false);
+    const payload = (lane as { structuredContent?: unknown }).structuredContent as {
+      verdict: string;
+      spend?: unknown;
+    };
+    expect(payload.verdict).toBe("skipped:window");
+    expect(payload.spend).toBeUndefined();
+  },
+);
+
 // ---------------------------------------------------------------------------
 // The same four tools, observed
 // ---------------------------------------------------------------------------
@@ -467,8 +557,10 @@ test("brain_maintenance forwards the sink to every task it dispatches", async ()
     (await callWithToken(server, "brain_maintenance", { operation: "run", force: true })).isError,
   ).toBe(false);
   // The lane is a dispatcher, so it speaks with its tasks' voices: each
-  // event names the operation that emitted it, never the lane.
-  expect(operationsIn(frames)).toEqual(new Set(["dream", "reindex", "bridges", "clusters"]));
+  // event names the operation that emitted it, never the lane. The
+  // population comes from LANE_TASKS, not a hand-copied list - a fifth
+  // lane task must emit under its own name or this fails with it.
+  expect(operationsIn(frames)).toEqual(new Set(LANE_TASKS));
 });
 
 test("no token leaves every one of them silent", async () => {

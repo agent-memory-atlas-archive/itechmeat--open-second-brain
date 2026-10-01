@@ -32,6 +32,8 @@ import { buildHygienePlan } from "../../core/brain/hygiene/plan.ts";
 import { resolveConflictFindings } from "../../core/brain/hygiene/resolve-conflicts.ts";
 import { runHygieneScan } from "../../core/brain/hygiene/scan.ts";
 import {
+  DEFAULT_SCAN_IDS,
+  HYGIENE_DETECTOR_IDS,
   isHygieneDetectorId,
   type HygieneDetectorId,
   type HygieneFinding,
@@ -225,7 +227,7 @@ async function toolBrainHygiene(
   if (detectorsRaw !== undefined && detectors!.length !== detectorsRaw.length) {
     throw new MCPError(
       INVALID_PARAMS,
-      "'detectors' entries must be: conflicts, dedup, freshness, usefulness",
+      `'detectors' entries must be: ${HYGIENE_DETECTOR_IDS.join(", ")}`,
     );
   }
   const scanned = scanWithResolver(ctx.vault, detectors, now);
@@ -339,8 +341,8 @@ export const HYGIENE_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
         },
         detectors: {
           type: "array",
-          items: { type: "string", enum: ["conflicts", "dedup", "freshness", "usefulness"] },
-          description: "Detector subset for scan/apply. Default: all detectors.",
+          items: { type: "string", enum: [...HYGIENE_DETECTOR_IDS] },
+          description: `Detector subset for scan/apply. Default: ${DEFAULT_SCAN_IDS.join(", ")} (every registered detector except the opt-in ones).`,
         },
         ids: {
           type: "array",

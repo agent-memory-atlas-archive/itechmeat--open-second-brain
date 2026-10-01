@@ -5,7 +5,9 @@
  *
  * Order is the contract here: structured exclusions, relation polarity,
  * reinforce, the cross-encoder reader, then the deterministic
- * rank-adjustment sink that emits the trust receipts.
+ * rank-adjustment sink that emits the trust receipts. Only the
+ * cross-encoder call can be cut short by the composite hybrid deadline;
+ * every other phase runs on whichever order the reader step returned.
  */
 
 import { readFileSync } from "node:fs";
@@ -23,6 +25,7 @@ import { resolvedTransportReach } from "../../graph/transport-reach.ts";
 import { applyRankAdjusters, type RankAdjuster } from "../rank-adjust.ts";
 import { applyReinforceBoost, loadReinforceStrengths } from "../reinforce.ts";
 import { applyCrossEncoderRerank } from "../rerank/index.ts";
+import { applyRelationalRerankPin } from "./relational-arm.ts";
 import type { DecisionRerankExtras } from "../rerank/decision-model.ts";
 import { RERANK_QUESTIONS } from "../../decision-model/questions.ts";
 import type { FrontmatterMap } from "../../types.ts";
@@ -52,7 +55,22 @@ export interface PostRankInput {
   readonly pool: ReadonlyArray<BrainSearchResult>;
   readonly structured: StructuredRecallQueryDocument | undefined;
   readonly frontmatterCache: FrontmatterCache;
+  /**
+   * The composite hybrid deadline's race over the cross-encoder call, the
+   * one budgeted wait in this phase. Past the deadline it serves the
+   * pre-rerank order, and every deterministic filter and adjuster below
+   * still runs on it. Absent: the rerank is awaited as is.
+   */
+  readonly raceRerank?: RerankRace;
+  /** The deadline's cancellation, handed to the rerank provider request. */
+  readonly signal?: AbortSignal;
 }
+
+/** Start `work` under a budget; serve `fallback()` when the budget wins. */
+export type RerankRace = (
+  work: () => Promise<ReadonlyArray<BrainSearchResult>>,
+  fallback: () => ReadonlyArray<BrainSearchResult>,
+) => Promise<ReadonlyArray<BrainSearchResult>>;
 
 export interface TrustReceipts {
   readonly retrievalDecisionTrace: ReturnType<typeof buildRetrievalDecisionTrace>;
@@ -152,46 +170,63 @@ export async function applyPostRankPhases(input: PostRankInput): Promise<PostRan
   let decisionExtras: DecisionRerankExtras | undefined;
   let decisionFallback = false;
   const regionsByPath = new Map<string, ReadonlyArray<string> | null>();
-  const reranked = await applyCrossEncoderRerank(reinforced, input.query, config.rerank, {
-    onTelemetry: (event) =>
-      emitGatedTelemetry(event.status === "error", () => {
-        warnings.push(`rerank_degraded: ${event.reason ?? "endpoint error"}`);
-      }),
-    // Decision-model kind only: a candidate leaves the machine only when
-    // its page's visibility resolves and does not carry `private`.
-    resolveVisibility: (path) => {
-      const entry = readCachedFrontmatterEntry(frontmatterCache, config.vault, path);
-      return entry.unreadable ? null : pageVisibility(entry.meta);
-    },
-    // The index keeps a page's text whole, and a long `<private>` region
-    // can be split across chunks, so the page's own regions are read to
-    // tell whether a chunk carries part of one. Unreadable: null, withheld.
-    resolvePrivateRegions: (path) => {
-      if (regionsByPath.has(path)) return regionsByPath.get(path)!;
-      let regions: ReadonlyArray<string> | null;
-      try {
-        regions = privateRegionTexts(readFileSync(join(config.vault, path), "utf8"));
-      } catch {
-        regions = null;
-      }
-      regionsByPath.set(path, regions);
-      return regions;
-    },
-    // Decision-model kind only: the declared `status` and `updated` of a
-    // result's page travel beside its passage, so an archived or older
-    // copy can be told from the current one. Nothing else is read.
-    resolveMeta: (path) => {
-      const entry = readCachedFrontmatterEntry(frontmatterCache, config.vault, path);
-      return entry.unreadable ? null : decisionMetaFields(entry.meta);
-    },
-    skipDecisionModel: opts.skipDecisionModelRerank === true,
-    onDecisionFallback: () => {
-      decisionFallback = true;
-    },
-    onDecisionExtras: (extras) => {
-      decisionExtras = extras;
-    },
-  });
+  const runRerank = (): Promise<ReadonlyArray<BrainSearchResult>> =>
+    applyCrossEncoderRerank(reinforced, input.query, config.rerank, {
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      onTelemetry: (event) =>
+        emitGatedTelemetry(event.status === "error", () => {
+          warnings.push(`rerank_degraded: ${event.reason ?? "endpoint error"}`);
+        }),
+      // Decision-model kind only: a candidate leaves the machine only when
+      // its page's visibility resolves and does not carry `private`.
+      resolveVisibility: (path) => {
+        const entry = readCachedFrontmatterEntry(frontmatterCache, config.vault, path);
+        return entry.unreadable ? null : pageVisibility(entry.meta);
+      },
+      // The index keeps a page's text whole, and a long `<private>` region
+      // can be split across chunks, so the page's own regions are read to
+      // tell whether a chunk carries part of one. Unreadable: null, withheld.
+      resolvePrivateRegions: (path) => {
+        if (regionsByPath.has(path)) return regionsByPath.get(path)!;
+        let regions: ReadonlyArray<string> | null;
+        try {
+          regions = privateRegionTexts(readFileSync(join(config.vault, path), "utf8"));
+        } catch {
+          regions = null;
+        }
+        regionsByPath.set(path, regions);
+        return regions;
+      },
+      // Decision-model kind only: the declared `status` and `updated` of a
+      // result's page travel beside its passage, so an archived or older
+      // copy can be told from the current one. Nothing else is read.
+      resolveMeta: (path) => {
+        const entry = readCachedFrontmatterEntry(frontmatterCache, config.vault, path);
+        return entry.unreadable ? null : decisionMetaFields(entry.meta);
+      },
+      skipDecisionModel: opts.skipDecisionModelRerank === true,
+      onDecisionFallback: () => {
+        decisionFallback = true;
+      },
+      onDecisionExtras: (extras) => {
+        decisionExtras = extras;
+      },
+    });
+  const reranked =
+    input.raceRerank === undefined
+      ? await runRerank()
+      : await input.raceRerank(runRerank, () => reinforced);
+  // Relational rerank pin (t_d9f863e9), `search_relational_rerank_pin`.
+  // Off (default) the rerank order passes through untouched, byte-
+  // identically. On, the rerank may promote relational-origin candidates
+  // but never sinks one below its pre-rerank heuristic position - the
+  // protect rule runs HERE, at the cross-encoder hand-off, over the pool
+  // order `reinforced` carried in, so every rerank kind is covered and the
+  // `minScore` relevance floor inside the stage still applies unchanged.
+  const pinnedReranked =
+    config.rerank.relationalRerankPin === true
+      ? applyRelationalRerankPin(reinforced, reranked)
+      : reranked;
   // Kernel 1 (t_5f61130a): the deterministic rank-adjustment sink between
   // ranking and result emission, mounted on BOTH the semantic and the
   // pure-lexical paths (both flow through this single pre-slice pool).
@@ -209,11 +244,11 @@ export async function applyPostRankPhases(input: PostRankInput): Promise<PostRan
     // Relation-only supersede fade (t_c4a9cef8): fetch the pool's typed
     // relations once and fade any candidate a `superseded_by` edge marks
     // superseded, the same source of truth `attachTrustMetadata` uses.
-    const poolDocIds = Array.from(new Set(reranked.map((r) => r.documentId)));
+    const poolDocIds = Array.from(new Set(pinnedReranked.map((r) => r.documentId)));
     const relByPoolDoc = store.typedRelationsForDocuments(poolDocIds);
     rankAdjusters.push(supersedeFadeAdjuster((documentId) => relByPoolDoc.get(documentId) ?? []));
   }
-  const adjusted = applyRankAdjusters(reranked, rankAdjusters);
+  const adjusted = applyRankAdjusters(pinnedReranked, rankAdjusters);
   // Per-pack retrieval trust receipts (t_5f61130a): compact references
   // consistent with the context-receipt model. Built only when the gate
   // ran, so the outcome shape stays byte-identical on the default path.
