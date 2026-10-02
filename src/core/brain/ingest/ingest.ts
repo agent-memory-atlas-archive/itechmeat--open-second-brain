@@ -36,7 +36,12 @@ import { sourcePagePath } from "../paths.ts";
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
 import { intakeExtraction, type ExtractionIntake } from "../intake/extract-intake.ts";
 import { normalizeSourceIdentity } from "../intake/source-trust.ts";
-import { untrustedSourceFrontmatter } from "../trust/untrusted-provenance.ts";
+import { INTAKE_TRUST, untrustedSourceFrontmatter } from "../trust/untrusted-provenance.ts";
+import {
+  captureScopeForTrust,
+  captureScopeFrontmatter,
+  type CaptureScope,
+} from "../provenance/capture-scope.ts";
 import {
   renderProvenanceSection,
   sourceIdentityHash,
@@ -88,6 +93,13 @@ export interface IngestSourceOptions {
    * the result only, keeping the persisted page unchanged.
    */
   readonly preExtract?: boolean;
+  /**
+   * May the caller read the vault file at this vault-relative path? Handed to
+   * the intake: a source the predicate refuses is classified as one with no
+   * local bytes (untrusted lane, no digest, `url-only`). A local caller passes
+   * nothing.
+   */
+  readonly readable?: (rel: string) => boolean;
 }
 
 export interface IngestSourceResult {
@@ -101,6 +113,14 @@ export interface IngestSourceResult {
   readonly entitiesUpdated: readonly string[];
   /** Pre-existing entity ids this source connected to (its connections). */
   readonly connections: readonly string[];
+  /**
+   * How much of the source this page's knowledge was captured from: the
+   * intake's lane for the cited source, as a capture scope. `full-local` for
+   * a vault file, `url-only` for a source with no local bytes. Ingest never
+   * stores an excerpt, so it never answers `bounded-local`: the summary is a
+   * paraphrase, not a capture.
+   */
+  readonly captureScope: CaptureScope;
   /**
    * Code-structure pre-extraction seeds (P4), present only when the pass was
    * requested via {@link IngestSourceOptions.preExtract}. `extracted: false`
@@ -152,8 +172,10 @@ export function ingestSource(
     agent: opts.agent,
     now: opts.now,
     provenance,
+    ...(opts.readable !== undefined ? { readable: opts.readable } : {}),
   });
   const trust = intake.trust;
+  const captureScope = captureScopeForTrust(trust);
   const connections = intake.entitiesUpdated;
   const allEntities = [...intake.entitiesCreated, ...intake.entitiesUpdated];
 
@@ -179,6 +201,9 @@ export function ingestSource(
     // reason rather than ranking it beside the operator's own notes. Trusted
     // sources add nothing, keeping their page byte-identical to before.
     ...untrustedSourceFrontmatter(trust),
+    // Says how much of the source was captured when it is less than the
+    // whole file; a full-local source adds nothing, for the same reason.
+    ...captureScopeFrontmatter(captureScope),
     created_at: createdAt,
     updated_at: stamp,
     tags: ["brain", "brain/source"],
@@ -212,7 +237,14 @@ export function ingestSource(
   // an escaping identity must not reach `existsSync` either, or a path outside
   // the vault would be hashed into the content manifest and keyed into a
   // folder-plan checkpoint.
-  if (resolvesInsideVault(vault, canonicalSource) && existsSync(join(vault, canonicalSource))) {
+  // Only in the trusted lane, which the intake grants only to a file the
+  // caller may read at its reach: a source answered as absent records no
+  // digest anywhere, the manifest included.
+  if (
+    trust === INTAKE_TRUST.trusted &&
+    resolvesInsideVault(vault, canonicalSource) &&
+    existsSync(join(vault, canonicalSource))
+  ) {
     updateManifest(vault, [canonicalSource]);
     // Record plan-scoped progress so an interrupted batch resumes at the item
     // boundary (t_ba1fa5f6). Only for real vault files - a URL/identity-only
@@ -237,6 +269,7 @@ export function ingestSource(
     entitiesCreated: intake.entitiesCreated,
     entitiesUpdated: intake.entitiesUpdated,
     connections,
+    captureScope,
     ...(preExtract !== undefined ? { preExtract } : {}),
   };
 }

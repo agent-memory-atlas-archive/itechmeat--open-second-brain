@@ -9,10 +9,28 @@
  *
  * Provider-agnostic: the calling agent supplies the atomic claims and their
  * block references; this core runs NO model. It validates the claims
- * structurally (non-empty text, well-formed block ids), stamps a content
- * sha256 the verifier can reproduce from the source file, and writes one
- * distillation page per source identity, rewritten in place on re-distill
- * (never duplicated). A byte-identical re-run is inert.
+ * structurally (non-empty text, well-formed block ids), checks every quoted
+ * span in a claim against the source ({@link checkClaimQuotes}), stamps a
+ * content sha256 the verifier can reproduce from the source file, and writes
+ * one distillation page per source identity, rewritten in place on
+ * re-distill (never duplicated). A byte-identical re-run is inert.
+ *
+ * QUOTES. A span in quotation marks is a claim that the source says exactly
+ * that. It is compared with the block the claim cites (or, without a block,
+ * the whole source) in the SAME bytes the content digest is computed over -
+ * one read feeds both. A span that does not verify loses its two marks on
+ * the page (its words stay) and is named in the result's `quotes` report, so
+ * the page never shows an unverified quote. `strictQuotes` refuses the whole
+ * write instead, with {@link QuoteCheckError}, before anything is written.
+ *
+ * CAPTURE SCOPE. Every result says how much of the source the vault holds
+ * (`captureScope`): a local file is `full-local` and adds nothing to the page;
+ * a source with no local bytes is `url-only` and the page says so. For such a
+ * source the caller may pass the verbatim `excerpt` it read: the page stores
+ * it in a fenced `## Excerpt` section with its digest, becomes
+ * `bounded-local`, and its quotes are checked against the excerpt. An excerpt
+ * beside a local source, an empty one or one past the byte ceiling is refused
+ * with {@link CaptureExcerptError} before anything is written.
  *
  * Language-agnostic: block-id validation is structural (the Obsidian `^id`
  * grammar), never over natural-language vocabulary.
@@ -23,8 +41,9 @@
  * and hashed whatever `join(vault, ...)` landed on, and wrote every page under
  * `provenance: stated`, the top authority tier. It now asks the same question
  * of the same classifier the other two claim-write paths ask
- * ({@link classifySourceOrigin}), so a source this vault does not own commits
- * in the quarantine lane the retrieval trust gate can actually see.
+ * ({@link readSourceOrigin}, the byte-keeping form of `classifySourceOrigin`),
+ * so a source this vault does not own commits in the quarantine lane the
+ * retrieval trust gate can actually see.
  */
 
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -34,7 +53,12 @@ import type { FrontmatterMap } from "../../types.ts";
 import { atomicWriteFileSync } from "../../fs-atomic.ts";
 import { canonicalNotePath } from "../../path-safety.ts";
 import { formatFrontmatter, parseFrontmatter, slugify } from "../../vault.ts";
-import { classifySourceOrigin, normalizeSourceIdentity } from "../intake/source-trust.ts";
+import {
+  UNTRUSTED_ORIGIN,
+  isSourceHidden,
+  normalizeSourceIdentity,
+  readSourceOrigin,
+} from "../intake/source-trust.ts";
 import { distillationPagePath } from "../paths.ts";
 import {
   DISTILL_CLAIMS_SHAPE,
@@ -53,20 +77,40 @@ import {
   type Provenance,
 } from "../provenance/provenance.ts";
 import { isoSecond } from "../time.ts";
+import {
+  CAPTURE_SCOPE,
+  EXCERPT_HASH_KEY,
+  assertExcerptAdmissible,
+  captureScopeForTrust,
+  captureScopeFrontmatter,
+  excerptDigest,
+  renderExcerptSection,
+  type CaptureScope,
+} from "../provenance/capture-scope.ts";
+import { BLOCK_ID_RE } from "./block-resolve.ts";
+import type { DistillClaim } from "./claim.ts";
+import { checkClaimQuotes, type QuoteEvidence } from "./quote-check.ts";
+import {
+  QUOTES_UNQUOTED_KEY,
+  QUOTES_VERIFIED_KEY,
+  QUOTE_CHECK_OUTCOME,
+  QuoteCheckError,
+  type QuoteCheckReport,
+} from "./quote-verdict.ts";
 
 /** Frontmatter `kind:` marker of a distillation page. */
 export const BRAIN_DISTILLATION_KIND = "brain-distillation";
 
-/** Structural grammar of an Obsidian block id (the text after `#^`). */
-const BLOCK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
+export type { DistillClaim } from "./claim.ts";
 
-/** One atomic claim distilled from the source, with an optional block ref. */
-export interface DistillClaim {
-  /** The atomic claim text. */
-  readonly text: string;
-  /** Block id in the source the claim was drawn from (the `^abc` sigil, id only). */
-  readonly block?: string;
-}
+/**
+ * The most claims one call may carry. Every claim is checked against the
+ * source, so the cap bounds the work one request can ask for.
+ */
+export const DISTILL_CLAIMS_MAX = 1000;
+
+/** Line breaks a claim may not hold: a claim is one bullet line on the page. */
+const CLAIM_LINE_BREAK_RE = /[\r\n]/;
 
 /**
  * Normalize one agent-supplied claim record into a {@link DistillClaim}. Shared
@@ -98,11 +142,31 @@ export interface DistillSourceInput {
   readonly sourcePath: string;
   /** The atomic claims the agent distilled from the source (non-empty). */
   readonly claims: readonly DistillClaim[];
+  /**
+   * The verbatim text the caller read from a source the vault holds no bytes
+   * of (`url-only`). Stored on the page and used as the quote evidence;
+   * refused for any other source.
+   */
+  readonly excerpt?: string;
 }
 
 export interface DistillSourceOptions {
   readonly agent: string;
   readonly now: Date;
+  /**
+   * Refuse the whole write with {@link QuoteCheckError} when any quoted span
+   * would be unquoted, instead of unquoting it. Unpaired marks never refuse.
+   */
+  readonly strictQuotes?: boolean;
+  /**
+   * May the caller read the vault file at this vault-relative path? Asked of
+   * the canonical source identity when the vault holds its bytes. A refusal
+   * makes the source answer exactly as an absent one: untrusted lane,
+   * `url-only` (an excerpt is admitted), every span `url-only`, and no digest
+   * in the result or on the page.
+   * Absent: the caller reads everything (the local CLI).
+   */
+  readonly readable?: (rel: string) => boolean;
 }
 
 export interface DistillSourceResult {
@@ -128,6 +192,56 @@ export interface DistillSourceResult {
    * untrusted page from every scope.
    */
   readonly trust: IntakeTrust;
+  /** How much of the source the page's evidence holds, as written. */
+  readonly captureScope: CaptureScope;
+  /**
+   * The quote check's account, present only when at least one claim contains
+   * a quoted span. Every finding is a span that was unquoted on the page.
+   */
+  readonly quotes?: QuoteCheckReport;
+}
+
+/** Strict UTF-8: a source that is not text verifies no quote. */
+const UTF8_STRICT = new TextDecoder("utf-8", { fatal: true });
+
+/** The evidence a quote is checked against: the bytes the digest covers. */
+function quoteEvidence(bytes: Uint8Array | undefined): QuoteEvidence {
+  if (bytes === undefined) return { kind: QUOTE_CHECK_OUTCOME.urlOnly };
+  try {
+    return { kind: "text", text: UTF8_STRICT.decode(bytes) };
+  } catch (cause) {
+    // A decode failure IS the verdict: these bytes are not text, so no span
+    // can be said to occur in them. It is reported per span, by name. The
+    // fatal decoder signals that with a TypeError; anything else is a fault.
+    if (!(cause instanceof TypeError)) throw cause;
+    return { kind: "not-text" };
+  }
+}
+
+/**
+ * The capture scope of this write and the evidence its quotes are checked
+ * against. An excerpt is admitted only for a `url-only` source, and then IS
+ * the evidence; otherwise the evidence is the bytes the digest covers.
+ */
+function captureOf(
+  trust: IntakeTrust,
+  bytes: Uint8Array | undefined,
+  excerpt: string | undefined,
+): { readonly scope: CaptureScope; readonly evidence: QuoteEvidence } {
+  const scope = captureScopeForTrust(trust);
+  if (excerpt === undefined) return { scope, evidence: quoteEvidence(bytes) };
+  assertExcerptAdmissible(scope, excerpt);
+  return { scope: CAPTURE_SCOPE.boundedLocal, evidence: { kind: "text", text: excerpt } };
+}
+
+/** The page's quote counters; nothing when no claim held a span. */
+function quotesFrontmatter(report: QuoteCheckReport | null): FrontmatterMap {
+  return report === null
+    ? {}
+    : {
+        [QUOTES_VERIFIED_KEY]: report.verified_in_block + report.verified_in_source,
+        [QUOTES_UNQUOTED_KEY]: report.unquoted,
+      };
 }
 
 /** A distillation failed structural validation; nothing was written. */
@@ -142,9 +256,17 @@ function validate(input: DistillSourceInput): void {
   if (input.claims.length === 0) {
     throw new DistillValidationError("distillation requires at least one claim");
   }
+  if (input.claims.length > DISTILL_CLAIMS_MAX) {
+    throw new DistillValidationError(
+      `distillation accepts at most ${DISTILL_CLAIMS_MAX} claims per call, got ${input.claims.length}`,
+    );
+  }
   input.claims.forEach((claim, i) => {
     if (claim.text.trim().length === 0) {
       throw new DistillValidationError(`claim ${i} has empty text`);
+    }
+    if (CLAIM_LINE_BREAK_RE.test(claim.text)) {
+      throw new DistillValidationError(`claim ${i} spans more than one line; a claim is one line`);
     }
     if (claim.block !== undefined && !BLOCK_ID_RE.test(claim.block)) {
       throw new DistillValidationError(
@@ -200,8 +322,27 @@ export function distillSource(
   // `provenance.level` stays `stated` - that vocabulary bands how a conclusion
   // was DERIVED, which is orthogonal to who was entitled to supply the
   // material; the lane is carried by the marker below.
-  const origin = classifySourceOrigin(vault, input.sourcePath);
+  //
+  // A source the caller may not read answers exactly as an absent one: the
+  // untrusted lane, no bytes, no digest. No span is checked against it, an
+  // excerpt is admitted for it, and nothing in the result or on the page
+  // tells the caller that the page exists or what it says. Asked first, so
+  // the source is never stat-ed or read for such a caller.
+  const origin = isSourceHidden(vault, input.sourcePath, opts.readable)
+    ? UNTRUSTED_ORIGIN
+    : readSourceOrigin(vault, input.sourcePath);
   const sourceHash = origin.contentHash;
+
+  // The quote check runs on the bytes the digest above was computed over (or
+  // on the admitted excerpt), before any write, so a refusal of either kind
+  // leaves nothing behind.
+  const { excerpt } = input;
+  const capture = captureOf(origin.trust, origin.bytes, excerpt);
+  const checked = checkClaimQuotes({ claims: input.claims, evidence: capture.evidence });
+  const quotes = checked.report;
+  if (opts.strictQuotes === true && quotes !== null && quotes.unquoted > 0) {
+    throw new QuoteCheckError(quotes.findings);
+  }
 
   const idHash = sourceIdentityHash([canonicalSource]);
   const absPath = distillationPagePath(vault, `${slugify(canonicalSource)}-${idHash.slice(0, 12)}`);
@@ -213,9 +354,11 @@ export function distillSource(
   const claimsSection = [
     "## Claims",
     "",
-    ...input.claims.map((c) => renderClaim(c, canonicalSource)),
+    ...checked.claims.map((c) => renderClaim(c, canonicalSource)),
   ].join("\n");
-  const body = [claimsSection, renderProvenanceSection(provenance)]
+  // The rendered section ends in a newline; the join supplies the separation.
+  const excerptSection = excerpt !== undefined ? renderExcerptSection(excerpt).trimEnd() : "";
+  const body = [claimsSection, excerptSection, renderProvenanceSection(provenance)]
     .filter((section) => section.length > 0)
     .join("\n\n");
 
@@ -239,9 +382,14 @@ export function distillSource(
       // rather than ranking it beside the operator's own notes. A trusted
       // source adds nothing, keeping its page byte-identical to before.
       ...untrustedSourceFrontmatter(origin.trust),
+      // How much of the source the page holds; nothing for a local file, so
+      // its page stays byte-identical to before.
+      ...captureScopeFrontmatter(capture.scope),
+      ...(excerpt !== undefined ? { [EXCERPT_HASH_KEY]: excerptDigest(excerpt) } : {}),
       provenance: provenance.level,
       agent: opts.agent,
       claim_count: input.claims.length,
+      ...quotesFrontmatter(quotes),
       created_at: createdAt,
       updated_at: updatedAt,
       tags: ["brain", "brain/distillation"],
@@ -264,6 +412,8 @@ export function distillSource(
     claimCount: input.claims.length,
     ...(sourceHash !== undefined ? { sourceHash } : {}),
     trust: origin.trust,
+    captureScope: capture.scope,
+    ...(quotes !== null ? { quotes } : {}),
   };
 }
 

@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
+import { TRANSPORT_REACH } from "../../src/core/graph/transport-reach.ts";
 import { JSONRPC_VERSION, MCPServer, PROTOCOL_VERSION } from "../../src/mcp/index.ts";
 import { buildToolTable } from "../../src/mcp/tools.ts";
 
@@ -58,8 +59,11 @@ async function initialize(server: MCPServer): Promise<void> {
   await server.handleRequest({ jsonrpc: JSONRPC_VERSION, method: "notifications/initialized" });
 }
 
-async function call(args: Record<string, unknown>): Promise<{ result?: unknown; error?: unknown }> {
-  const server = new MCPServer({ vault, configPath: null });
+async function call(
+  args: Record<string, unknown>,
+  reach?: typeof TRANSPORT_REACH.local,
+): Promise<{ result?: unknown; error?: unknown }> {
+  const server = new MCPServer({ vault, configPath: null }, reach !== undefined ? { reach } : {});
   await initialize(server);
   return (await server.handleRequest({
     jsonrpc: JSONRPC_VERSION,
@@ -92,5 +96,39 @@ describe("brain_note_history tool", () => {
   test("missing path is an invalid-params error", async () => {
     const response = await call({});
     expect((response.error as { code: number }).code).toBe(-32602);
+  });
+
+  test("a page the caller may not read at its reach answers as a path no commit touches", async () => {
+    const privateBody = "---\nvisibility: private\n---\nv1\n";
+    commit("notes/secret.md", privateBody, "secret start", "2026-05-01T10:00:00Z");
+    commit("notes/secret.md", `${privateBody}v2\n`, "secret later", "2026-05-20T10:00:00Z");
+    commit("notes/open.md", "open", "open", "2026-05-21T10:00:00Z");
+
+    const withheld = payload(await call({ path: "notes/secret.md" }));
+    const local = payload(await call({ path: "notes/secret.md" }, TRANSPORT_REACH.local));
+    rmSync(join(vault, "notes/secret.md"));
+    const absent = payload(await call({ path: "notes/secret.md" }));
+    const neverWritten = payload(await call({ path: "notes/never.md" }));
+
+    expect(withheld).toEqual(absent);
+    expect(withheld).toEqual({ ...neverWritten, note_path: "notes/secret.md" });
+    expect(withheld["commit_count"]).toBe(0);
+    expect(JSON.stringify(withheld)).not.toContain("secret start");
+    expect(local["commit_count"]).toBe(2);
+  });
+
+  test("a path that leaves the vault answers as a path no commit touches at remote reach", async () => {
+    commit("notes/open.md", "open", "open", "2026-05-21T10:00:00Z");
+    const outside = mkdtempSync(join(tmpdir(), "o2b-note-history-outside-"));
+    try {
+      writeFileSync(join(outside, "x.md"), "---\ntitle: beside\n---\nbody\n");
+      const rel = `../${basename(outside)}/x.md`;
+      const escaped = payload(await call({ path: rel }));
+      const neverWritten = payload(await call({ path: "notes/never.md" }));
+      expect(escaped).toEqual({ ...neverWritten, note_path: escaped["note_path"] });
+      expect(escaped["commit_count"]).toBe(0);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

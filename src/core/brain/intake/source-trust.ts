@@ -53,11 +53,24 @@
  * that question is this module's to ask, and for the limit of the answer.
  */
 
-import { isAbsolute, join } from "node:path";
-import { statSync } from "node:fs";
+import { isAbsolute, join, relative, sep } from "node:path";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 
-import { canonicalNotePath, ensureInsideVault, hasUriScheme } from "../../path-safety.ts";
-import { hashFile } from "../ingest/content-manifest.ts";
+import {
+  canonicalNotePath,
+  ensureInsideVault,
+  hasUriScheme,
+  realpathInsideVault,
+} from "../../path-safety.ts";
+import { hashBytes } from "../ingest/content-manifest.ts";
 import { INTAKE_TRUST, type IntakeTrust } from "../trust/untrusted-provenance.ts";
 
 /** `[[Articles/x.md]]` - the wikilink form the NER tool's `source` arrives in. */
@@ -76,6 +89,16 @@ const WIKILINK_ANCHOR_SEPARATOR = "#";
  */
 const ERRNO_NO_SUCH_ENTRY = "ENOENT";
 const ERRNO_NOT_A_DIRECTORY = "ENOTDIR";
+/** A symlink met where `O_NOFOLLOW` forbids one: not this vault's file. */
+const ERRNO_SYMLINK_LOOP = "ELOOP";
+
+/**
+ * How the one read opens a source: never through a final-component symlink,
+ * never blocking (a FIFO swapped in after the stat must not hang the read).
+ * Both flags are POSIX; where the platform lacks one it is simply absent.
+ */
+const SOURCE_OPEN_FLAGS =
+  fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
 
 /** What a failure is called when it carries neither an errno nor a name. */
 const UNNAMED_ERRNO = "unknown";
@@ -125,7 +148,23 @@ export interface SourceOrigin {
   readonly contentHash?: string;
 }
 
-const UNTRUSTED_ORIGIN: SourceOrigin = Object.freeze({ trust: INTAKE_TRUST.untrusted });
+/**
+ * A source origin together with the bytes its digest was computed over.
+ * `bytes` is present exactly when `contentHash` is: both come from one read,
+ * so a check that runs on these bytes runs on the bytes the page records.
+ */
+export interface SourceOriginWithBytes extends SourceOrigin {
+  readonly bytes?: Uint8Array;
+}
+
+/**
+ * The origin of a source with no local bytes: the untrusted lane, no digest.
+ * Also the answer for a vault file the caller may not read at its reach, so
+ * a hidden page and an absent one are indistinguishable.
+ */
+export const UNTRUSTED_ORIGIN: SourceOriginWithBytes = Object.freeze({
+  trust: INTAKE_TRUST.untrusted,
+});
 
 /** Everything before the first occurrence of `separator`, or the whole string. */
 function cutAt(value: string, separator: string): string {
@@ -236,6 +275,34 @@ function resolveVaultShapedPath(vault: string, canonical: string): string | null
     // same verdict as naming one on another host.
     return null;
   }
+}
+
+/**
+ * The vault-relative identity of a source SHAPED like a location inside this
+ * vault, in POSIX form with every `.` and `..` segment resolved, or `null`
+ * when the shape does not hold. Touches no file: it is the identity a reach
+ * predicate is asked about BEFORE anything is stat-ed or read, so a refusal
+ * of the stat or the size ceiling never names a page the caller may not read.
+ */
+export function vaultShapedIdentity(vault: string, sourcePath: string): string | null {
+  const abs = resolveVaultShapedPath(vault, normalizeSourceIdentity(sourcePath));
+  return abs === null ? null : relative(vault, abs).split(sep).join(PATH_SEPARATOR);
+}
+
+/**
+ * Does `readable` refuse this source? Asked on {@link vaultShapedIdentity},
+ * before any filesystem question about the source; a source with no
+ * vault-shaped identity is never asked about, and without a predicate
+ * nothing is refused.
+ */
+export function isSourceHidden(
+  vault: string,
+  sourcePath: string,
+  readable: ((rel: string) => boolean) | undefined,
+): boolean {
+  if (readable === undefined) return false;
+  const rel = vaultShapedIdentity(vault, sourcePath);
+  return rel !== null && !readable(rel);
 }
 
 /** Is this the filesystem saying "nothing is there", rather than refusing? */
@@ -349,6 +416,18 @@ export function classifySourceTrust(vault: string, sourcePath: string): IntakeTr
  * can be asked - and it belongs to the boundaries that can still ask.
  */
 export function classifySourceOrigin(vault: string, sourcePath: string): SourceOrigin {
+  const { trust, contentHash } = readSourceOrigin(vault, sourcePath);
+  return contentHash === undefined ? UNTRUSTED_ORIGIN : { trust, contentHash };
+}
+
+/**
+ * {@link classifySourceOrigin}, keeping the bytes the digest was computed
+ * over. Same verdicts, same refusals ({@link SourceTrustError}, the
+ * {@link SOURCE_HASH_MAX_BYTES} ceiling), and ONE read of the file: the
+ * digest and the returned bytes cannot describe two different versions of
+ * the source, which a hash followed by a second read for the caller could.
+ */
+export function readSourceOrigin(vault: string, sourcePath: string): SourceOriginWithBytes {
   const file = resolveVaultSourceFile(vault, sourcePath);
   if (file === null) return UNTRUSTED_ORIGIN;
 
@@ -358,24 +437,67 @@ export function classifySourceOrigin(vault: string, sourcePath: string): SourceO
     // case), so reusing it here would make an unrecordable source look like a
     // multi-source intake and quietly drop the audit record this classifier
     // exists to produce.
-    throw new SourceTrustError(
-      `source ${file.identity} is ${file.size} bytes, past the ${SOURCE_HASH_MAX_BYTES}-byte ` +
-        "ceiling on a source this classifier will read to record its digest",
-    );
+    throw ceilingRefusal(file.identity, file.size);
   }
 
+  let bytes: Uint8Array | null;
   try {
-    // The one hasher in this repository, so the digest a summary page records
-    // and the digest an entity page records cannot drift apart. It stats the
-    // file again; that is the price of one hasher, and it is the READ this
-    // ceiling was added to bound, not the stat.
-    return { trust: INTAKE_TRUST.trusted, contentHash: hashFile(file.abs) };
+    bytes = readBoundedSource(vault, file);
   } catch (cause) {
-    // The file went away between the stat and the read. That is the same
-    // answer the stat itself would have given a moment later - there is
-    // nothing there - and a race is not a reason to fail an intake that a
-    // retry would classify cleanly.
-    if (isAbsenceErrno(cause)) return UNTRUSTED_ORIGIN;
+    if (cause instanceof SourceTrustError) throw cause;
+    // The file went away (or was swapped for a symlink) between the stat and
+    // the read. That is the same answer the stat itself would have given a
+    // moment later - there is nothing of ours there - and a race is not a
+    // reason to fail an intake that a retry would classify cleanly.
+    if (isAbsenceErrno(cause) || errnoCode(cause) === ERRNO_SYMLINK_LOOP) return UNTRUSTED_ORIGIN;
     throw refusal(file.identity, cause);
+  }
+  if (bytes === null) return UNTRUSTED_ORIGIN;
+  // The one digest function in this repository, so the digest a summary page
+  // records and the digest an entity page records cannot drift apart.
+  return { trust: INTAKE_TRUST.trusted, contentHash: hashBytes(bytes), bytes };
+}
+
+/** The size refusal, composed from the identity and integers only. */
+function ceilingRefusal(identity: string, size: number): SourceTrustError {
+  return new SourceTrustError(
+    `source ${identity} is ${size} bytes, past the ${SOURCE_HASH_MAX_BYTES}-byte ` +
+      "ceiling on a source this classifier will read to record its digest",
+  );
+}
+
+/**
+ * Read a resolved source through ONE descriptor, so the checks that admitted
+ * it hold for the bytes read: the path is resolved to its real location and
+ * must still be inside the vault, the open refuses a symlink in the final
+ * component, the descriptor must be a regular file, and no more than the
+ * ceiling is read however large the file has grown since the stat. `null`
+ * when what is there now is not a regular file of this vault.
+ */
+function readBoundedSource(vault: string, file: VaultSourceFile): Uint8Array | null {
+  const real = realpathSync(file.abs);
+  if (!realpathInsideVault(real, vault)) return null;
+  const fd = openSync(real, SOURCE_OPEN_FLAGS);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return null;
+    if (stat.size > SOURCE_HASH_MAX_BYTES) throw ceilingRefusal(file.identity, stat.size);
+    // One byte past the expected size, so growth since the fstat is seen.
+    let buffer = Buffer.allocUnsafe(stat.size + 1);
+    let filled = 0;
+    for (;;) {
+      if (filled === buffer.length) {
+        if (filled > SOURCE_HASH_MAX_BYTES) throw ceilingRefusal(file.identity, filled);
+        const grown = Buffer.allocUnsafe(Math.min(buffer.length * 2, SOURCE_HASH_MAX_BYTES + 1));
+        buffer.copy(grown, 0, 0, filled);
+        buffer = grown;
+      }
+      const read = readSync(fd, buffer, filled, buffer.length - filled, null);
+      if (read === 0) break;
+      filled += read;
+    }
+    return buffer.subarray(0, filled);
+  } finally {
+    closeSync(fd);
   }
 }

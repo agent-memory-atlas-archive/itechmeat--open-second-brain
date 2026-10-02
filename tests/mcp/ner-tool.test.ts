@@ -16,9 +16,15 @@ import { join } from "node:path";
 import { bootstrapBrain } from "../../src/core/brain/init.ts";
 import { atomicWriteFileSync } from "../../src/core/fs-atomic.ts";
 import { getEntity, listEntities } from "../../src/core/brain/entities/registry.ts";
+import {
+  INTAKE_TRUST,
+  SOURCE_CONTENT_HASH_FRONTMATTER_KEY,
+} from "../../src/core/brain/trust/untrusted-provenance.ts";
+import { TRANSPORT_REACH } from "../../src/core/graph/transport-reach.ts";
 import { NER_TOOLS } from "../../src/mcp/brain/ner-tools.ts";
 import { MCPError } from "../../src/mcp/protocol.ts";
 import type { ServerContext } from "../../src/mcp/tool-contract.ts";
+import { brainPageTexts } from "../helpers/brain-pages.ts";
 import { CHMOD_CANNOT_DENY } from "../helpers/platform.ts";
 
 let vault: string;
@@ -129,10 +135,15 @@ describe("brain_intake_entities", () => {
     chmodSync(locked, 0o000);
     let thrown: unknown;
     try {
-      await handler(ctx, {
-        source: `[[${LOCKED_DIR}/note.md]]`,
-        entities: [{ category: "concept", name: "Restaking" }],
-      });
+      // At local reach: a caller that may not read the page is answered as
+      // for an absent one before the stat is made (source-reach-first.test.ts).
+      await handler(
+        { ...ctx, reach: TRANSPORT_REACH.local },
+        {
+          source: `[[${LOCKED_DIR}/note.md]]`,
+          entities: [{ category: "concept", name: "Restaking" }],
+        },
+      );
     } catch (err) {
       thrown = err;
     }
@@ -160,5 +171,45 @@ describe("brain_intake_entities", () => {
       }),
     ).rejects.toThrow(MCPError);
     expect(listEntities(vault)).toHaveLength(0);
+  });
+});
+
+/**
+ * A page the caller cannot read at its reach is cited exactly like an absent
+ * one: the intake commits in the untrusted lane and records no digest of it.
+ */
+describe("brain_intake_entities - a page withheld at the caller's reach", () => {
+  const PRIVATE_PATH = "Notes/secret.md";
+  const ABSENT = "Notes/absent.md";
+
+  beforeEach(() => {
+    mkdirSync(join(vault, "Notes"), { recursive: true });
+    writeFileSync(
+      join(vault, PRIVATE_PATH),
+      "---\nvisibility: private\n---\nThe code is ZX8.\n",
+      "utf8",
+    );
+  });
+
+  const intake = (source: string, reachCtx: ServerContext = ctx) =>
+    handler(reachCtx, { source, entities: [{ category: "concept", name: "Codes" }] }) as Promise<{
+      trust: string;
+    }>;
+
+  test("answers like an absent source and writes no digest", async () => {
+    const hidden = await intake(PRIVATE_PATH);
+    const absent = await intake(ABSENT);
+    expect(hidden.trust).toBe(INTAKE_TRUST.untrusted);
+    expect(hidden.trust).toBe(absent.trust);
+    for (const page of brainPageTexts(vault))
+      expect(page).not.toContain(SOURCE_CONTENT_HASH_FRONTMATTER_KEY);
+  });
+
+  test("at local reach the same page is trusted and digested", async () => {
+    const res = await intake(PRIVATE_PATH, { ...ctx, reach: TRANSPORT_REACH.local });
+    expect(res.trust).toBe(INTAKE_TRUST.trusted);
+    expect(
+      brainPageTexts(vault).some((page) => page.includes(SOURCE_CONTENT_HASH_FRONTMATTER_KEY)),
+    ).toBe(true);
   });
 });

@@ -10,6 +10,7 @@
  * the vault; remediation lives in `apply.ts`.
  */
 
+import { detectCaptureScope } from "./detectors/capture-scope.ts";
 import { detectConflicts } from "./detectors/conflicts.ts";
 import { detectDedup } from "./detectors/dedup.ts";
 import { detectFreshness } from "./detectors/freshness.ts";
@@ -33,6 +34,7 @@ const DETECTORS: Readonly<Record<HygieneDetectorId, HygieneDetector>> = Object.f
   usefulness: (vault, ctx) => detectUsefulness(vault, ctx),
   "slug-collisions": (vault) => detectSlugCollisions(vault),
   tags: (vault) => detectTags(vault),
+  "capture-scope": (vault, ctx) => detectCaptureScope(vault, ctx.readable),
 });
 
 export interface RunHygieneScanOptions {
@@ -44,6 +46,8 @@ export interface RunHygieneScanOptions {
   readonly detectors?: ReadonlyArray<HygieneDetectorId>;
   /** Injected clock. */
   readonly now: Date;
+  /** Handed to every detector; see `HygieneDetectorContext.readable`. */
+  readonly readable?: (rel: string) => boolean;
 }
 
 export function runHygieneScan(vault: string, opts: RunHygieneScanOptions): HygieneScanReport {
@@ -58,7 +62,10 @@ export function runHygieneScan(vault: string, opts: RunHygieneScanOptions): Hygi
 
   for (const id of requested) {
     try {
-      const detected = DETECTORS[id](vault, { now: opts.now });
+      const detected = DETECTORS[id](vault, {
+        now: opts.now,
+        ...(opts.readable !== undefined ? { readable: opts.readable } : {}),
+      });
       counts[id] = detected.length;
       findings.push(...detected);
     } catch (error) {

@@ -69,6 +69,7 @@ import {
   type RecoverabilityVerdict,
 } from "./gates/recoverability.ts";
 import { withDestructiveSnapshot } from "./snapshot-gate.ts";
+import { stringArrayField, wikilinkTarget } from "./source-links.ts";
 import { BRAIN_SNAPSHOT_REASON } from "./types.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 
@@ -182,6 +183,13 @@ export interface DeleteBySourceOptions {
   readonly now?: Date;
   /** Agent identity recorded in the audit reason. */
   readonly agent?: string;
+  /**
+   * May the caller read the original at this vault-relative path? Asked
+   * before the original is stat-ed, so one it may not read is planned,
+   * counted and left on disk exactly as an absent one would be. Absent
+   * includes every original (the CLI, which reads the vault directly).
+   */
+  readonly include?: (rel: string) => boolean;
 }
 
 /**
@@ -275,12 +283,6 @@ function stringField(meta: FrontmatterMap, key: string): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-function stringArrayField(meta: FrontmatterMap, key: string): ReadonlyArray<string> {
-  const value = meta[key];
-  if (!Array.isArray(value)) return [];
-  return value.filter((item): item is string => typeof item === "string");
-}
-
 /**
  * A preference's evidence links. The writer stores the field under the
  * managed `_evidenced_by` key (with a plain `evidenced_by` on legacy
@@ -289,12 +291,6 @@ function stringArrayField(meta: FrontmatterMap, key: string): ReadonlyArray<stri
 function evidencedByLinks(meta: FrontmatterMap): ReadonlyArray<string> {
   const managed = stringArrayField(meta, "_evidenced_by");
   return managed.length > 0 ? managed : stringArrayField(meta, "evidenced_by");
-}
-
-/** Strip a single enclosing `[[ … ]]` and any `|alias` / `#heading` tail. */
-function wikilinkTarget(raw: string): string {
-  const m = /^\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]$/.exec(raw.trim());
-  return m ? m[1]!.trim() : raw.trim();
 }
 
 function classifyKind(vault: string, absPath: string): SourceCleanupKind {
@@ -631,13 +627,21 @@ export function traceNoteDerivations(
  * A source that lives inside `Brain/` (or that has no on-disk file — e.g. a
  * URL identity) contributes no original.
  */
-function findOriginals(vault: string, canonical: string): string[] {
+function findOriginals(
+  vault: string,
+  canonical: string,
+  include: ((rel: string) => boolean) | undefined,
+): string[] {
   let abs: string;
   try {
     abs = ensureInsideVault(join(vault, canonical), vault);
   } catch {
     return [];
   }
+  // Before the stat: an original the caller may not read is answered as
+  // an absent one, so neither its existence nor its removal is decided by
+  // a caller that cannot see it.
+  if (include?.(canonical) === false) return [];
   if (!existsSync(abs)) return [];
   try {
     if (!statSync(abs).isFile()) return [];
@@ -682,7 +686,7 @@ export function deleteBySource(
   if (confirm) assertVaultIdentityForWrite(vault);
 
   const { derived, mentions } = traceReferences(vault, identity);
-  const originals = findOriginals(vault, canonical);
+  const originals = findOriginals(vault, canonical, opts.include);
   const manifestKey = readManifest(vault).entries[canonical] !== undefined ? canonical : null;
   const blastRadius = derived.length + mentions.length + originals.length;
 

@@ -252,11 +252,12 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
   {
     surface: "brain_idea_discovery",
     kind: K.mcpTool,
-    category: C.excluded,
+    category: C.covered,
     reason:
-      "discoverIdeas / ideaCandidates (core/brain/idea-discovery.ts) walk the vault via " +
-      "readdirSync + parseFrontmatter to find orphan research notes, with no visibility check on " +
-      "any candidate page.",
+      "discoverIdeas (core/brain/idea-discovery.ts) takes the handler's " +
+      "readableAtContextReach(ctx) as its include option and leaves a page the caller may not " +
+      "read at its reach out of the inbound-link walk and the candidates, before ranking and " +
+      "the cap, so a withheld research page is answered as an absent one.",
   },
   {
     surface: "brain_dead_ends",
@@ -299,11 +300,62 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
   {
     surface: "brain_tiers",
     kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "check keeps only the drift rows whose page passes the handler's " +
+      "readableAtContextReach(ctx), and restore and accept refuse any other page with the 'not " +
+      "indexed' error a page the index never saw gets, before the drift is read or anything is " +
+      "written.",
+  },
+  {
+    surface: "brain_doctor",
+    kind: K.mcpTool,
     category: C.excluded,
     reason:
-      "check returns store.listTierDrift() unscoped across the whole index - every drifted " +
-      "document's path, with no visibility check - and restore additionally reads the named " +
-      "page's full frontmatter and body via parseFrontmatter.",
+      "the read-only report keeps every issue stream through the owner view ANDed with " +
+      "reachView, over the path, target, sources and message wikilinks each issue names, takes " +
+      "ok and trust_verdict again over the kept issues, and below local reach recounts the " +
+      "tier-drift warning over the rows readableAtContextReach(ctx) keeps. It stays EXCLUDED " +
+      "because the repair branch is bounded by the owner scope only, and its plan names the " +
+      "records it would fix, reserved ones included.",
+  },
+  {
+    surface: "schema_inspect",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "the lint and orphans views keep only the findings whose named pages (path, or the source " +
+      "and target of a blocked link) pass reachView, and below local reach stats counts the same " +
+      "kept findings; graph, explain_type, active_pack and packs read the schema pack and its " +
+      "token usage counts, never a page path, title or body. Swept in through schema-admin.ts.",
+  },
+  {
+    surface: "schema_apply_mutations",
+    kind: K.mcpTool,
+    category: C.excluded,
+    reason:
+      "swept in for file-level completeness because schema-tools.ts also registers " +
+      "schema_inspect: it writes Brain/_brain.yaml and returns the resulting pack, its diff and " +
+      "the audit path, never a note path, title, or body.",
+  },
+  {
+    surface: "brain_health",
+    kind: K.mcpTool,
+    category: C.excluded,
+    reason:
+      "runs runDoctor's semantic-health pass and names preferences by id in its contradiction, " +
+      "stale-claim and batch-inflation findings; those are kept through the gated owner view " +
+      "only, and no reach view is asked, so a reserved preference can be named at remote reach.",
+  },
+  {
+    surface: "brain_status",
+    kind: K.mcpTool,
+    category: C.excluded,
+    reason:
+      "its hygiene count asks the owner view ANDed with reachView and its cited pages answer " +
+      "readableAtContextReach(ctx), but the doctor error and warning counts and the preference " +
+      "counts are taken over the whole Brain layer, so they move with a reserved record; it " +
+      "returns counts and problem labels, never a note path, title, or body.",
   },
   {
     surface: "brain_maintenance",
@@ -355,11 +407,13 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
   {
     surface: "brain_agent_query",
     kind: K.mcpTool,
-    category: C.excluded,
+    category: C.covered,
     reason:
-      "queryAgentSources (core/brain/agent-source/query.ts) returns, by the handler's own " +
-      "comment, 'contribution rows - ids, topics and the record text' from the provenance fold, " +
-      "gated by an explicit agent_scope argument only - never by visibility.",
+      "queryAgentSources (core/brain/agent-source/query.ts) takes the handler's " +
+      "reachView(ctx.vault, contextReach(ctx)) as its view option and drops, before the roster " +
+      "is folded, every contribution whose named page or event-body string the caller may not " +
+      "read at its reach, so a note-write row for a withheld page is answered as one for an " +
+      "absent page; agent_scope still gates ownership.",
   },
   {
     surface: "brain_writes",
@@ -375,11 +429,12 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
   {
     surface: "brain_agent_diff",
     kind: K.mcpTool,
-    category: C.excluded,
+    category: C.covered,
     reason:
-      "diffAgentSources returns the same contribution rows brain_agent_query does, gated by the " +
-      "GATED server identity (owner_scope_delivery, off by default) rather than an argument - " +
-      "visibility is not part of either gate.",
+      "diffAgentSources folds queryAgentSources, and the handler passes the same " +
+      "reachView(ctx.vault, contextReach(ctx)) view brain_agent_query does, so a contribution " +
+      "naming a page the caller may not read at its reach is dropped before any count or topic " +
+      "map is built; ownership is gated by the GATED server identity.",
   },
   {
     surface: "brain_anticipatory_context",
@@ -401,11 +456,12 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
   {
     surface: "brain_event_trace",
     kind: K.mcpTool,
-    category: C.excluded,
+    category: C.covered,
     reason:
-      "resolveLogEventTraces (core/brain/event-trace.ts) returns Brain log event bodies, which " +
-      "can name a note path per event; gated by a keep_private argument over the event's own " +
-      "flag, not by the named artifact's visibility.",
+      "resolveLogEventTraces (core/brain/event-trace.ts) takes the handler's " +
+      "reachView(ctx.vault, contextReach(ctx)) as its view option and drops, before the limit " +
+      "and the totals, every event whose artifacts or body strings name a page the caller may " +
+      "not read at its reach, and every attached trace whose handoff reference it hides.",
   },
   {
     surface: "brain_foresight",
@@ -510,14 +566,12 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
   {
     surface: "brain_procedural_memory",
     kind: K.mcpTool,
-    category: C.excluded,
+    category: C.covered,
     reason:
-      "collectEntries walks the configured roots with parseFrontmatter and returns `sourcePath` " +
-      "and `title` per entry, so this surface DOES disclose a page's path and title - it is " +
-      "excluded rather than swept in for completeness, and the distinction is the point of the " +
-      "row. It reads procedure-kind pages under caller-named roots rather than through any of " +
-      "the three read roots, and closing it means giving that walk a reach the way listVaultPages " +
-      "has one, which is a fourth root to build rather than a filter to add.",
+      "the handler filters list through readableAtContextReach(ctx) and recounts its total, " +
+      "reports reconcile counts over readable pages only, and refuses mark_used and " +
+      "mark_outcome on a withheld entry with the unknown-id error, before writing, so a " +
+      "procedure page the caller may not read at its reach is answered as an absent one.",
   },
   {
     surface: "brain_procedural_graph",

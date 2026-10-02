@@ -33,6 +33,14 @@ import {
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
 import { renderProvenanceSection, type Provenance } from "../provenance/provenance.ts";
 import {
+  CAPTURE_SCOPE,
+  captureScopesFrontmatter,
+  resolveCaptureScope,
+  type CaptureScope,
+  type CaptureScopeResolution,
+} from "../provenance/capture-scope.ts";
+import { SourceTrustError } from "../intake/source-trust.ts";
+import {
   ExternalFetchError,
   createFetchTransport,
   createMemoryResponseCache,
@@ -71,6 +79,14 @@ export interface ResearchReportInput {
 export interface ResearchReportOptions {
   readonly agent: string;
   readonly now: Date;
+  /**
+   * May the caller read this vault-relative path? Supplied by a surface
+   * that answers at a reach narrower than the vault (the MCP tool at remote
+   * reach); a local caller passes nothing. A source backed by a file the
+   * caller cannot read is reported `url-only`, the same answer as an absent
+   * file, in the result and on the page.
+   */
+  readonly readable?: (rel: string) => boolean;
 }
 
 export interface ResearchReportResult {
@@ -78,6 +94,12 @@ export interface ResearchReportResult {
   readonly reportPath: string;
   readonly created: boolean;
   readonly findingCount: number;
+  /**
+   * The current capture scope of every consulted source, parallel to
+   * `input.sources`. A report stores no excerpt, so each member is
+   * `full-local` (a vault file) or `url-only` (no local bytes).
+   */
+  readonly captureScopes: ReadonlyArray<CaptureScope>;
 }
 
 /** A research report failed validation; nothing was written. */
@@ -114,6 +136,9 @@ export function parseResearchReportInput(payload: unknown): ResearchReportInput 
   };
 }
 
+/** Line breaks a title may not hold: it is rendered as the page's one heading line. */
+const TITLE_LINE_BREAK_RE = /[\r\n]/;
+
 /** Wrap a bare source identifier in a wikilink; leave an existing one as-is. */
 function asWikilink(source: string): string {
   const trimmed = source.trim();
@@ -123,6 +148,9 @@ function asWikilink(source: string): string {
 function validate(input: ResearchReportInput): void {
   if (input.title.trim().length === 0) {
     throw new ResearchValidationError("report title must not be empty");
+  }
+  if (TITLE_LINE_BREAK_RE.test(input.title)) {
+    throw new ResearchValidationError("report title spans more than one line; a title is one line");
   }
   if (input.sources.length === 0) {
     throw new ResearchValidationError("a report must consult at least one source");
@@ -148,6 +176,39 @@ function validate(input: ResearchReportInput): void {
       }
     }
   }
+}
+
+/**
+ * The capture scope of one consulted source as the caller may know it. A
+ * `full-local` source whose backing file the caller cannot read answers
+ * `url-only`, so the scope never tells a narrower caller that a hidden page
+ * exists. The backing file is the identity's own path, or its `.md` note
+ * when the identity names no extension (see `resolveCaptureScope`).
+ *
+ * A source whose `stat` the filesystem refuses is inside this vault but
+ * unreadable. The scope is an annotation, so it never aborts the report, and
+ * it answers `url-only`: the vault can show none of the file's bytes, and the
+ * answer is the same at every reach, so it names nothing about the path.
+ * The `capture-scope` hygiene detector deliberately treats the same refused
+ * stat as backing, unless the caller may not read the file: this stamp is a
+ * snapshot of what the report could show, while the detector avoids warning
+ * about a file that may well exist.
+ */
+function captureScopeAtReach(
+  vault: string,
+  source: string,
+  readable: ((rel: string) => boolean) | undefined,
+): CaptureScope {
+  let resolved: CaptureScopeResolution;
+  try {
+    resolved = resolveCaptureScope(vault, source);
+  } catch (err) {
+    if (!(err instanceof SourceTrustError)) throw err;
+    return CAPTURE_SCOPE.urlOnly;
+  }
+  const { scope, backing } = resolved;
+  if (backing === null || readable === undefined) return scope;
+  return readable(backing) ? scope : CAPTURE_SCOPE.urlOnly;
 }
 
 /**
@@ -178,6 +239,12 @@ export function writeResearchReport(
     premises: [],
   };
 
+  // Classified from the identity alone (no byte read), in the consulted
+  // order, so `capture_scopes[i]` always describes `sources[i]`.
+  const captureScopes = Object.freeze(
+    input.sources.map((source) => captureScopeAtReach(vault, source, opts.readable)),
+  );
+
   const body = [
     `# ${input.title.trim()}`,
     ["## Findings", "", ...findingLines].join("\n"),
@@ -190,6 +257,9 @@ export function writeResearchReport(
     report_date: date,
     provenance: provenance.level,
     source_count: input.sources.length,
+    // Written only when some source is not a local file, so a report built
+    // from vault files alone stays byte-identical to before.
+    ...captureScopesFrontmatter(captureScopes),
     created_at: stamp,
     updated_at: stamp,
     tags: ["brain", "brain/report"],
@@ -206,6 +276,7 @@ export function writeResearchReport(
     reportPath: canonicalNotePath(relative(vault, absPath)),
     created,
     findingCount: input.findings.length,
+    captureScopes,
   };
 }
 

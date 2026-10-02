@@ -500,10 +500,6 @@ const COVERED_TOOLS: ReadonlySet<string> = new Set(
  * queued and `brain_trigger operation=terminal` does not.
  */
 const STILL_NAMED_AT_REMOTE: ReadonlySet<string> = new Set([
-  "brain_agent_diff mode=browse",
-  "brain_agent_diff mode=diff",
-  "brain_agent_diff mode=map",
-  "brain_agent_query",
   "brain_analytics view=belief_evolution",
   "brain_analytics view=concept_synthesis",
   "brain_analytics view=timeline",
@@ -514,12 +510,7 @@ const STILL_NAMED_AT_REMOTE: ReadonlySet<string> = new Set([
   "brain_claims operation=history",
   "brain_context",
   "brain_context_pack",
-  "brain_design_note",
-  "brain_doctor",
-  "brain_doctor #1",
   "brain_doctor #2",
-  "brain_event_trace",
-  "brain_idea_discovery",
   "brain_pre_compress_pack",
   "brain_retention",
   "brain_scaffold_stub action=list",

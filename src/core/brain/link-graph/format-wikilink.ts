@@ -32,12 +32,9 @@ export function isWikiLinkFormat(value: string): value is WikiLinkFormat {
   return (WIKI_LINK_FORMATS as ReadonlyArray<string>).includes(value);
 }
 
-/** Mirrors the masks used by the link-graph parser, broadened for the
- * rewrite path: backtick fences of any length (3+), tilde fences, and
- * inline code spans all stay verbatim. */
-import { RICH_WIKILINK_RE } from "../wikilink.ts";
-
-const CODE_BLOCK_RE = /(`{3,}|~{3,})[\s\S]*?\1|`[^`]+`/g;
+/** Fenced blocks and inline code spans stay verbatim on the rewrite path:
+ * the regions every link reader masks. */
+import { RICH_WIKILINK_RE, codeRegions } from "../wikilink.ts";
 
 export interface NormalizeResult {
   readonly content: string;
@@ -199,10 +196,10 @@ export function normalizeWikilinks(
 
   let out = "";
   let last = 0;
-  for (const m of content.matchAll(CODE_BLOCK_RE)) {
-    out += transformSegment(content.slice(last, m.index));
-    out += m[0];
-    last = m.index + m[0].length;
+  for (const [start, end] of codeRegions(content)) {
+    out += transformSegment(content.slice(last, start));
+    out += content.slice(start, end);
+    last = end;
   }
   out += transformSegment(content.slice(last));
 

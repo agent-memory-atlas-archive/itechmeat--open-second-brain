@@ -16,6 +16,7 @@ export const HYGIENE_DETECTOR_IDS = [
   "usefulness",
   "slug-collisions",
   "tags",
+  "capture-scope",
 ] as const;
 
 export type HygieneDetectorId = (typeof HYGIENE_DETECTOR_IDS)[number];
@@ -28,7 +29,8 @@ export type HygieneDetectorId = (typeof HYGIENE_DETECTOR_IDS)[number];
  * mechanism, two explicit policies: `slug-collisions` is default-on
  * (fires only on actual same-stem groups), `tags` is opt-in (noisy on
  * vaults that tag loosely), and further noisy detectors register as
- * opt-in by staying out of this list.
+ * opt-in by staying out of this list. `capture-scope` is default-on: it
+ * fires only on retrievable knowledge whose every source is url-only.
  *
  * Members are compile-checked against the registered tuple; a registered
  * id missing here is simply default-off, never an error.
@@ -39,6 +41,7 @@ export const DEFAULT_SCAN_IDS: ReadonlyArray<HygieneDetectorId> = Object.freeze(
   "freshness",
   "usefulness",
   "slug-collisions",
+  "capture-scope",
 ]);
 
 export type HygieneSeverity = "info" | "warning" | "action";
@@ -79,6 +82,13 @@ export interface HygieneFinding {
 export interface HygieneDetectorContext {
   /** Injected clock - detectors never read the wall clock themselves. */
   readonly now: Date;
+  /**
+   * May the caller read the vault file at this vault-relative path? Supplied
+   * by a surface that answers at a reach narrower than the vault; a local
+   * caller passes nothing. A detector that derives an answer from another
+   * file's presence treats a refused file as absent.
+   */
+  readonly readable?: (rel: string) => boolean;
 }
 
 export type HygieneDetector = (

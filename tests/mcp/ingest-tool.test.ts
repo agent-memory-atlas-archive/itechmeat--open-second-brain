@@ -12,11 +12,19 @@ import { tmpdir } from "node:os";
 import { mkdirSync, writeFileSync } from "node:fs";
 
 import { bootstrapBrain } from "../../src/core/brain/init.ts";
+import { CAPTURE_SCOPE } from "../../src/core/brain/provenance/capture-scope.ts";
 import { atomicWriteFileSync } from "../../src/core/fs-atomic.ts";
 import { listEntities } from "../../src/core/brain/entities/registry.ts";
+import { readManifest } from "../../src/core/brain/ingest/content-manifest.ts";
+import {
+  SOURCE_CONTENT_HASH_FRONTMATTER_KEY,
+  UNTRUSTED_SOURCE_FRONTMATTER_KEY,
+} from "../../src/core/brain/trust/untrusted-provenance.ts";
+import { TRANSPORT_REACH } from "../../src/core/graph/transport-reach.ts";
 import { INGEST_TOOLS } from "../../src/mcp/brain/ingest-tools.ts";
 import { INVALID_PARAMS, MCPError } from "../../src/mcp/protocol.ts";
 import type { ServerContext } from "../../src/mcp/tool-contract.ts";
+import { brainPageTexts } from "../helpers/brain-pages.ts";
 
 let vault: string;
 let configHome: string;
@@ -234,5 +242,133 @@ describe("brain_ingest_batch_plan reconcile (P5, t_d067a153)", () => {
     writeFileSync(join(vault, "Docs", "a.md"), "alpha", "utf8");
     const res = (await batchPlan(ctx, { source_dir: "Docs" })) as Record<string, unknown>;
     expect(res["reconcile"]).toBeUndefined();
+  });
+});
+
+/**
+ * The capture scope reaches the MCP caller (distilled provenance, D3): a
+ * source the vault holds is `full-local`, a URL is `url-only`, and the key
+ * is always present so a caller never infers it from absence.
+ */
+describe("brain_ingest_source - capture_scope", () => {
+  test("a source the vault holds is full-local", async () => {
+    seed("Articles/held.md");
+    const res = (await handler(ctx, {
+      source_path: "Articles/held.md",
+      summary: "A held source.",
+      entities: [{ category: "concept", name: "Held" }],
+    })) as Record<string, unknown>;
+    expect(res["capture_scope"]).toBe(CAPTURE_SCOPE.fullLocal);
+  });
+
+  test("a url source is url-only", async () => {
+    const res = (await handler(ctx, {
+      source_path: "https://example.test/post",
+      summary: "A remote source.",
+      entities: [{ category: "concept", name: "Remote" }],
+    })) as Record<string, unknown>;
+    expect(res["capture_scope"]).toBe(CAPTURE_SCOPE.urlOnly);
+  });
+});
+
+/**
+ * A page the caller cannot read at its reach is ingested exactly like an
+ * absent one: untrusted lane, `url-only`, and no digest on any page.
+ */
+describe("brain_ingest_source - a page withheld at the caller's reach", () => {
+  const PRIVATE_PATH = "Notes/secret.md";
+
+  beforeEach(() => {
+    mkdirSync(join(vault, "Notes"), { recursive: true });
+    writeFileSync(
+      join(vault, PRIVATE_PATH),
+      "---\nvisibility: private\n---\nThe code is ZX8.\n",
+      "utf8",
+    );
+  });
+
+  const ingest = (source: string, reachCtx: ServerContext = ctx) =>
+    handler(reachCtx, {
+      source_path: source,
+      summary: "Codes.",
+      entities: [{ category: "concept", name: "Codes" }],
+    }) as Promise<{ capture_scope: string; summary_path: string }>;
+
+  test("answers like an absent source and writes no digest", async () => {
+    const hidden = await ingest(PRIVATE_PATH);
+    const absent = await ingest("Notes/absent.md");
+    expect(hidden.capture_scope).toBe(CAPTURE_SCOPE.urlOnly);
+    expect(hidden.capture_scope).toBe(absent.capture_scope);
+    const summary = readFileSync(join(vault, hidden.summary_path), "utf8");
+    expect(summary).toContain(UNTRUSTED_SOURCE_FRONTMATTER_KEY);
+    for (const page of brainPageTexts(vault))
+      expect(page).not.toContain(SOURCE_CONTENT_HASH_FRONTMATTER_KEY);
+  });
+
+  test("at local reach the same page is full-local", async () => {
+    const res = await ingest(PRIVATE_PATH, { ...ctx, reach: TRANSPORT_REACH.local });
+    expect(res.capture_scope).toBe(CAPTURE_SCOPE.fullLocal);
+  });
+
+  test("records no content manifest entry for it, as for an absent source", async () => {
+    await ingest(PRIVATE_PATH);
+    expect(Object.keys(readManifest(vault).entries)).not.toContain(PRIVATE_PATH);
+    await ingest(PRIVATE_PATH, { ...ctx, reach: TRANSPORT_REACH.local });
+    expect(Object.keys(readManifest(vault).entries)).toContain(PRIVATE_PATH);
+  });
+});
+
+/**
+ * A file the caller cannot read at its reach is planned exactly like an
+ * absent one: in no batch, no total, no skip list and no reconcile list.
+ */
+describe("brain_ingest_batch_plan - a page withheld at the caller's reach", () => {
+  const batchPlan = INGEST_TOOLS.find((t) => t.name === "brain_ingest_batch_plan")!.handler;
+  const OPEN = "Notes/open.md";
+  const PRIVATE_PATH = "Notes/secret.md";
+
+  beforeEach(() => {
+    seed(OPEN, "open\n");
+    seed(PRIVATE_PATH, "---\nvisibility: private\n---\nThe code is ZX8.\n");
+  });
+
+  type Plan = {
+    plan_id: string;
+    total_files: number;
+    total_bytes: number;
+    batches: Array<{ files: Array<{ path: string }> }>;
+    reconcile?: { dispatched: string[]; ingested: string[]; missing: string[] };
+  };
+  const plan = (reachCtx: ServerContext, args: Record<string, unknown> = {}) =>
+    batchPlan(reachCtx, { source_dir: "Notes", ...args }) as Promise<Plan>;
+  const planned = (p: Plan) => p.batches.flatMap((b) => b.files.map((f) => f.path));
+
+  test("plans the vault as if the page were absent", async () => {
+    const remote = await plan(ctx);
+    expect(planned(remote)).toEqual([OPEN]);
+    expect(remote.total_files).toBe(1);
+
+    rmSync(join(vault, PRIVATE_PATH));
+    const absent = await plan(ctx);
+    expect(remote).toEqual(absent);
+  });
+
+  test("at local reach the page is planned", async () => {
+    const local = await plan({ ...ctx, reach: TRANSPORT_REACH.local });
+    expect(planned(local)).toEqual([OPEN, PRIVATE_PATH]);
+  });
+
+  test("a checkpoint entry for the page stays out of the reconcile lists", async () => {
+    const localCtx = { ...ctx, reach: TRANSPORT_REACH.local };
+    const local = await plan(localCtx);
+    await handler(localCtx, {
+      source_path: PRIVATE_PATH,
+      summary: "Codes.",
+      entities: [{ category: "concept", name: "Codes" }],
+      plan_id: local.plan_id,
+    });
+    const remote = await plan(ctx, { reconcile: true });
+    expect(remote.reconcile?.dispatched).toEqual([OPEN]);
+    expect(remote.reconcile?.ingested).toEqual([]);
   });
 });

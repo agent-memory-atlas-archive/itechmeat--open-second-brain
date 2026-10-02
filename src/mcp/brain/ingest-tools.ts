@@ -37,6 +37,7 @@ import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { parseExtractionIntakeArgs } from "./intake-args.ts";
+import { readableAtContextReach } from "./reach-readable.ts";
 import { enforceCountGuard, readCountGuardArgs, wrapToolErrors } from "./shared.ts";
 
 const TOOL = "brain_ingest_source";
@@ -86,6 +87,8 @@ async function toolBrainIngestSource(
       {
         agent,
         now: new Date(),
+        // A page the caller may not read at its reach answers as an absent one.
+        readable: readableAtContextReach(ctx),
         ...(planId !== undefined ? { planId } : {}),
         ...(preExtract ? { preExtract: true } : {}),
       },
@@ -96,6 +99,10 @@ async function toolBrainIngestSource(
       entities_created: [...res.entitiesCreated],
       entities_updated: [...res.entitiesUpdated],
       connections: [...res.connections],
+      // How much of the source the vault holds, as the summary page records
+      // it. Always present: absence would read as "full-local" to a caller
+      // that never learned the key exists.
+      capture_scope: res.captureScope,
       // Only emitted when the pre-extract pass ran, so a call without it is
       // byte-identical to before (P4).
       ...(res.preExtract !== undefined ? { pre_extract: serializePreExtract(res.preExtract) } : {}),
@@ -206,9 +213,12 @@ async function toolBrainDeleteBySource(
   const agent = coerceStr(args, "agent", false) ?? undefined;
   const { expect, strict } = readCountGuardArgs(args);
   const now = new Date();
+  // An original the caller may not read at its reach is planned and
+  // deleted exactly as an absent one: never confirmed, never removed.
   const baseOpts = {
     includeOriginals,
     now,
+    include: readableAtContextReach(ctx),
     ...(agent !== undefined ? { agent } : {}),
   };
 
@@ -316,16 +326,19 @@ async function toolBrainIngestBatchPlan(
   const reconcile = coerceBoolOptional(args, "reconcile") ?? false;
   const srcSubpath = coerceStr(args, "src_subpath", false) ?? undefined;
   const exclude = coerceStrList(args, "exclude");
+  // A file the caller may not read at its reach is planned as an absent one.
+  const include = readableAtContextReach(ctx);
   const plan = planBatches(ctx.vault, sourceDir, {
     maxBatchBytes,
     maxBatchFiles,
     resume,
+    include,
     ...(srcSubpath !== undefined ? { srcSubpath } : {}),
     ...(exclude.length > 0 ? { exclude } : {}),
   });
   // Reconcile BEFORE any checkpoint clear below, so the gap report reads a live
   // checkpoint. Read-only: it only diffs dispatched vs completed.
-  const report = reconcile ? reconcilePlan(ctx.vault, plan) : undefined;
+  const report = reconcile ? reconcilePlan(ctx.vault, plan, include) : undefined;
   // A resumed plan that comes back empty is fully drained: drop its checkpoint
   // (the content manifest is the authoritative final state from here on).
   if (resume && plan.batches.length === 0) {

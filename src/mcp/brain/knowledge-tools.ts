@@ -76,6 +76,7 @@ import {
   unknownOperationError,
 } from "../coerce.ts";
 import { coercePositiveInteger, toolSafeguard } from "./shared.ts";
+import { readableAtContextReach } from "./reach-readable.ts";
 
 /**
  * Vault-relative locations these two handlers read BY PATH, rather than
@@ -498,7 +499,13 @@ async function toolBrainDiarize(
       // filtered through the same gated view every other report surface
       // here uses - an unscoped list would publish another owner's
       // preference ids as citation targets.
-      { now: new Date(), ownerScope: gatedOwnerScopeView(ctx.vault, ctx.agentName).scope },
+      // A page the caller may not read at its reach is withheld from the
+      // candidates exactly as an absent one.
+      {
+        now: new Date(),
+        ownerScope: gatedOwnerScopeView(ctx.vault, ctx.agentName).scope,
+        readable: readableAtContextReach(ctx),
+      },
     );
     return {
       entity_id: report.entityId,
@@ -542,7 +549,13 @@ function toolBrainIdeaDiscovery(
   // notes (a-label-is-not-a-boundary, U3). Filtered BEFORE the trigger
   // pass so a hidden artifact cannot be enqueued either.
   const view = gatedOwnerScopeView(ctx.vault, ctx.agentName);
-  const ideas = view.keep(discoverIdeas(ctx.vault, { now, cap }), (i) => i.sourceArtifacts);
+  // A page the caller may not read at its reach is left out of the walk
+  // itself, before the ranking and the cap, so the list is the one a vault
+  // without that page would give.
+  const ideas = view.keep(
+    discoverIdeas(ctx.vault, { now, cap, include: readableAtContextReach(ctx) }),
+    (i) => i.sourceArtifacts,
+  );
   let triggersCreated: number | undefined;
   if (enqueue) {
     const result = createTriggers(ctx.vault, ideaCandidates(ideas), {

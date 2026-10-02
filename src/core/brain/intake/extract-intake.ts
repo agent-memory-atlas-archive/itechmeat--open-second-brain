@@ -37,7 +37,13 @@ import { validateEntityCategory, normalizeEntityName } from "../entities/canonic
 import { relateEntities, upsertEntity } from "../entities/registry.ts";
 import { renderProvenanceSection, type Provenance } from "../provenance/provenance.ts";
 import { INTAKE_TRUST, type IntakeTrust } from "../trust/untrusted-provenance.ts";
-import { classifySourceOrigin, classifySourceTrust, type SourceOrigin } from "./source-trust.ts";
+import {
+  UNTRUSTED_ORIGIN,
+  classifySourceOrigin,
+  classifySourceTrust,
+  isSourceHidden,
+  type SourceOrigin,
+} from "./source-trust.ts";
 
 /** One entity the agent extracted from a source. */
 export interface IntakeEntity {
@@ -77,6 +83,14 @@ export interface IntakeOptions {
    * itself, which nothing enforced for the next caller.
    */
   readonly provenance: Provenance;
+  /**
+   * May the caller read the vault file at this vault-relative path? Supplied
+   * by a surface that answers at a reach narrower than the vault (the MCP
+   * tools at remote reach); a local caller passes nothing. A cited vault file
+   * the predicate refuses is classified as a source with no local bytes
+   * (untrusted lane, no digest), exactly like an absent file.
+   */
+  readonly readable?: (rel: string) => boolean;
 }
 
 export interface IntakeResult {
@@ -162,7 +176,11 @@ function validateIntake(intake: ExtractionIntake): void {
  * itself the way in, while quarantining it punishes a caller for a question
  * nobody asked. The remedy is to name a source, so the caller is told to.
  */
-function resolveIntakeOrigin(vault: string, provenance: Provenance): SourceOrigin {
+function resolveIntakeOrigin(
+  vault: string,
+  provenance: Provenance,
+  readable: ((rel: string) => boolean) | undefined,
+): SourceOrigin {
   const sources = provenance.sources;
   if (sources.length === 0) {
     throw new IntakeValidationError(
@@ -176,12 +194,21 @@ function resolveIntakeOrigin(vault: string, provenance: Provenance): SourceOrigi
   // each of them in full and then discarded every digest but the first - and
   // discarded that one too the moment there was more than one source.
   const only = sources.length === 1 ? sources[0] : undefined;
-  if (only !== undefined) return classifySourceOrigin(vault, only);
+  // The reach question comes first, before any stat or read, so neither a
+  // refused stat nor the size ceiling can name a page the caller may not read.
+  if (only !== undefined) {
+    return isSourceHidden(vault, only, readable)
+      ? UNTRUSTED_ORIGIN
+      : classifySourceOrigin(vault, only);
+  }
 
-  // `some` rather than a full map: the first source outside the vault settles
-  // the whole intake, and nothing after it changes the answer.
+  // `some` rather than a full map: the first source outside the vault (or
+  // hidden from the caller) settles the whole intake, and nothing after it
+  // changes the answer.
   const untrusted = sources.some(
-    (source) => classifySourceTrust(vault, source) === INTAKE_TRUST.untrusted,
+    (source) =>
+      isSourceHidden(vault, source, readable) ||
+      classifySourceTrust(vault, source) === INTAKE_TRUST.untrusted,
   );
   return { trust: untrusted ? INTAKE_TRUST.untrusted : INTAKE_TRUST.trusted };
 }
@@ -199,7 +226,7 @@ export function intakeExtraction(
   validateIntake(intake);
   // Before any write, like the payload validation above: an intake that
   // cannot be classified must not leave half its entities behind.
-  const origin = resolveIntakeOrigin(vault, opts.provenance);
+  const origin = resolveIntakeOrigin(vault, opts.provenance, opts.readable);
 
   const provenanceSection = renderProvenanceSection(opts.provenance);
   const untrustedOrigin = origin.trust === INTAKE_TRUST.untrusted;

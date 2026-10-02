@@ -79,6 +79,123 @@ export const ANCHORED_WIKILINK_RE = /^\[\[([^\]]+)\]\]/;
 /** Whole-string wikilink form; body in one capture. */
 export const EXACT_WIKILINK_RE = /^\[\[([^\]]+)\]\]$/;
 
+/** The two characters a fence is built from. */
+const BACKTICK = "`";
+const TILDE = "~";
+
+/** The shortest run of fence characters that opens or closes a fence. */
+const FENCE_MIN_RUN = 3;
+
+/** A whole run of three or more fence characters: `[start, start + len)`. */
+interface FenceRun {
+  readonly start: number;
+  readonly len: number;
+}
+
+/**
+ * Every whole run of three or more `ch`, left to right, and for each the
+ * run that closes it: the next run of the same character at least as long
+ * (next-greater-or-equal, one monotonic-stack pass from the right).
+ */
+function fenceClosers(text: string, ch: string): Map<number, FenceRun> {
+  const runs: FenceRun[] = [];
+  let i = text.indexOf(ch);
+  while (i !== -1) {
+    let end = i + 1;
+    while (end < text.length && text[end] === ch) end++;
+    if (end - i >= FENCE_MIN_RUN) runs.push({ start: i, len: end - i });
+    i = text.indexOf(ch, end);
+  }
+  const closers = new Map<number, FenceRun>();
+  const stack: FenceRun[] = [];
+  for (let r = runs.length - 1; r >= 0; r--) {
+    const run = runs[r]!;
+    while (stack.length > 0 && stack.at(-1)!.len < run.len) stack.pop();
+    const closer = stack.at(-1);
+    if (closer !== undefined) closers.set(run.start, closer);
+    stack.push(run);
+  }
+  return closers;
+}
+
+/**
+ * Every whole run of one or two backticks, left to right, and for each the
+ * run that closes it as an inline code span: the next run of exactly the
+ * same length (the CommonMark rule). One pass from the right.
+ */
+function inlineClosers(text: string): Map<number, FenceRun> {
+  const runs: FenceRun[] = [];
+  let i = text.indexOf(BACKTICK);
+  while (i !== -1) {
+    let end = i + 1;
+    while (end < text.length && text[end] === BACKTICK) end++;
+    if (end - i < FENCE_MIN_RUN) runs.push({ start: i, len: end - i });
+    i = text.indexOf(BACKTICK, end);
+  }
+  const closers = new Map<number, FenceRun>();
+  const nextOfLength = new Map<number, FenceRun>();
+  for (let r = runs.length - 1; r >= 0; r--) {
+    const run = runs[r]!;
+    const closer = nextOfLength.get(run.len);
+    if (closer !== undefined) closers.set(run.start, closer);
+    nextOfLength.set(run.len, run);
+  }
+  return closers;
+}
+
+/**
+ * Code regions a wikilink or mention scan masks out, as `[start, end)`
+ * pairs left to right: a fenced block or an inline code span. A fence is a
+ * whole run of three or more backticks or tildes, and it closes on the next
+ * whole run of the same character at least as long (the CommonMark rule),
+ * consumed whole: a longer fence holding a shorter run stays masked.
+ * Elsewhere a run of one or two backticks opens an inline span that closes
+ * on the next run of exactly its length. A run with no closer is not a
+ * region, and none of its marks opens one.
+ *
+ * One pass over the text plus one pass over the runs, so the cost is
+ * linear whatever the runs look like. Shared by every link and mention
+ * reader, so a stored excerpt never contributes links anywhere.
+ */
+export function codeRegions(text: string): Array<[number, number]> {
+  const closers = new Map([
+    ...fenceClosers(text, BACKTICK),
+    ...fenceClosers(text, TILDE),
+    ...inlineClosers(text),
+  ]);
+  const regions: Array<[number, number]> = [];
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch !== BACKTICK && ch !== TILDE) {
+      i++;
+      continue;
+    }
+    const closer = closers.get(i);
+    if (closer !== undefined) {
+      const end = closer.start + closer.len;
+      regions.push([i, end]);
+      i = end;
+      continue;
+    }
+    // An unclosed run is literal text as a whole: skipping it keeps its last
+    // mark from opening an inline span against an unrelated later backtick.
+    while (i < text.length && text[i] === ch) i++;
+  }
+  return regions;
+}
+
+/** `text` with every {@link codeRegions} region replaced by `fill(region)`. */
+export function maskCodeRegions(text: string, fill: (region: string) => string): string {
+  let out = "";
+  let last = 0;
+  for (const [start, end] of codeRegions(text)) {
+    out += text.slice(last, start) + fill(text.slice(start, end));
+    last = end;
+  }
+  return out + text.slice(last);
+}
+
 /**
  * Strip wikilink decoration off `value` and return the bare target id.
  *

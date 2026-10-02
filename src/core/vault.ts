@@ -50,7 +50,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 
-import { WIKILINK_TARGET_RE } from "./brain/wikilink.ts";
+import { WIKILINK_TARGET_RE, maskCodeRegions } from "./brain/wikilink.ts";
 import {
   FileAlreadyExistsError,
   atomicCreateFileSyncExclusive,
@@ -91,7 +91,6 @@ const KEY_VALUE_RE = new RegExp(`^(${FRONTMATTER_KEY_PATTERN})\\s*:\\s*(.*?)\\s*
 // list item) is NOT matched. Captures the item text after the whitespace.
 const DASH_ITEM_RE = /^-(?:\s+(.*))?$/;
 const PLAIN_SCALAR_RE = /^[A-Za-z0-9_./-](?:[A-Za-z0-9_./ -]*[A-Za-z0-9_./-])?$/;
-const CODE_BLOCK_RE = /```[\s\S]*?```|`[^`]+`/g;
 const SLUG_INVALID_RE = /[^a-z0-9]+/g;
 const SLUG_MAX_LEN = 64;
 
@@ -556,7 +555,7 @@ export function slugify(value: string): string {
  * file extensions and links inside fenced or inline code blocks.
  */
 export function extractWikilinks(content: string): string[] {
-  const masked = content.replace(CODE_BLOCK_RE, " ");
+  const masked = maskCodeRegions(content, () => " ");
   const seen = new Set<string>();
   const result: string[] = [];
   for (const m of masked.matchAll(WIKILINK_TARGET_RE)) {

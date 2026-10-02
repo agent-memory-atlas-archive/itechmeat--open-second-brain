@@ -25,6 +25,7 @@ import { gatedOwnerScopeView } from "../../core/brain/owner-scope-view.ts";
 import { everyArtifactRefView } from "../../core/brain/artifact-ref-view.ts";
 import { reachView } from "../../core/brain/reach-view.ts";
 import { contextReach } from "../tool-contract.ts";
+import { TRANSPORT_REACH } from "../../core/graph/transport-reach.ts";
 import { applyHygienePlan } from "../../core/brain/hygiene/apply.ts";
 import { annotateDedupFindings } from "../../core/brain/hygiene/dedup-verdicts.ts";
 import { verdictFields } from "../../core/decision-model/pair-verdict.ts";
@@ -45,12 +46,14 @@ import {
   DANGLING_LINK_DEFINITION,
   measureFromIndex,
   type LinkRatchetMeasurement,
+  type LinkRatchetUnmeasurableReason,
 } from "../../core/search/link-ratchet.ts";
 import { coerceBool } from "../coerce.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { enforceCountGuard, readCountGuardArgs, vaultRelativeSafe } from "./shared.ts";
+import { readableAtContextReach } from "./reach-readable.ts";
 
 function coerceStringArray(args: Record<string, unknown>, key: string): string[] | undefined {
   const raw = args[key];
@@ -70,13 +73,16 @@ function resolverCmdFromConfig(vault: string): string | undefined {
 }
 
 function scanWithResolver(
-  vault: string,
+  ctx: ServerContext,
   detectors: HygieneDetectorId[] | undefined,
   now: Date,
 ): HygieneScanReport {
+  const vault = ctx.vault;
   const report = runHygieneScan(vault, {
     ...(detectors !== undefined && detectors.length > 0 ? { detectors } : {}),
     now,
+    // A cited page the caller may not read at its reach answers as an absent one.
+    readable: readableAtContextReach(ctx),
   });
   const resolverCmd = resolverCmdFromConfig(vault);
   if (resolverCmd === undefined) return report;
@@ -117,6 +123,19 @@ function findingView(vault: string, finding: HygieneFinding): Record<string, unk
 }
 
 /**
+ * The `link_integrity.reason` a scan reports below local reach, where the
+ * count is not taken at all (docs/mcp.md, `brain_hygiene`). It sits beside
+ * the reasons the measurement itself returns, in
+ * {@link LinkIntegrityReason}.
+ */
+export const LINK_INTEGRITY_REACH_REASON = "reach" as const;
+
+/** Every `link_integrity.reason` a scan can report. */
+export type LinkIntegrityReason =
+  | LinkRatchetUnmeasurableReason
+  | typeof LINK_INTEGRITY_REACH_REASON;
+
+/**
  * Vault-wide link integrity, reported beside the detector findings
  * (context-integrity-gates, unit G).
  *
@@ -135,6 +154,18 @@ function findingView(vault: string, finding: HygieneFinding): Record<string, unk
  * flattened into a zero.
  */
 async function linkIntegrityView(ctx: ServerContext): Promise<Record<string, unknown>> {
+  // The measurement is taken over the whole index, withheld pages
+  // included, so its counts would move when a page the caller may not
+  // read appears or goes. Below local reach the number is not taken at
+  // all, which is the same answer whether such a page exists or not.
+  if (contextReach(ctx) !== TRANSPORT_REACH.local) {
+    return {
+      definition: DANGLING_LINK_DEFINITION,
+      measured: false,
+      reason: LINK_INTEGRITY_REACH_REASON satisfies LinkIntegrityReason,
+      detail: "link integrity is measured over the whole index and is reported at local reach only",
+    };
+  }
   let measurement: LinkRatchetMeasurement;
   try {
     measurement = await measureFromIndex(
@@ -148,7 +179,7 @@ async function linkIntegrityView(ctx: ServerContext): Promise<Record<string, unk
     return {
       definition: DANGLING_LINK_DEFINITION,
       measured: false,
-      reason: "index-unreadable",
+      reason: "index-unreadable" satisfies LinkIntegrityReason,
       detail: e instanceof Error ? e.message : String(e),
     };
   }
@@ -156,7 +187,7 @@ async function linkIntegrityView(ctx: ServerContext): Promise<Record<string, unk
     return {
       definition: measurement.definition,
       measured: false,
-      reason: measurement.reason,
+      reason: measurement.reason satisfies LinkIntegrityReason,
       detail: measurement.detail,
     };
   }
@@ -230,7 +261,7 @@ async function toolBrainHygiene(
       `'detectors' entries must be: ${HYGIENE_DETECTOR_IDS.join(", ")}`,
     );
   }
-  const scanned = scanWithResolver(ctx.vault, detectors, now);
+  const scanned = scanWithResolver(ctx, detectors, now);
 
   // The owner boundary is applied to the REPORT, once, before EITHER mode
   // reads it. `findings[].targets` are artifact ids (or absolute paths
@@ -330,7 +361,7 @@ export const HYGIENE_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
     name: "brain_hygiene",
     previewBudget: MCP_PREVIEW_BUDGET,
     description:
-      "Memory hygiene pipeline. `scan`: read-only digest of contested truth slots, near-duplicate preferences, stale/orphaned pages, low-usefulness candidates. `apply`: execute selected finding ids (review findings never execute). `refresh`: targeted recompile of stale pages with dry-run.",
+      "Memory hygiene pipeline. `scan`: read-only digest of contested truth slots, near-duplicate preferences, stale/orphaned pages, low-usefulness candidates, knowledge resting on url-only sources. `apply`: run selected finding ids (review findings never run). `refresh`: recompile stale pages.",
     inputSchema: {
       type: "object",
       properties: {
@@ -342,7 +373,7 @@ export const HYGIENE_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
         detectors: {
           type: "array",
           items: { type: "string", enum: [...HYGIENE_DETECTOR_IDS] },
-          description: `Detector subset for scan/apply. Default: ${DEFAULT_SCAN_IDS.join(", ")} (every registered detector except the opt-in ones).`,
+          description: `Detector subset for scan/apply. Default: ${DEFAULT_SCAN_IDS.join(", ")} (all but the opt-in ones).`,
         },
         ids: {
           type: "array",
