@@ -1284,10 +1284,11 @@ an existing file is never touched, so operator curation owns the
 draft from the moment it exists.
 
 Architecture knowledge gets the same treatment via `o2b brain
-architect <project-path>`: a stdlib-only scanner derives structural
-facts (module layout, language mix, entry points, manifests, test
-layout - no LLM, no network) and renders an overview plus per-module
-notes under `Brain/projects/arch/<repo-key>/`. Generated content
+architect <project-path>`: a scanner that uses the built-in runtime
+only, no dependency, derives structural facts (module layout, language
+mix, entry points, manifests, test layout - no LLM, no network) and
+renders an overview plus per-module notes under
+`Brain/projects/arch/<repo-key>/`. Generated content
 lives between paired `<!-- o2b:begin <id> -->` / `<!-- o2b:end <id>
 -->` sentinels: regeneration replaces only generated bodies, operator
 prose outside regions survives byte-for-byte, and corrupted markers
@@ -1300,10 +1301,55 @@ dot-directory and no build or dependency output (`node_modules`,
 state. A run reports its two stages - `walk`, a counter with no
 denominator, and `render`, which knows its note count - through the
 progress spine, and honours a safeguard deadline at each directory
-read. The same release also closes the
-observability gap v0.39.0 left open: `brain_query` now emits opt-in
-recall telemetry with a kind-only payload, so the supplied preference
-id, topic, or timestamp never lands in a continuity record.
+read. The same release also closes the observability gap v0.39.0 left
+open: `brain_query` now emits opt-in recall telemetry with a kind-only
+payload, so the supplied preference id, topic, or timestamp never lands
+in a continuity record.
+
+Since v1.68.0 the scan reads dependency manifests at the project root
+and at each detected module: `package.json`, `pyproject.toml` (PEP 621
+and Poetry), `Cargo.toml` and `go.mod`. `pom.xml`, `build.gradle`,
+`Gemfile` and `composer.json` are detected and reported `unsupported`
+by name. The walk skips symlinks, so a manifest that is a symlink is
+not read. Every manifest gets one status - `read`, `malformed` (with a
+fixed reason such as `invalid JSON` or `invalid TOML`, never the
+manifest's own text), `unreadable` (with the error code, or because it
+is not a regular file or is larger than 1 MiB, which is not read) or
+`unsupported` - and one bad manifest never aborts the run. The overview's
+`dependencies` region lists every manifest of the root and the modules
+with its status, and the runtime dependencies they declare per
+ecosystem, leaving out a name that is the manifest name of exactly one
+other module (those edges are drawn in `module-dependencies`; a name two
+modules share binds no edge and stays listed), one canonical name
+each (PyPI names
+normalised per PEP 503, a renamed Cargo dependency by its real crate
+name), and counts the dev, build, optional, peer and indirect groups on
+one line per ecosystem instead of listing them. A declared name that is
+not a plausible package name (one holding a line break, a space or a
+bracket) is not written into a note: it is counted on the same line as
+`unrepresentable`. The project's name, version and description are
+written on one line, with `[[` escaped so they cannot open a link. The
+project name comes from the first root manifest read that names a
+project, in the order
+`package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`.
+
+A module whose manifest declares a runtime dependency on the manifest
+name of exactly one other module gets a declared edge; a name two
+modules carry binds nothing. The edges render in their own
+`module-dependencies` region (a Mermaid diagram under its own claim:
+declared by manifests, not measured from imports), in a `dependencies`
+region on each module note, and as a `depends_on` frontmatter key on
+the module note, a YAML list of wikilinks to the target module notes,
+which the indexer turns into typed `depends_on` links. A module whose
+directory name holds a character a link cannot carry (a control
+character, `[`, `]`, `|`, `#` or `^`) is named once on the overview's
+module list and left out of every link and edge. The generator
+owns that one key: it rewrites it on every run, removes it when a
+module has no edge, overwrites any value typed under it, and never
+touches another frontmatter key. The `module-map` region stays
+containment only. On an existing overview or module note the new
+regions are appended at the end of the note, once, so the first run
+after an upgrade reports those notes `updated`.
 
 ## The agent write contract (since v0.41.0)
 

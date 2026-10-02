@@ -49,19 +49,20 @@
  * `not found` message an ABSENT one produces, because a distinguishable
  * refusal would announce the page it is meant to hide.
  *
- * The three whole-vault readers (`preferences/active`, `lessons`,
- * `digest/latest`, `status`) are deliberately NOT filtered here: they
- * serve generated files that are shared by construction and regenerated
- * unscoped (see `brain_context`, which returns a scoped PROJECTION while
- * leaving `Brain/active.md` untouched). Scoping the file itself is a
- * different decision from scoping a delivery, and it is not made here.
+ * The three digest readers (`preferences/active`, `lessons`,
+ * `digest/latest`) render preference records, so each answers with the
+ * request view: a record the caller may not see is absent from the
+ * digest it is handed. The shared files stay unscoped - they are
+ * regenerated unscoped and never rewritten for one reader; the narrowed
+ * digest is rendered in memory. `status` returns counts over the whole
+ * Brain layer and is not filtered here.
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { listLogMarkdownFiles } from "../core/brain/log-jsonl.ts";
 
-import { regenerateActive } from "../core/brain/active.ts";
-import { regenerateLessons } from "../core/brain/lessons.ts";
+import { readActiveForReader, regenerateActive } from "../core/brain/active.ts";
+import { regenerateLessons, renderLessonsForReader } from "../core/brain/lessons.ts";
 import { buildBacklinkIndex } from "../core/brain/backlinks.ts";
 import type { BacklinkRef } from "../core/brain/backlinks.ts";
 import { renderDigest } from "../core/brain/digest.ts";
@@ -82,7 +83,11 @@ import { BrainNotFoundError, queryByPreference, queryByTopic } from "../core/bra
 import { gatedOwnerScopeView } from "../core/brain/owner-scope-view.ts";
 import { everyArtifactRefView, type ArtifactRefView } from "../core/brain/artifact-ref-view.ts";
 import { reachView } from "../core/brain/reach-view.ts";
-import { resolvedTransportReach, type TransportReach } from "../core/graph/transport-reach.ts";
+import {
+  TRANSPORT_REACH,
+  resolvedTransportReach,
+  type TransportReach,
+} from "../core/graph/transport-reach.ts";
 import { extractWikilinkRichBodies } from "../core/brain/link-graph/parse-wikilink.ts";
 import { normaliseWikilinkTarget } from "../core/brain/wikilink.ts";
 import { logEntryArtifactRefs } from "../core/brain/log.ts";
@@ -212,11 +217,11 @@ export function readResource(ctx: ResourceContext, uri: string): ResourceContent
   const parsed = parseUri(uri);
   switch (parsed.kind) {
     case "active":
-      return readActive(ctx, uri);
+      return readActive(ctx, uri, requestView(ctx));
     case "lessons":
-      return readLessons(ctx, uri);
+      return readLessons(ctx, uri, requestView(ctx));
     case "digestLatest":
-      return readDigestLatest(ctx, uri);
+      return readDigestLatest(ctx, uri, requestView(ctx));
     case "status":
       return readStatus(ctx, uri);
     case "preference":
@@ -333,7 +338,7 @@ function parseUri(uri: string): Parsed {
 
 // ----- Readers -------------------------------------------------------------
 
-function readActive(ctx: ResourceContext, uri: string): ResourceContent {
+function readActive(ctx: ResourceContext, uri: string, view: RequestView): ResourceContent {
   const path = brainActivePath(ctx.vault);
   // First read attempt: the file usually exists because dream
   // regenerates it. On a fresh vault that has never been dreamed, the
@@ -351,10 +356,18 @@ function readActive(ctx: ResourceContext, uri: string): ResourceContent {
       );
     }
   }
-  return readMarkdown(uri, path);
+  // The shared file is served as it is to a local reader with no owner
+  // scope; any other reader gets the in-memory render, stamped with the
+  // generation on disk (see `readActiveForReader`).
+  const text = readActiveForReader(ctx.vault, {
+    ...(view.refs.filtersNothing ? {} : { readable: view.refs.visible }),
+    ...(view.ownerScope !== null ? { agentScope: view.ownerScope } : {}),
+    restricted: view.reach !== TRANSPORT_REACH.local,
+  });
+  return { uri, mimeType: MIME_MARKDOWN, text };
 }
 
-function readLessons(ctx: ResourceContext, uri: string): ResourceContent {
+function readLessons(ctx: ResourceContext, uri: string, view: RequestView): ResourceContent {
   const path = brainLessonsPath(ctx.vault);
   // Same on-demand-on-first-miss policy as readActive: a fresh vault
   // that has never been dreamed has no lessons.md yet — generate it
@@ -369,11 +382,19 @@ function readLessons(ctx: ResourceContext, uri: string): ResourceContent {
       );
     }
   }
-  return readMarkdown(uri, path);
+  // A local reader with no owner scope is served the shared file as it
+  // is; any other reader gets the digest rendered without the records it
+  // cannot see, scored and stamped at the generation on disk.
+  if (view.refs.filtersNothing) return readMarkdown(uri, path);
+  const text = renderLessonsForReader(ctx.vault, { readable: view.refs.visible }).document;
+  return { uri, mimeType: MIME_MARKDOWN, text };
 }
 
-function readDigestLatest(ctx: ResourceContext, uri: string): ResourceContent {
-  const rendered = renderDigest(ctx.vault, { format: "markdown" });
+function readDigestLatest(ctx: ResourceContext, uri: string, view: RequestView): ResourceContent {
+  const rendered = renderDigest(ctx.vault, {
+    format: "markdown",
+    ...(view.refs.filtersNothing ? {} : { readable: view.refs.visible }),
+  });
   return {
     uri,
     mimeType: MIME_MARKDOWN,

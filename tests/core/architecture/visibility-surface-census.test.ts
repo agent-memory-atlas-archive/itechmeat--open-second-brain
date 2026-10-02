@@ -250,6 +250,12 @@ const NOTE_CONTENT_PRODUCERS: ReadonlyArray<ProducerRule> = Object.freeze([
     identifiers: ["buildSchemaLint", "buildSchemaStats", "reviewSchemaOrphans"],
   },
   { specifierIncludes: "/brain/dead-ends.ts", identifiers: ["listDeadEnds", "recordDeadEnd"] },
+  // The compiled digests: both render preference records by principle.
+  { specifierIncludes: "/brain/digest.ts", identifiers: ["renderDigest"] },
+  {
+    specifierIncludes: "/brain/lessons.ts",
+    identifiers: ["regenerateLessons", "renderLessonsForReader"],
+  },
   {
     specifierIncludes: "/brain/claim-graph.ts",
     identifiers: [
@@ -458,12 +464,15 @@ function reasonProblems(entries: ReadonlyArray<VisibilitySurfaceEntry>): {
  *
  * 49 before the vocabulary gained `runDoctor` and the schema-admin record
  * views. The five new names are `brain_doctor` and `schema_inspect`,
- * which named a malformed reserved record by path (the doctor's repair
- * plan still does, so it is registered excluded), plus `brain_health`,
+ * which named a malformed reserved record by path (both are covered now
+ * that the repair plan is bounded by the caller's reach), plus `brain_health`,
  * `brain_status` and `schema_apply_mutations` on the file-level rule.
+ *
+ * 54 before the vocabulary gained the two compiled digests. The one new
+ * name is `brain_brief`, whose digest view renders preference records.
  */
-const MCP_TOOL_POPULATION_SIZE = 54;
-/** Measured: MCP resources + templates, all excluded. */
+const MCP_TOOL_POPULATION_SIZE = 55;
+/** Measured: MCP resources + templates. */
 const MCP_RESOURCE_POPULATION_SIZE = 8;
 /** Measured: hand-enumerated CLI verb mirrors. */
 const CLI_VERB_POPULATION_SIZE = 20;
@@ -525,12 +534,16 @@ describe("visibility surface census", () => {
         "brain_backlinks",
         "brain_bridges",
         "brain_clusters",
+        "brain_context",
         "brain_deep_synthesis",
+        "brain_doctor",
         "brain_eval",
         "brain_event_trace",
         "brain_file_context",
+        "brain_health",
         "brain_hygiene",
         "brain_idea_discovery",
+        "brain_pre_compress_pack",
         "brain_procedural_memory",
         "brain_query",
         "brain_recall_feedback",
@@ -559,12 +572,13 @@ describe("visibility surface census", () => {
       expect(advertised.size).toBe(MCP_RESOURCE_POPULATION_SIZE);
     });
 
-    test("the four templated readers are covered and the four whole-vault ones are not", () => {
-      // The split is the design, not an oversight: a templated reader is
-      // keyed by a caller-supplied id and is therefore root C, while the
-      // four whole-vault readers return Brain/active.md, the lessons
-      // digest and the status projection - shared artifacts by
-      // construction, which no page's reservation covers.
+    test("the templated readers and the three digests are covered, the status projection is not", () => {
+      // A templated reader is keyed by a caller-supplied id and is
+      // therefore root C. The active, lessons and activity digests are
+      // renders of preference records, so a reader is handed each without
+      // the records withheld from it. The status projection returns
+      // counts over the whole Brain layer, which no page's reservation
+      // covers.
       const byCategory = (category: string): string[] =>
         REGISTRY_BY_KIND(VISIBILITY_SURFACE_KIND.mcpResource)
           .filter((e) => e.category === category)
@@ -572,16 +586,14 @@ describe("visibility surface census", () => {
           .toSorted();
       expect(byCategory(VISIBILITY_SURFACE_CATEGORY.covered)).toEqual([
         "osb://backlinks/{id}",
-        "osb://log/{date}",
-        "osb://preference/{id}",
-        "osb://topic/{slug}",
-      ]);
-      expect(byCategory(VISIBILITY_SURFACE_CATEGORY.excluded)).toEqual([
         "osb://digest/latest",
         "osb://lessons",
+        "osb://log/{date}",
+        "osb://preference/{id}",
         "osb://preferences/active",
-        "osb://status",
+        "osb://topic/{slug}",
       ]);
+      expect(byCategory(VISIBILITY_SURFACE_CATEGORY.excluded)).toEqual(["osb://status"]);
     });
   });
 

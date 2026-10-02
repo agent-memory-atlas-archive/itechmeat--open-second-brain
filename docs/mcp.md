@@ -1080,7 +1080,9 @@ generates deduped triggers from semantic-health and retention data,
 `acknowledge` / `dismiss` / `act` transition one trigger. Cooldown keys
 keep the same issue from reappearing while an earlier trigger is open
 or cooling down; `brain_brief` `view="morning"` surfaces capped pending
-triggers and marks them delivered (once per `trigger_cooldown_days`).
+triggers and marks them delivered (once per `trigger_cooldown_days`) for
+a caller at local reach; below local reach it shows no trigger section
+and marks nothing delivered, because the queue is the operator's own.
 `suppress` silences a cooldown key indefinitely - it is legal from any
 status and carries no clock, so the finding never re-nags - and
 `unsuppress` restores the status suppression interrupted along with its
@@ -2062,3 +2064,33 @@ format characters), when it contains NUL, or when it exceeds the cap.
   plan's `unclassifiable` counts of other files are the same at every
   reach), and `brain_ingest_source` records a source in
   the content manifest only in the trusted lane.
+- Since v1.68.0 more readers treat a record the caller cannot read at its
+  reach as absent. `brain_context`, the `osb://preferences/active`
+  resource and `brain_pre_compress_pack` hand a remote caller the active
+  digest without such a preference or retired record: its line, its
+  count and its most-applied entry go, and the pack's top-K walk skips
+  it. A remote caller always gets that render, stamped with the file's
+  `generated_at`; a local caller with no owner scope still gets the
+  file's own bytes. `brain_brief` `view="digest"`, the
+  `osb://digest/latest` resource and the `osb://lessons` resource do the
+  same for the activity and lessons digests: such a record, its rows,
+  its counts, the log events naming it and their share of the agent
+  summary go, and a remote digest neither takes a report snapshot nor
+  shows its delta. `brain_brief` `view="morning"` leaves such a
+  preference out of its list, and below local reach it shows no pending
+  trigger and marks none delivered. The resource also follows the owner gate now, as
+  `brain_context` does, so under `integrity.owner_scope_delivery: fail`
+  it answers with the caller's own view. `brain_health` drops a finding
+  any of whose members the caller cannot read, and `brain_doctor` with
+  `repair` derives its plan only from findings the caller can read: such
+  a record is neither planned, counted under `unfixable`, nor written by
+  `apply`. The generic page readers (`brain_search` and every other
+  tool that reads a page by path) no longer return the compiled digest
+  pages `Brain/active.md` and `Brain/lessons.md` to a remote caller,
+  because those pages compile records that may be reserved; a remote
+  client reads the active digest through the three readers above and the
+  lessons digest through `osb://lessons`.
+  `brain_ingest_source` with `pre_extract` reads Terraform
+  (`.tf`, `.tfvars`) and redacts credentials in import specifiers
+  (see `o2b brain pre-extract` in
+  [`cli-reference.md`](cli-reference.md)).

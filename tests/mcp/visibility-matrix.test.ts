@@ -320,7 +320,10 @@ const SCOPED_CALLS: ReadonlyArray<ProbeEntry> = [
   },
   {
     name: "brain_brief",
-    calls: [{ args: { view: "morning" }, reason: "the session-start summary view" }],
+    calls: [
+      { args: { view: "morning" }, reason: "the session-start summary view" },
+      { args: { view: "digest" }, reason: "the activity digest renders preference records" },
+    ],
   },
   {
     name: "brain_retrieval_plan",
@@ -504,14 +507,10 @@ const STILL_NAMED_AT_REMOTE: ReadonlySet<string> = new Set([
   "brain_analytics view=concept_synthesis",
   "brain_analytics view=timeline",
   "brain_anticipatory_context",
-  "brain_brief view=morning",
   "brain_claims operation=at",
   "brain_claims operation=current",
   "brain_claims operation=history",
-  "brain_context",
   "brain_context_pack",
-  "brain_doctor #2",
-  "brain_pre_compress_pack",
   "brain_retention",
   "brain_scaffold_stub action=list",
   "brain_stale_scan",

@@ -32,8 +32,10 @@ import {
 import { buildOperatorSummary } from "../../core/brain/trust/operator-summary.ts";
 import { isoDate } from "../../core/brain/time.ts";
 import { captureReportDelta } from "../../core/brain/report-snapshot.ts";
+import { TRANSPORT_REACH } from "../../core/graph/transport-reach.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
-import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
+import { contextReach, type ServerContext, type ToolDefinition } from "../tool-contract.ts";
+import { readableAtContextReach, readableAtContextReachOrUndefined } from "./reach-readable.ts";
 import { vaultPathField } from "../vault-path-field.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
 import {
@@ -54,6 +56,12 @@ import {
 import type { ProgressSink } from "../../core/brain/progress.ts";
 import { OPERATION } from "../../core/brain/safeguard.ts";
 
+/** What a reader outside the operator's queue is told about it: nothing. */
+const NO_TRIGGER_QUEUE_FAILURES: TriggerQueueFailures = Object.freeze({
+  unreadable: Object.freeze([]),
+  queueError: null,
+});
+
 async function toolBrainMorningBrief(
   ctx: ServerContext,
   args: Record<string, unknown>,
@@ -73,10 +81,12 @@ async function toolBrainMorningBrief(
   );
   const now = new Date();
   const agentScope = coerceAgentScope(ctx, args, true);
+  const readable = readableAtContextReachOrUndefined(ctx);
   const brief = buildMorningBrief(ctx.vault, {
     now,
     topK,
     ...(agentScope !== undefined ? { agentScope } : {}),
+    ...(readable !== undefined ? { readable } : {}),
     lookbackDays,
     ...(maxCharsPerMemory !== undefined ? { maxCharsPerMemory } : {}),
     ...(maxTotalChars !== undefined ? { maxTotalChars } : {}),
@@ -91,18 +101,27 @@ async function toolBrainMorningBrief(
   // queue: the one outcome the anti-nag ledger exists to rule out. The
   // records that could not be read are collected first and reported
   // alongside whatever did render.
-  const triggerFailures: TriggerQueueFailures = readTriggerQueueFailures(ctx.vault, now);
+  //
+  // The queue and its delivery state belong to the local operator: a
+  // reader below local reach is shown no trigger, no queue failure, and
+  // marks nothing delivered.
+  const operatorQueue = contextReach(ctx) === TRANSPORT_REACH.local;
+  const triggerFailures: TriggerQueueFailures = operatorQueue
+    ? readTriggerQueueFailures(ctx.vault, now)
+    : NO_TRIGGER_QUEUE_FAILURES;
   let triggerSection: ReturnType<typeof renderTriggerBriefSection> | null = null;
   let triggerQueueError = triggerFailures.queueError;
-  try {
-    triggerSection = renderTriggerBriefSection(ctx.vault, {
-      now,
-      cooldownDays: resolveTriggerCooldownDays(ctx.configPath ?? undefined),
-    });
-    if (triggerSection.triggers.length > 0) deliverBriefTriggers(ctx.vault, triggerSection, now);
-  } catch (err) {
-    triggerSection = null;
-    triggerQueueError = (err as Error).message ?? String(err);
+  if (operatorQueue) {
+    try {
+      triggerSection = renderTriggerBriefSection(ctx.vault, {
+        now,
+        cooldownDays: resolveTriggerCooldownDays(ctx.configPath ?? undefined),
+      });
+      if (triggerSection.triggers.length > 0) deliverBriefTriggers(ctx.vault, triggerSection, now);
+    } catch (err) {
+      triggerSection = null;
+      triggerQueueError = (err as Error).message ?? String(err);
+    }
   }
   const failureText = renderTriggerQueueFailures({
     unreadable: triggerFailures.unreadable,
@@ -149,33 +168,34 @@ async function toolBrainDigest(
   // window even when the caller omitted `until`.
   const effectiveUntil = until ?? new Date();
   const agentScope = coerceAgentScope(ctx, args, true);
-  const result = renderDigest(ctx.vault, {
-    ...(since ? { since } : {}),
-    until: effectiveUntil,
-    format,
-    linkOutputFormat: resolveLinkOutputFormat(ctx.configPath ?? undefined),
-    ...(agentScope !== undefined ? { agentScope } : {}),
-  });
+  // Below local reach the digest is rendered for this reader: a record it
+  // cannot read is absent from every row and count.
+  const restricted = contextReach(ctx) !== TRANSPORT_REACH.local;
+  const renderFor = (renderFormat: DigestFormat, readable?: (rel: string) => boolean) =>
+    renderDigest(ctx.vault, {
+      ...(since ? { since } : {}),
+      until: effectiveUntil,
+      format: renderFormat,
+      linkOutputFormat: resolveLinkOutputFormat(ctx.configPath ?? undefined),
+      ...(agentScope !== undefined ? { agentScope } : {}),
+      ...(readable !== undefined ? { readable } : {}),
+    });
+  const result = renderFor(format, restricted ? readableAtContextReach(ctx) : undefined);
 
   const envelope: Record<string, unknown> = {
     format,
     empty: result.empty,
     content: result.content,
   };
+  // The snapshot is the vault's own run-over-run record, diffed over the
+  // digest every record feeds, so a reader below local reach neither
+  // takes one nor is shown the delta.
+  if (restricted) return envelope;
   // Snapshot the structured summary, not the rendered string: render
   // a JSON digest for the snapshot regardless of the caller's format
   // so the run-over-run diff keys on data.
   const digestDate = isoDate(effectiveUntil);
-  const snapshotSource =
-    format === "json"
-      ? result.content
-      : renderDigest(ctx.vault, {
-          ...(since ? { since } : {}),
-          until: effectiveUntil,
-          format: "json",
-          linkOutputFormat: resolveLinkOutputFormat(ctx.configPath ?? undefined),
-          ...(agentScope !== undefined ? { agentScope } : {}),
-        }).content;
+  const snapshotSource = format === "json" ? result.content : renderFor("json").content;
   let parsedSnapshot: unknown = null;
   try {
     parsedSnapshot = JSON.parse(snapshotSource);

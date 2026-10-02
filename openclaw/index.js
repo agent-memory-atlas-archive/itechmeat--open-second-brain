@@ -1976,7 +1976,7 @@ var BEARER_RE = /\b(Bearer\s+)([A-Za-z0-9._\-+/=]+)/gi;
 var JWT_RE = /\b(?:eyJ|eyA|ewo|ew0|ewk)[A-Za-z0-9_-]{9,65533}(?:\.[A-Za-z0-9_-]{4,65536}){2}(?![A-Za-z0-9_-])/g;
 var IPV4_OCTET = "(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
 var IPV4 = `${IPV4_OCTET}(?:\\.${IPV4_OCTET}){3}`;
-var BASIC_AUTH_URL_RE = /\b([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^\s/:@]*):(?!\d{1,5}\/)([^\s@]+)@/g;
+var BASIC_AUTH_URL_RE = /\b([a-zA-Z][a-zA-Z0-9+.-]{0,31}:\/\/)([^\s/:@]{0,256}):(?!\d{1,5}\/)([^\s@]{1,4096})@/g;
 var IPV4_PORT_RE = new RegExp(`\\b${IPV4}:\\d{1,5}\\b`, "g");
 var FQDN_PORT_SOURCE_EXTS = "js|ts|tsx|jsx|py|json|rs|go|java|rb|php|c|cc|cpp|cxx|h|hpp|css|scss|sass|less|" + "html|htm|xml|yaml|yml|toml|ini|cfg|md|markdown|sh|bash|sql|vue|svelte|gradle|" + "kt|swift|scala|clj|ex|exs|erl|elm|dart|lua|pl|pm|r|jl|tf|lock|map|txt|csv|log";
 var FQDN_PORT_RE = new RegExp("\\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.)+(?!(" + FQDN_PORT_SOURCE_EXTS + "):\\d)[a-zA-Z]{2,63}:\\d{1,5}\\b", "g");
@@ -2039,6 +2039,32 @@ function redactBareTokens(text) {
 function redactUrlCredentials(text) {
   return text.replace(BASIC_AUTH_URL_RE, (_m, scheme) => `${scheme}${PLACEHOLDER}@`);
 }
+var CREDENTIAL_QUERY_KEYS = Object.freeze([
+  "sshkey",
+  "token",
+  "access_token",
+  "password",
+  "secret",
+  "signature",
+  "sig",
+  "key",
+  "aws_access_key_id",
+  "aws_access_key_secret",
+  "aws_secret_access_key",
+  "aws_access_token",
+  "x-amz-signature",
+  "x-amz-credential",
+  "x-amz-security-token",
+  "x-goog-signature",
+  "x-goog-credential"
+]);
+var CREDENTIAL_QUERY_KEY_SET = new Set(CREDENTIAL_QUERY_KEYS);
+var TOKEN_USERINFO_SCHEMES = new Set([
+  "http:",
+  "https:",
+  "git+http:",
+  "git+https:"
+]);
 function redactInfraTopology(text) {
   let out = redactUrlCredentials(text);
   out = out.replace(IPV4_PORT_RE, PLACEHOLDER);
@@ -2436,6 +2462,37 @@ import { dirname as dirname4, join as join5 } from "node:path";
 import { existsSync as existsSync2, readdirSync, realpathSync } from "node:fs";
 import { dirname as dirname3, join as join4, resolve as resolve3 } from "node:path";
 
+// src/core/project-manifests.ts
+var MANIFEST_ECOSYSTEM = Object.freeze({
+  npm: "npm",
+  pypi: "pypi",
+  cargo: "cargo",
+  go: "go",
+  maven: "maven",
+  gradle: "gradle",
+  rubygems: "rubygems",
+  composer: "composer"
+});
+function spec(file, ecosystem, dependencyReadable) {
+  return Object.freeze({ file, ecosystem, dependencyReadable });
+}
+var DEPENDENCY_MANIFESTS = Object.freeze([
+  spec("package.json", MANIFEST_ECOSYSTEM.npm, true),
+  spec("pyproject.toml", MANIFEST_ECOSYSTEM.pypi, true),
+  spec("Cargo.toml", MANIFEST_ECOSYSTEM.cargo, true),
+  spec("go.mod", MANIFEST_ECOSYSTEM.go, true),
+  spec("pom.xml", MANIFEST_ECOSYSTEM.maven, false),
+  spec("build.gradle", MANIFEST_ECOSYSTEM.gradle, false),
+  spec("Gemfile", MANIFEST_ECOSYSTEM.rubygems, false),
+  spec("composer.json", MANIFEST_ECOSYSTEM.composer, false)
+]);
+var TYPESCRIPT_CONFIG_FILE = "tsconfig.json";
+var CODE_MANIFEST_FILES = Object.freeze([
+  ...DEPENDENCY_MANIFESTS.map((manifest) => manifest.file),
+  TYPESCRIPT_CONFIG_FILE
+]);
+var SPEC_BY_FILE = new Map(DEPENDENCY_MANIFESTS.map((manifest) => [manifest.file, manifest]));
+
 // src/core/partner/codegraph-health.ts
 var GRAPH_HEALTH_CODES = Object.freeze({
   emptyGraph: "empty-graph",
@@ -2494,17 +2551,6 @@ function summarizeGraphHealth(report) {
 }
 
 // src/core/partner/codegraph.ts
-var CODE_MANIFESTS = [
-  "package.json",
-  "pyproject.toml",
-  "Cargo.toml",
-  "go.mod",
-  "tsconfig.json",
-  "Gemfile",
-  "composer.json",
-  "build.gradle",
-  "pom.xml"
-];
 var DEFAULT_LIMIT = 50;
 var CODEGRAPH_CLI = Object.freeze({
   bin: "codegraph",
@@ -2521,7 +2567,7 @@ function isCodeProject(dir) {
       return false;
     if (!isDir(join4(dir, ".git")))
       return false;
-    return CODE_MANIFESTS.some((m) => existsSync2(join4(dir, m)));
+    return CODE_MANIFEST_FILES.some((m) => existsSync2(join4(dir, m)));
   } catch {
     return false;
   }

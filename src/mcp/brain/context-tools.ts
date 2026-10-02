@@ -19,11 +19,12 @@ import { loadBrainConfig, resolveStandingRulesMaxChars } from "../../core/brain/
 import type { BrainConfig } from "../../core/brain/types.ts";
 import {
   regenerateActive,
-  renderActive,
+  readerNarrowsActive,
+  renderActiveForReader,
   type RegenerateActiveResult,
 } from "../../core/brain/active.ts";
-import { resolveOwnerScopeDelivery } from "../../core/brain/preferences-collect.ts";
 import { computeMaintenanceOverdueFlag } from "../../core/brain/status.ts";
+import { TRANSPORT_REACH } from "../../core/graph/transport-reach.ts";
 import { parseFrontmatter } from "../../core/vault.ts";
 import { readVaultInstructionFile } from "../../core/brain/vault-instruction-file.ts";
 import { normalizeAgentArgument } from "../../core/agent-identity.ts";
@@ -51,9 +52,10 @@ import {
 } from "../../core/brain/pinned.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
 import { TOOL_ERROR_CODE, type ToolErrorCode } from "../tool-error-codes.ts";
-import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
+import { contextReach, type ServerContext, type ToolDefinition } from "../tool-contract.ts";
 import { VAULT_PATH_OUTPUT_SCHEMA, vaultPathField } from "../vault-path-field.ts";
 import { coerceStr, coerceInt, unknownOperationError } from "../coerce.ts";
+import { readableAtContextReachOrUndefined } from "./reach-readable.ts";
 import { vaultRelativeSafe } from "./shared.ts";
 
 /**
@@ -418,23 +420,26 @@ async function toolBrainContext(ctx: ServerContext): Promise<Record<string, unkn
       generatedAt = null;
     }
   }
-  // Owner-scope isolation (context-integrity-gates, Unit A) applies to
-  // what this ONE caller is handed, not to what is on disk. This surface
-  // takes no arguments, so `ServerContext.agentName` is its only source of
-  // identity, and the gate decides whether it narrows: `enforcedScope` is
-  // non-null only under `fail`, so the branch is dead on a default vault
-  // and the delivered bytes stay the file's own. The re-render reuses the
-  // stamp already on disk so the scoped view names the same generation the
-  // shared file does.
+  // What this ONE caller is handed, not what is on disk, answers at its
+  // reach and under the owner gate. This surface takes no arguments, so
+  // `ServerContext.agentName` is its only source of identity and the
+  // minted reach its only source of distance. A preference or retired
+  // record the caller cannot read is absent from its digest - principle,
+  // counts and most-applied entry alike. A local caller with no enforced
+  // owner scope keeps the file's own bytes; any other caller gets the
+  // reader render, decided on its reach rather than on what is withheld,
+  // and stamped with the generation already on disk.
   if (!error) {
-    const delivery = resolveOwnerScopeDelivery(ctx.vault, ctx.agentName);
-    if (delivery.enforcedScope !== null) {
-      const scoped = renderActive(ctx.vault, {
-        agentScope: delivery.enforcedScope,
-        ...(generatedAt !== null ? { generatedAt } : {}),
-      });
-      content = scoped.document;
-      counts = scoped.counts;
+    const readable = readableAtContextReachOrUndefined(ctx);
+    const reader = {
+      ...(readable !== undefined ? { readable } : {}),
+      restricted: contextReach(ctx) !== TRANSPORT_REACH.local,
+      ...(ctx.agentName !== undefined ? { agentScope: ctx.agentName } : {}),
+    };
+    if (readerNarrowsActive(ctx.vault, reader)) {
+      const narrowed = renderActiveForReader(ctx.vault, reader);
+      content = narrowed.document;
+      counts = narrowed.counts;
     }
   }
 

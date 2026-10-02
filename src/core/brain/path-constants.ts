@@ -197,6 +197,20 @@ export const BRAIN_MANUAL_FILE = "_BRAIN.md";
 export const BRAIN_ACTIVE_FILE = "active.md";
 export const BRAIN_LESSONS_FILE = "lessons.md";
 /**
+ * The compiled digest pages, vault-relative. Each is generated from records
+ * (preferences, retired preferences, dead-ends) that may reserve themselves
+ * against remote reads, yet the page carries no `visibility:` of its own, so
+ * a generic page reader cannot measure it. The shared reach predicate
+ * (`isPathReadableAtReach`) therefore withholds these pages at remote reach;
+ * their dedicated readers (`brain_context`, `brain_pre_compress_pack`, and
+ * the `osb://preferences/active` and `osb://lessons` resources) render the
+ * digest per reader instead.
+ */
+export const BRAIN_COMPILED_DIGEST_RELS: ReadonlyArray<string> = Object.freeze([
+  posix.join(BRAIN_ROOT_REL, BRAIN_ACTIVE_FILE),
+  posix.join(BRAIN_ROOT_REL, BRAIN_LESSONS_FILE),
+]);
+/**
  * Operator-authored standing rules injected at the head of every session
  * preamble (silence-is-not-an-answer, U8).
  *
@@ -269,6 +283,20 @@ export function brainRootSegments(relPath: string): ReadonlyArray<string> | null
   const head = segments[0];
   if (head === undefined || foldSegment(head) !== foldSegment(BRAIN_ROOT_REL)) return null;
   return segments.slice(1);
+}
+
+/**
+ * Does `relPath` name a compiled digest page ({@link BRAIN_COMPILED_DIGEST_RELS})
+ * in any spelling the filesystem resolves to it? Read with the same
+ * normalization and case-folding as {@link brainRootSegments}, so a leading
+ * separator, a backslash, dot segments, a case variant or a trailing dot cannot
+ * walk past a check that knew one spelling only.
+ */
+export function isCompiledDigestRel(relPath: string): boolean {
+  const tail = brainRootSegments(relPath);
+  if (tail === null || tail.length !== 1) return false;
+  const name = foldSegment(tail[0]!);
+  return [BRAIN_ACTIVE_FILE, BRAIN_LESSONS_FILE].some((file) => foldSegment(file) === name);
 }
 
 /** Does `relPath` land at or under `Brain/`? See {@link brainRootSegments}. */

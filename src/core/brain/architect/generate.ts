@@ -9,12 +9,13 @@
  * regenerates byte-identically (the scanner is deterministic and the
  * renderer adds no timestamps).
  *
- * DECLARED EXCEPTIONS to that byte-identity guarantee - two of them, and
- * no others. Both are scoped to their own region: every other region, and
- * every byte of operator prose, still regenerates identically, and each
- * exception carries the whole provenance of what it was stamped from, so
- * a stale stamp describes its own reading rather than passing for a
- * current one.
+ * DECLARED EXCEPTIONS - three of them, and no others. The first two are
+ * exceptions to the byte-identity guarantee, each scoped to its own
+ * region: every other region, and every byte of operator prose, still
+ * regenerates identically, and each carries the whole provenance of what
+ * it was stamped from, so a stale stamp describes its own reading rather
+ * than passing for a current one. The third is an exception to the
+ * write-once frontmatter rule below.
  *
  *   - the overview's `codegraph` region states the codegraph partner's
  *     verdict, which is a fact about the machine and the partner index,
@@ -24,15 +25,27 @@
  *   - the key-decisions note lists the repo's ADR candidates, which the
  *     commit miner writes into the VAULT; mining new commits moves those
  *     bytes with no change to the repository at all. Stamped with each
- *     candidate's sha and matched signals.
+ *     candidate's sha and matched signals;
+ *   - a module note's `depends_on` frontmatter key is GENERATOR-OWNED and
+ *     rewritten on every run: the modules this module's manifests declare
+ *     a dependency on, as a YAML block list of quoted wikilinks, sorted,
+ *     and absent when there is none. It lives in frontmatter because a
+ *     frontmatter field named after a relation is the one way a typed
+ *     edge enters the search index; a region cannot carry one. The
+ *     generator touches exactly that key and no other, and overwrites
+ *     whatever an operator typed under it. It does not break byte
+ *     identity: an unchanged project renders the same key, and the merge
+ *     then returns the note's bytes untouched.
  *
  * The overview's `module-map` diagram is NOT an exception: it renders the
  * same scanned facts as every other region and moves only when the tree
- * does.
+ * does. Neither are the `dependencies` and `module-dependencies` regions:
+ * they render manifest facts, which are files in the tree.
  *
  * Frontmatter is written ONCE at file creation and never rewritten -
  * it carries static identity (kind, repo key, path), while every fact
- * that can change between scans lives inside a region.
+ * that can change between scans lives inside a region. The one exception
+ * is the generator-owned `depends_on` key above.
  *
  * Module REMOVAL keeps the old module note on disk (the operator may
  * have annotated it); the overview's module region reflects only the
@@ -71,10 +84,20 @@ import { buildRegionDocument, mergeRegions } from "../regions.ts";
 import type { Region } from "../regions.ts";
 import type { Safeguard } from "../safeguard.ts";
 import { acquireLockSyncWithRetry, LOCK_WAIT_INTERACTIVE_MS } from "../sync-lockfile.ts";
+import { DEPENDENCY_MANIFESTS } from "../../project-manifests.ts";
+import type { ManifestEcosystem } from "../../project-manifests.ts";
 import { listRepoDecisionCandidates } from "./decisions.ts";
 import type { DecisionCandidateFact } from "./decisions.ts";
-import { ARCHITECT_STAGE, compareStable, scanProject } from "./scan.ts";
-import type { ModuleFact, ProjectFacts } from "./scan.ts";
+import { compareCodePoints, MANIFEST_STATUS, oneLine } from "./manifests.ts";
+import type { DependencyGroup, ManifestReading } from "./manifests.ts";
+import {
+  ARCHITECT_STAGE,
+  compareStable,
+  manifestIdentity,
+  moduleManifestIdentities,
+  scanProject,
+} from "./scan.ts";
+import type { ModuleDependency, ModuleFact, ProjectFacts } from "./scan.ts";
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
 
 export interface GenerateArchDocsOptions {
@@ -104,6 +127,13 @@ export interface GenerateArchDocsResult {
   /** The key-decisions note, one per repo, beside the overview. */
   readonly decisionsPath: string;
   readonly modulePaths: ReadonlyArray<string>;
+  /**
+   * Every dependency manifest the scan found, root and modules, with its
+   * status, sorted by path. A scan fact like `modulePaths`: it goes out
+   * on the CLI's JSON envelope, where a manifest that was not read is the
+   * operator's to fix.
+   */
+  readonly manifests: ReadonlyArray<ManifestReading>;
   /**
    * What this run did to the notes: how many it wrote for the first time,
    * how many it rewrote, and how many it found already correct. They sum
@@ -153,7 +183,7 @@ function languagesLine(languages: Readonly<Record<string, number>>): string {
   if (entries.length === 0) return "none detected";
   return entries
     .slice(0, LANGUAGES_LINE_CAP)
-    .map(([ext, count]) => `${ext} (${count})`)
+    .map(([ext, count]) => `${oneLine(ext)} (${count})`)
     .join(", ");
 }
 
@@ -229,7 +259,8 @@ function codegraphRegionBody(report: CodegraphReport): string {
  *
  * Line breaks are folded to a space rather than escaped: a directory name
  * may legally contain one, and `<br/>` is the label's own field
- * separator here.
+ * separator here. A backtick becomes its entity too, so a run of three
+ * cannot close the Markdown fence the diagram sits in.
  */
 function mermaidLabel(text: string): string {
   return text
@@ -237,6 +268,7 @@ function mermaidLabel(text: string): string {
     .replaceAll('"', "#quot;")
     .replaceAll("<", "#lt;")
     .replaceAll(">", "#gt;")
+    .replaceAll("`", "#96;")
     .replaceAll(/[\r\n]+/g, " ");
 }
 
@@ -250,7 +282,9 @@ const NO_LANGUAGE = "no language detected";
  * scanner records no import graph at all (`scan.ts`: "Import-graph
  * analysis is explicitly out of scope"), so every edge here runs from the
  * project root to a module it contains; a module-to-module edge would be
- * a relation nothing measured.
+ * a relation nothing measured. The edges manifests DECLARE between modules
+ * render in their own `module-dependencies` region, under their own claim,
+ * so this diagram's claim stays true.
  *
  * Node ids are positional (`mod0`, `mod1`, ...), never derived from the
  * module name. A directory name is arbitrary bytes and a Mermaid node id
@@ -258,7 +292,7 @@ const NO_LANGUAGE = "no language detected";
  * must also stay collision-free - an index needs neither.
  */
 function moduleMapBody(facts: ProjectFacts): string {
-  const modules = facts.modules.toSorted((a, b) => compareStable(a.name, b.name));
+  const modules = modulesByName(facts);
   const lines = [
     "Containment only: the scan records no import edges, so this diagram claims none.",
     "",
@@ -277,44 +311,334 @@ function moduleMapBody(facts: ProjectFacts): string {
   return lines.join("\n");
 }
 
+/** Ecosystems in the manifest precedence order, each once. */
+const ECOSYSTEM_ORDER: ReadonlyArray<ManifestEcosystem> = Object.freeze([
+  ...new Set(DEPENDENCY_MANIFESTS.map((spec) => spec.ecosystem)),
+]);
+
+/** What the overview's `dependencies` region says when the tree has no manifest. */
+const NO_MANIFEST = "No dependency manifest found.";
+
+/** What a module note's `dependencies` region says when the module has no manifest. */
+const NO_MODULE_MANIFEST = "No dependency manifest in this module.";
+
+/** What an ecosystem's runtime list says when its read manifests declare nothing. */
+const NO_RUNTIME_DEPENDENCY = "none declared";
+
+/**
+ * The claim the `module-dependencies` region makes, above its diagram.
+ * The edges are DECLARED, not measured: the scan reads manifests and no
+ * import graph, so the sentence names where every edge came from.
+ */
+const MODULE_DEPENDENCIES_CLAIM =
+  "Declared by manifests, not measured from imports: an edge means the module's " +
+  "manifest names exactly one other module's manifest as a runtime dependency.";
+
+/** What the `module-dependencies` region says when no module declares an edge. */
+const NO_MODULE_DEPENDENCY =
+  "No module's manifest names exactly one other module's manifest as a runtime dependency.";
+
+/** What a module note says when its module declares no edge. */
+const NO_DEPENDS_ON = "Depends on: no other module";
+
+/** One manifest line: its path, ecosystem, status and, when it has one, the detail. */
+function manifestLine(reading: ManifestReading): string {
+  const detail = reading.detail === undefined ? "" : ` - ${oneLine(reading.detail)}`;
+  return `- ${codeSpanPath(reading.path)} (${reading.ecosystem}): ${reading.status}${detail}`;
+}
+
+/** The groups a manifest counts but does not list, summed per group, zero counts omitted. */
+function groupCountsLine(
+  ecosystem: string,
+  readings: ReadonlyArray<ManifestReading>,
+): string | null {
+  const totals = new Map<DependencyGroup, number>();
+  for (const reading of readings) {
+    for (const { group, count } of reading.otherGroups) {
+      totals.set(group, (totals.get(group) ?? 0) + count);
+    }
+  }
+  if (totals.size === 0) return null;
+  const parts = [...totals.entries()]
+    .toSorted((a, b) => compareStable(a[0], b[0]))
+    .map(([group, count]) => `${group} ${count}`);
+  return `Not listed (${ecosystem}): ${parts.join(", ")}`;
+}
+
+/**
+ * The manifest list and, per ecosystem with a read manifest, its runtime
+ * dependencies and the count line for the groups not listed. `exclude`
+ * holds the canonical names, per ecosystem, that are left out of the
+ * runtime lists (a module's own manifest name, on the overview).
+ */
+function dependencySections(
+  readings: ReadonlyArray<ManifestReading>,
+  exclude: ReadonlySet<string>,
+): string {
+  const sections = [["Manifests:", ...readings.map(manifestLine)].join("\n")];
+  for (const ecosystem of ECOSYSTEM_ORDER) {
+    const read = readings.filter(
+      (reading) => reading.ecosystem === ecosystem && reading.status === MANIFEST_STATUS.read,
+    );
+    if (read.length === 0) continue;
+    const names = [...new Set(read.flatMap((reading) => reading.fact?.dependencies ?? []))]
+      .filter((name) => !exclude.has(manifestIdentity(ecosystem, name)))
+      .toSorted(compareCodePoints);
+    const runtime =
+      names.length === 0
+        ? `Runtime dependencies (${ecosystem}): ${NO_RUNTIME_DEPENDENCY}`
+        : [`Runtime dependencies (${ecosystem}):`, ...names.map((name) => `- ${name}`)].join("\n");
+    const counts = groupCountsLine(ecosystem, read);
+    sections.push(counts === null ? runtime : `${runtime}\n\n${counts}`);
+  }
+  return sections.join("\n\n");
+}
+
+/**
+ * The overview's `dependencies` region: every manifest the scan found,
+ * root and modules, with its status; the runtime dependencies per
+ * ecosystem with the names that bind to exactly one module left out
+ * (those are modules, drawn in `module-dependencies`); one count line per
+ * ecosystem for the rest.
+ */
+function dependenciesBody(facts: ProjectFacts): string {
+  if (facts.manifests.length === 0) return NO_MANIFEST;
+  return dependencySections(facts.manifests, moduleManifestIdentities(facts.modules));
+}
+
+/** The modules in the order both diagrams number them. */
+function modulesByName(facts: ProjectFacts): ReadonlyArray<ModuleFact> {
+  return facts.modules.toSorted((a, b) => compareStable(a.name, b.name));
+}
+
+/**
+ * The declared module edges, as a Mermaid flowchart under its claim.
+ * Node ids are the same positional ids `module-map` uses, so one module
+ * is one id across both diagrams.
+ */
+function moduleDependenciesBody(facts: ProjectFacts): string {
+  const edges = linkableEdges(facts);
+  if (edges.length === 0) return NO_MODULE_DEPENDENCY;
+  const ids = new Map(modulesByName(facts).map((module, index) => [module.name, `mod${index}`]));
+  const node = (name: string): string => `${ids.get(name)}["${mermaidLabel(name)}"]`;
+  return [
+    MODULE_DEPENDENCIES_CLAIM,
+    "",
+    "```mermaid",
+    "graph LR",
+    ...edges.map((edge) => `  ${node(edge.from)} --> ${node(edge.to)}`),
+    "```",
+  ].join("\n");
+}
+
+/**
+ * A module name a wikilink cannot carry: a control character (C0, DEL or
+ * C1) breaks the line or the note's YAML, `[`, `]` and `|` end the link or its alias early, and `#` and `^`
+ * turn the target into a heading or block reference.
+ */
+// oxlint-disable-next-line no-control-regex -- matching control characters is the point
+const UNLINKABLE_MODULE_NAME = /[\u0000-\u001f\u007f-\u009f[\]|#^]/;
+
+function isLinkable(name: string): boolean {
+  return !UNLINKABLE_MODULE_NAME.test(name);
+}
+
+/** What the overview's module list says before the modules it cannot link. */
+const UNLINKABLE_MODULES_LEAD = "Not linked (the name holds a character a link cannot carry):";
+
+/** A path on one line inside a code span, with no backtick to end the span. */
+function codeSpanPath(path: string): string {
+  return `\`${oneLine(path).replaceAll("`", "\\u0060")}\``;
+}
+
+/** A name on one line inside a code span: JSON escapes, and no backtick to end the span. */
+function codeSpanName(name: string): string {
+  return `\`${JSON.stringify(name).replaceAll("`", "\\u0060")}\``;
+}
+
+/** The declared edges between modules a link can name; an edge touching any other is left out. */
+function linkableEdges(facts: ProjectFacts): ReadonlyArray<ModuleDependency> {
+  return facts.moduleDependencies.filter((edge) => isLinkable(edge.from) && isLinkable(edge.to));
+}
+
+/** The wikilink to one module's note, as the overview's module list writes it. */
+function moduleLink(key: string, name: string): string {
+  return `[[Brain/projects/arch/${key}/modules/${name}|${name}]]`;
+}
+
+/**
+ * The frontmatter key the generator owns on module notes. Named after the
+ * relation it produces, because the indexer turns a frontmatter field
+ * named after a known relation into typed links of that relation.
+ */
+export const DEPENDS_ON_KEY = "depends_on";
+
+/** The fence that opens and closes a note's frontmatter. */
+const FRONTMATTER_FENCE = "---";
+
+/** A YAML double-quoted scalar: backslash and quote are the two characters it escapes. */
+function yamlQuoted(text: string): string {
+  const escaped = text
+    .replaceAll("\\", "\\\\")
+    .replaceAll('"', '\\"')
+    .replace(CONTROL_CHARACTER, (c) => YAML_ESCAPES.get(c) ?? yamlHexEscape(c));
+  return `"${escaped}"`;
+}
+
+// oxlint-disable-next-line no-control-regex -- matching control characters is the point
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/g;
+/** The short escapes YAML's double-quoted style defines for the common controls. */
+const YAML_ESCAPES: ReadonlyMap<string, string> = new Map([
+  ["\n", "\\n"],
+  ["\t", "\\t"],
+  ["\r", "\\r"],
+]);
+
+function yamlHexEscape(c: string): string {
+  return `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`;
+}
+
+/** A name as a plain YAML scalar when it is one, else double-quoted. */
+const PLAIN_YAML_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
+
+function yamlName(name: string): string {
+  return PLAIN_YAML_NAME.test(name) ? name : yamlQuoted(name);
+}
+
+/** The `depends_on` key as frontmatter lines, or no lines when the module has no edge. */
+function dependsOnLines(key: string, targets: ReadonlyArray<string>): ReadonlyArray<string> {
+  if (targets.length === 0) return [];
+  return [
+    `${DEPENDS_ON_KEY}:`,
+    ...targets.map((name) => `  - ${yamlQuoted(moduleLink(key, name))}`),
+  ];
+}
+
+/** A note whose frontmatter opens and never closes; the generator will not guess where it ends. */
+export class ArchFrontmatterError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ArchFrontmatterError";
+  }
+}
+
+/** A line without the `\r` a CRLF note leaves on it. */
+function bare(line: string): string {
+  return line.replace(/\r$/, "");
+}
+
+/**
+ * Rewrite one generator-owned frontmatter key, leaving every other byte
+ * of `text` as it was.
+ *
+ * The key's extent is its own line plus every following line that is
+ * indented or a block-list item, which is how YAML continues a value.
+ * Rendered `lines` replace that extent in place, or are appended before
+ * the closing fence when the key is absent; no lines remove it. A note
+ * without frontmatter gets one only when there is something to write. A
+ * frontmatter block that opens and never closes is refused by name
+ * rather than edited, as the region engine refuses broken sentinels.
+ * A CRLF note keeps CRLF on the lines written into it.
+ */
+function replaceGeneratorOwnedKey(text: string, key: string, lines: ReadonlyArray<string>): string {
+  const all = text.split("\n");
+  if (bare(all[0] ?? "") !== FRONTMATTER_FENCE) {
+    if (lines.length === 0) return text;
+    return [FRONTMATTER_FENCE, ...lines, FRONTMATTER_FENCE, text].join("\n");
+  }
+  const close = all.findIndex((line, index) => index > 0 && bare(line) === FRONTMATTER_FENCE);
+  if (close < 0) {
+    throw new ArchFrontmatterError(
+      `frontmatter opens with "${FRONTMATTER_FENCE}" and never closes - ` +
+        `the "${key}" key cannot be rewritten safely`,
+    );
+  }
+  const eol = all[close]!.endsWith("\r") ? "\r" : "";
+  const rendered = lines.map((line) => `${line}${eol}`);
+  const keyLine = new RegExp(`^${key}\\s*:`);
+  const start = all.findIndex((line, index) => index > 0 && index < close && keyLine.test(line));
+  if (start < 0) {
+    all.splice(close, 0, ...rendered);
+    return all.join("\n");
+  }
+  let end = start + 1;
+  // Indentation or a list item continues the value; a blank line, `\r`
+  // alone on a CRLF note included, ends it and is left where it is.
+  while (end < close && /^(?:[ \t]|-)/.test(all[end]!)) end += 1;
+  all.splice(start, end - start, ...rendered);
+  return all.join("\n");
+}
+
+/** One generator-owned frontmatter key and the lines it renders to. */
+interface OwnedKey {
+  readonly key: string;
+  readonly lines: ReadonlyArray<string>;
+}
+
+/** The modules `module` declares a dependency on that a link can name, sorted. */
+function dependsOn(facts: ProjectFacts, module: ModuleFact): ReadonlyArray<string> {
+  return linkableEdges(facts)
+    .filter((edge) => edge.from === module.name)
+    .map((edge) => edge.to);
+}
+
+/** A module note's `dependencies` region: its manifests and the modules it depends on. */
+function moduleDependenciesRegionBody(
+  key: string,
+  module: ModuleFact,
+  targets: ReadonlyArray<string>,
+): string {
+  if (module.manifests.length === 0) return NO_MODULE_MANIFEST;
+  const edges =
+    targets.length === 0
+      ? NO_DEPENDS_ON
+      : ["Depends on:", ...targets.map((name) => `- ${moduleLink(key, name)}`)].join("\n");
+  return `${dependencySections(module.manifests, new Set())}\n\n${edges}`;
+}
+
 function overviewRegions(
   facts: ProjectFacts,
   key: string,
   codegraph: CodegraphReport,
 ): ReadonlyArray<Region> {
   const summary = [
-    `Project: ${facts.name}`,
-    ...(facts.manifest?.version != null ? [`Version: ${facts.manifest.version}`] : []),
-    ...(facts.manifest?.description != null ? [`Description: ${facts.manifest.description}`] : []),
+    `Project: ${oneLine(facts.name)}`,
+    ...(facts.manifest?.version != null ? [`Version: ${oneLine(facts.manifest.version)}`] : []),
+    ...(facts.manifest?.description != null
+      ? [`Description: ${oneLine(facts.manifest.description)}`]
+      : []),
     `Files: ${facts.totalFiles}`,
     `Languages: ${languagesLine(facts.languages)}`,
     ...(facts.testLayout !== null ? [`Test layout: ${facts.testLayout}/`] : []),
   ].join("\n");
 
-  const modules = facts.modules
-    .map(
-      (module) =>
-        `- [[Brain/projects/arch/${key}/modules/${module.name}|${module.name}]] ` +
-        `(${module.path}, ${module.files} file(s))`,
-    )
-    .join("\n");
+  const unlinkable = facts.modules.filter((module) => !isLinkable(module.name));
+  const modules = [
+    ...facts.modules
+      .filter((module) => isLinkable(module.name))
+      .map(
+        (module) =>
+          `- ${moduleLink(key, module.name)} (${oneLine(module.path)}, ${module.files} file(s))`,
+      ),
+    ...(unlinkable.length === 0
+      ? []
+      : [
+          `${UNLINKABLE_MODULES_LEAD} ${unlinkable.map((module) => codeSpanName(module.name)).join(", ")}`,
+        ]),
+  ].join("\n");
 
   const entryPoints =
     facts.entryPoints.length === 0
       ? "none detected"
-      : facts.entryPoints.map((entry) => `- \`${entry}\``).join("\n");
-
-  const dependencies =
-    facts.manifest === null || facts.manifest.dependencies.length === 0
-      ? "none declared"
-      : facts.manifest.dependencies.map((dep) => `- ${dep}`).join("\n");
+      : facts.entryPoints.map((entry) => `- ${codeSpanPath(entry)}`).join("\n");
 
   return [
     { id: "summary", body: summary },
     { id: "modules", body: modules },
     { id: "module-map", body: moduleMapBody(facts) },
     { id: "entry-points", body: entryPoints },
-    { id: "dependencies", body: dependencies },
+    { id: "dependencies", body: dependenciesBody(facts) },
+    { id: "module-dependencies", body: moduleDependenciesBody(facts) },
     { id: "codegraph", body: codegraphRegionBody(codegraph) },
   ];
 }
@@ -362,19 +686,24 @@ function decisionsRegionBody(candidates: ReadonlyArray<DecisionCandidateFact>): 
     .join("\n");
 }
 
-function moduleRegions(module: ModuleFact): ReadonlyArray<Region> {
+function moduleRegions(
+  key: string,
+  module: ModuleFact,
+  targets: ReadonlyArray<string>,
+): ReadonlyArray<Region> {
   const facts = [
-    `Path: ${module.path}`,
+    `Path: ${oneLine(module.path)}`,
     `Files: ${module.files}`,
     `Languages: ${languagesLine(module.languages)}`,
   ].join("\n");
   const files =
     module.topFiles.length === 0
       ? "empty module"
-      : module.topFiles.map((file) => `- \`${file}\``).join("\n");
+      : module.topFiles.map((file) => `- ${codeSpanPath(file)}`).join("\n");
   return [
     { id: "facts", body: facts },
     { id: "files", body: files },
+    { id: "dependencies", body: moduleDependenciesRegionBody(key, module, targets) },
   ];
 }
 
@@ -409,7 +738,12 @@ interface PlannedNote {
  * order, which made it predictable but no less wrong: an operator asked
  * to repair one note found the rest of the tree already half-refreshed.
  */
-function planNote(path: string, head: string, regions: ReadonlyArray<Region>): PlannedNote {
+function planNote(
+  path: string,
+  head: string,
+  regions: ReadonlyArray<Region>,
+  owned?: OwnedKey,
+): PlannedNote {
   if (!existsSync(path)) {
     return {
       path,
@@ -418,7 +752,18 @@ function planNote(path: string, head: string, regions: ReadonlyArray<Region>): P
     };
   }
   const existing = readFileSync(path, "utf8");
-  const merged = mergeRegions(existing, regions);
+  const regionsMerged = mergeRegions(existing, regions);
+  let merged = regionsMerged;
+  if (owned !== undefined) {
+    try {
+      merged = replaceGeneratorOwnedKey(regionsMerged, owned.key, owned.lines);
+    } catch (error) {
+      if (error instanceof ArchFrontmatterError) {
+        throw new ArchFrontmatterError(`${path}: ${error.message}`);
+      }
+      throw error;
+    }
+  }
   if (merged === existing) return { path, text: null, disposition: NOTE_DISPOSITION.unchanged };
   return { path, text: merged, disposition: NOTE_DISPOSITION.updated };
 }
@@ -517,11 +862,14 @@ function renderNotes(
   );
   for (const module of facts.modules) {
     opts.safeguard?.checkpoint();
+    const targets = dependsOn(facts, module);
+    const owned = { key: DEPENDS_ON_KEY, lines: dependsOnLines(key, targets) };
     plans.push(
       planNote(
         modulePath(dir, module),
-        frontmatter("arch-module", key, [`module: ${module.name}`]),
-        moduleRegions(module),
+        frontmatter("arch-module", key, [`module: ${yamlName(module.name)}`, ...owned.lines]),
+        moduleRegions(key, module, targets),
+        owned,
       ),
     );
   }
@@ -689,6 +1037,7 @@ function generateRun(
     overviewPath,
     decisionsPath: decisionsPath(dir),
     modulePaths: Object.freeze(modulePaths),
+    manifests: facts.manifests,
     created: countOf(plans, NOTE_DISPOSITION.created),
     updated: countOf(plans, NOTE_DISPOSITION.updated),
     unchanged: countOf(plans, NOTE_DISPOSITION.unchanged),

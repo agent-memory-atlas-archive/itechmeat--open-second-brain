@@ -1,11 +1,14 @@
 /**
- * Deterministic, no-LLM code-structure pre-extractor (P4, t_ef786747).
+ * Deterministic, no-LLM code-structure pre-extractor.
  *
  * A pre-ingest pass that turns one CODE source into JSON seeds an agent can
  * treat as pre-extracted facts: classes and functions become entity seeds,
- * imports and inheritance become edge seeds. It runs no model - structural
- * parsing per language family via a line grammar - and is a deliberate FALLBACK
- * pre-pass, not a codegraph substitute.
+ * imports and inheritance become edge seeds; Terraform blocks become entity
+ * seeds in address syntax (`pre-extract-hcl.ts`). It runs no model -
+ * structural parsing per language family via a line grammar - and is a
+ * deliberate FALLBACK pre-pass, not a codegraph substitute. The families are
+ * dispatched by an exhaustive switch, so a new family never falls into
+ * another family's parser.
  *
  * Determinism: the output depends only on (path, content). Seeds are deduped
  * and sorted with a fixed key, so the same input always yields byte-identical
@@ -19,30 +22,10 @@
  */
 
 import { resolveUniqueMatch } from "../../graph/unique-match.ts";
+import { parseHcl } from "./pre-extract-hcl.ts";
+import { type CodeEdgeSeed, type CodeEntitySeed, specifierSeed } from "./pre-extract-seeds.ts";
 
-/** A class/function declaration surfaced as an entity seed. */
-export interface CodeEntitySeed {
-  readonly kind: "class" | "function";
-  readonly name: string;
-}
-
-/**
- * A structural relationship surfaced as an edge seed. `imports` runs from the
- * source path to a module specifier; `inherits` runs from a subclass to a base
- * class (TS `extends`/`implements`, Python base classes); `uses` runs from a
- * `.tsx`/`.jsx` source path to a JSX component it renders.
- *
- * `resolvedTo` is present only when the caller supplied the ingested-file set
- * and a relative import specifier probed to exactly one ingested file; it
- * carries that file's canonical vault-relative path. An ambiguous or unmet
- * probe leaves the seed with its raw specifier and no field.
- */
-export interface CodeEdgeSeed {
-  readonly kind: "imports" | "inherits" | "uses";
-  readonly from: string;
-  readonly to: string;
-  readonly resolvedTo?: string;
-}
+export type { CodeEdgeSeed, CodeEntitySeed } from "./pre-extract-seeds.ts";
 
 /** Options for the pre-extract pass. Absent, every default is byte-identical. */
 export interface PreExtractOptions {
@@ -58,11 +41,11 @@ export interface PreExtractOptions {
 /** A source whose language family was recognized and parsed. */
 export interface PreExtractSuccess {
   readonly extracted: true;
-  /** Recognized language family: `typescript`, `javascript`, or `python`. */
+  /** Recognized language family: `typescript`, `javascript`, `python`, or `hcl`. */
   readonly language: string;
-  /** Class/function seeds, deduped and sorted by (kind, name). */
+  /** Entity seeds, deduped and sorted by (kind, name). */
   readonly entities: readonly CodeEntitySeed[];
-  /** Import/inheritance/uses seeds, deduped and sorted by (kind, from, to). */
+  /** Edge seeds, deduped and sorted by (kind, from, to). */
   readonly edges: readonly CodeEdgeSeed[];
 }
 
@@ -75,7 +58,7 @@ export interface PreExtractUnsupported {
 export type PreExtractResult = PreExtractSuccess | PreExtractUnsupported;
 
 /** Recognized language family for a lowercase, dot-prefixed extension. */
-type Language = "typescript" | "javascript" | "python";
+type Language = "typescript" | "javascript" | "python" | "hcl";
 
 /** Extension -> language family. The single home for supported extensions. */
 const LANGUAGE_BY_EXTENSION: ReadonlyMap<string, Language> = new Map([
@@ -89,14 +72,20 @@ const LANGUAGE_BY_EXTENSION: ReadonlyMap<string, Language> = new Map([
   [".cjs", "javascript"],
   [".py", "python"],
   [".pyi", "python"],
+  [".tf", "hcl"],
+  [".tfvars", "hcl"],
 ]);
+
+/** The Terraform variable-definitions extension: assignment names only, never blocks. */
+const TFVARS_EXTENSION = ".tfvars";
 
 /**
  * The TS/JS-family extensions in declaration order: what a `./`/`../`
- * specifier may resolve to. A Python file is never a TS/JS module target.
+ * specifier may resolve to. Named by family, so a file of any other family
+ * (Python, Terraform) is never a TS/JS module target.
  */
 const JS_FAMILY_EXTENSIONS: ReadonlyArray<string> = [...LANGUAGE_BY_EXTENSION]
-  .filter(([, language]) => language !== "python")
+  .filter(([, language]) => language === "typescript" || language === "javascript")
   .map(([ext]) => ext);
 
 /** Directory entry file a TS/JS specifier naming a directory resolves to, minus extension. */
@@ -248,10 +237,21 @@ export function preExtractCodeStructure(
 
   const entities: CodeEntitySeed[] = [];
   const edges: CodeEdgeSeed[] = [];
-  if (language === "python") {
-    parsePython(path, content, entities, edges, opts.ingestedFiles);
-  } else {
-    parseTsJs(path, content, entities, edges, opts.ingestedFiles);
+  switch (language) {
+    case "typescript":
+    case "javascript":
+      parseTsJs(path, content, entities, edges, opts.ingestedFiles);
+      break;
+    case "python":
+      parsePython(path, content, entities, edges, opts.ingestedFiles);
+      break;
+    case "hcl":
+      parseHcl(path, content, entities, edges, ext === TFVARS_EXTENSION);
+      break;
+    default: {
+      const unhandled: never = language;
+      throw new TypeError(`pre-extract: no parser for language family ${String(unhandled)}`);
+    }
   }
 
   return {
@@ -347,7 +347,7 @@ function parsePython(
     if (importMatch) {
       for (const spec of splitNames(importMatch[1]!)) {
         const mod = spec.split(/\s+as\s+/)[0]!.trim();
-        if (mod.length > 0) edges.push({ kind: "imports", from: path, to: mod });
+        if (mod.length > 0) edges.push(specifierSeed(path, mod));
       }
     }
   }
@@ -360,13 +360,10 @@ function importSeed(
   ingestedFiles: ReadonlySet<string> | undefined,
   rule: RelativeImportRule,
 ): CodeEdgeSeed {
-  if (ingestedFiles === undefined || !rule.relative.test(to)) {
-    return { kind: "imports", from: path, to };
-  }
-  const resolvedTo = resolveRelativeImport(path, to, ingestedFiles, rule);
-  return resolvedTo === undefined
-    ? { kind: "imports", from: path, to }
-    : { kind: "imports", from: path, to, resolvedTo };
+  const seed = specifierSeed(path, to);
+  if (ingestedFiles === undefined || !rule.relative.test(seed.to)) return seed;
+  const resolvedTo = resolveRelativeImport(path, seed.to, ingestedFiles, rule);
+  return resolvedTo === undefined ? seed : { ...seed, resolvedTo };
 }
 
 /**

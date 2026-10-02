@@ -47,6 +47,77 @@ instruction files such as `CLAUDE.md`/`AGENTS.md`, installed
 `.claude/skills/`) and warns with the exact replacement for any stale
 reference it finds (`removed-tool-reference`).
 
+## Upgrading to 1.68.0
+
+No step below is required. Six changes are visible to an operator or a
+client.
+
+**Architecture notes gain dependency regions and one owned frontmatter
+key.** `o2b brain architect` now reads dependency manifests at the root
+and at each module. On an existing project the first run appends a
+`module-dependencies` region to the overview and a `dependencies`
+region to each module note, so it reports those notes `updated` once.
+A module note whose manifest depends on another module gets a
+`depends_on` frontmatter key that the generator owns and rewrites on
+every run; a value typed under that key is replaced. `--json` gains a
+`manifests` list. A malformed root `package.json`, which used to be read
+as no manifest at all, is now reported `malformed`, and the `detail` of
+every malformed manifest is a fixed reason such as `invalid JSON`, not
+the parser's message. A dependency name that cannot be written into a
+note is counted as `unrepresentable` instead of listed, and a module
+whose directory name a link cannot carry is named once on the overview
+and left out of every link and edge. See
+[`how-it-works.md`](how-it-works.md).
+
+**The pre-extractor reads Terraform.** `o2b brain pre-extract` and
+`brain_ingest_source` with `pre_extract` now return seeds for `.tf` and
+`.tfvars` files, which used to report `extracted: false`.
+
+**Credentials in import specifiers are redacted.** In every family's
+`imports` seeds, the userinfo of an http(s) or `git::` specifier (a
+`user:password` pair such as `https://user:pass@host/m.js`, or a bare
+token such as `git::https://<token>@github.com/o/r.git`) and the value
+of a named credential query parameter (`sshkey`, `token`,
+`access_token`, `password`, `signature`, the S3 and GCS access-key and
+signing parameters) are replaced, the query parameter also on a
+specifier that is not a URL, such as `git@host:org/repo.git?sshkey=...`.
+A conventional login such as `ssh://git@` is kept. A credential in a
+path segment, a fragment or an unnamed query parameter is not
+recognised. Specifiers without credentials are unchanged; a specifier
+longer than 2048 characters is replaced whole. With `pre_extract`,
+`brain_ingest_source` skips a source larger than 1 MiB and says so.
+
+**A remote search with no match no longer states index counts.** The
+answer of an empty `brain_search` and of `brain_recall_gate` below local
+reach carries no coverage receipt, since its counts include pages the
+caller cannot read: a `not_found` names the index time only, and an
+`unknown` gives a fixed reason for its `unknown_reason`. A local caller and the
+CLI keep the receipt.
+
+**More tools treat a record the caller cannot read at its reach as
+absent.** A remote client now gets, for such a record, exactly the
+answer an absent one gets from `brain_context`, the
+`osb://preferences/active` resource, `brain_pre_compress_pack`,
+`brain_brief` `view="digest"` and `view="morning"`, the
+`osb://digest/latest` and `osb://lessons` resources, `brain_health` and
+the `brain_doctor` repair plan and apply. The first three now always
+hand a remote client a render stamped with the file's `generated_at`
+instead of the file's bytes. A remote `view="digest"` takes no report
+snapshot and shows no delta, and a remote `view="morning"` shows no
+pending-triggers section and marks no trigger delivered. The `osb://preferences/active`
+resource also follows the owner gate under
+`integrity.owner_scope_delivery: fail`, as `brain_context` does. A local
+caller and the CLI see no change.
+
+**Remote search no longer returns the compiled digest pages.**
+`Brain/active.md` and `Brain/lessons.md` compile preferences and dead-ends
+that may reserve themselves against remote reads, so `brain_search` and the
+other generic page readers withhold both pages from a remote client. The
+active digest stays available remotely through `brain_context`, the
+`osb://preferences/active` resource and `brain_pre_compress_pack`, each
+rendered without the records that client cannot read. Local search is
+unchanged. See the 1.68.0 entry in [`CHANGELOG.md`](../CHANGELOG.md).
+
 ## Upgrading to 1.67.0
 
 No step below is required. Six changes are visible to an operator or a

@@ -19,7 +19,16 @@
  * genuine connection to prior material; a freshly created entity is not.
  */
 
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+} from "node:fs";
 import { dirname, join, relative } from "node:path";
 
 import type { FrontmatterMap } from "../../types.ts";
@@ -160,7 +169,8 @@ export function ingestSource(
   // producing two summary pages for one source against this pipeline's
   // documented idempotency.
   const canonicalSource = normalizeSourceIdentity(input.sourcePath);
-  const preExtract = opts.preExtract === true ? runPreExtract(vault, canonicalSource) : undefined;
+  const preExtract =
+    opts.preExtract === true ? runPreExtract(vault, canonicalSource, opts.readable) : undefined;
   const sourceLink = `[[${canonicalSource}]]`;
   const provenance: Provenance = { level: "stated", sources: [sourceLink], premises: [] };
 
@@ -275,11 +285,74 @@ export function ingestSource(
 }
 
 /**
+ * The largest source the code-structure pass reads. A hand-written module
+ * is far smaller; a larger file is generated or vendored, and its seeds are
+ * not worth a parse whose cost grows with the file.
+ */
+export const PRE_EXTRACT_MAX_SOURCE_BYTES = 1_048_576;
+
+/** Why a source read yields no text, apart from a thrown error. */
+const SOURCE_UNREAD = Object.freeze({
+  notAFile: "not a regular file",
+  tooLarge: "larger than the read limit",
+} as const);
+
+type SourceUnread = (typeof SOURCE_UNREAD)[keyof typeof SOURCE_UNREAD];
+
+/**
+ * How a source is opened: read-only and never blocking, so a FIFO met
+ * where a file was expected cannot stall the server. No `O_NOFOLLOW`: an
+ * in-vault symlink is admitted by the containment check in
+ * `runPreExtract` (`resolvesInsideVault`). The flag
+ * is POSIX; where the platform lacks it it is simply absent.
+ */
+const SOURCE_OPEN_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0);
+
+/**
+ * Read a source through ONE descriptor, so the checks hold for the bytes
+ * read: the descriptor must be a regular file, and no more than
+ * {@link PRE_EXTRACT_MAX_SOURCE_BYTES} is read however large the file has
+ * grown since the `fstat`.
+ */
+function readSourceBounded(
+  absolute: string,
+):
+  | { readonly text: string; readonly unread?: undefined }
+  | { readonly text: null; readonly unread: SourceUnread } {
+  const fd = openSync(absolute, SOURCE_OPEN_FLAGS);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return { text: null, unread: SOURCE_UNREAD.notAFile };
+    if (stat.size > PRE_EXTRACT_MAX_SOURCE_BYTES)
+      return { text: null, unread: SOURCE_UNREAD.tooLarge };
+    // One byte past the cap, so growth since the fstat is seen.
+    const buffer = Buffer.allocUnsafe(PRE_EXTRACT_MAX_SOURCE_BYTES + 1);
+    let filled = 0;
+    for (;;) {
+      const count = readSync(fd, buffer, filled, buffer.length - filled, null);
+      if (count === 0) break;
+      filled += count;
+      if (filled > PRE_EXTRACT_MAX_SOURCE_BYTES)
+        return { text: null, unread: SOURCE_UNREAD.tooLarge };
+    }
+    return { text: buffer.toString("utf8", 0, filled) };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
  * Run the code-structure pre-extraction pass over a vault-file source. A source
  * with no readable file bytes (a URL or identity-only source) cannot be parsed,
- * so it is reported as unextracted rather than a fake empty success.
+ * so it is reported as unextracted rather than a fake empty success. A source
+ * `readable` refuses is answered the same way, before its bytes are read, so
+ * the pass reads no file the intake would treat as having no local bytes.
  */
-function runPreExtract(vault: string, canonicalSource: string): PreExtractResult {
+function runPreExtract(
+  vault: string,
+  canonicalSource: string,
+  readable: ((rel: string) => boolean) | undefined,
+): PreExtractResult {
   // The identity is caller-supplied and `..` segments survive normalization,
   // so the read is contained the same way the trust classifier contains its
   // own resolution (`source-trust.ts`): an identity that resolves outside the
@@ -296,17 +369,25 @@ function runPreExtract(vault: string, canonicalSource: string): PreExtractResult
   if (!isCodeStructureSource(canonicalSource)) {
     return preExtractCodeStructure(canonicalSource, "");
   }
+  const noBytes: PreExtractResult = {
+    extracted: false,
+    reason: `source has no readable file bytes for code-structure pre-extraction: ${canonicalSource}`,
+  };
+  if (readable !== undefined && !readable(canonicalSource)) return noBytes;
+  const tooLarge: PreExtractResult = {
+    extracted: false,
+    reason: `source is larger than ${PRE_EXTRACT_MAX_SOURCE_BYTES} bytes; code-structure pre-extraction skipped: ${canonicalSource}`,
+  };
   let content: string;
   try {
-    content = readFileSync(join(vault, canonicalSource), "utf8");
+    const read = readSourceBounded(join(vault, canonicalSource));
+    if (read.text === null) return read.unread === SOURCE_UNREAD.tooLarge ? tooLarge : noBytes;
+    content = read.text;
   } catch {
     // A source with no readable file bytes - a URL/identity-only source, a
     // directory, a permission failure, or a deletion race - cannot be parsed,
     // so it is reported as unextracted rather than aborting the whole ingest.
-    return {
-      extracted: false,
-      reason: `source has no readable file bytes for code-structure pre-extraction: ${canonicalSource}`,
-    };
+    return noBytes;
   }
   // The manifest's canonical path set is what a relative import specifier
   // may bind to: a specifier probes it and fills the seed's `resolvedTo`

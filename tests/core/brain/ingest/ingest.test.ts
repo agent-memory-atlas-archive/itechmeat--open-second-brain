@@ -11,6 +11,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join, relative } from "node:path";
 import { tmpdir } from "node:os";
 
+import { IS_WINDOWS } from "../../../helpers/platform.ts";
+
 import { bootstrapBrain } from "../../../../src/core/brain/init.ts";
 import { atomicWriteFileSync } from "../../../../src/core/fs-atomic.ts";
 import {
@@ -18,7 +20,10 @@ import {
   listEntities,
   upsertEntity,
 } from "../../../../src/core/brain/entities/registry.ts";
-import { ingestSource } from "../../../../src/core/brain/ingest/ingest.ts";
+import {
+  ingestSource,
+  PRE_EXTRACT_MAX_SOURCE_BYTES,
+} from "../../../../src/core/brain/ingest/ingest.ts";
 import { manifestPath } from "../../../../src/core/brain/ingest/content-manifest.ts";
 import { computePlanId, readCheckpoint } from "../../../../src/core/brain/ingest/checkpoint.ts";
 
@@ -256,6 +261,67 @@ describe("ingestSource pre-extract pass (P4, t_ef786747)", () => {
       expect(res.preExtract.reason).toContain("no readable file bytes");
     }
   });
+
+  test("a code source the caller may not read answers as one with no bytes", () => {
+    writeCode();
+    const refused = ingestSource(vault, CODE_INPUT, {
+      agent: "claude",
+      now: NOW,
+      preExtract: true,
+      readable: (rel) => rel !== CODE_INPUT.sourcePath,
+    });
+    expect(refused.preExtract).toEqual({
+      extracted: false,
+      reason: `source has no readable file bytes for code-structure pre-extraction: ${CODE_INPUT.sourcePath}`,
+    });
+    const allowed = ingestSource(vault, CODE_INPUT, {
+      agent: "claude",
+      now: NOW,
+      preExtract: true,
+      readable: () => true,
+    });
+    expect(allowed.preExtract?.extracted).toBe(true);
+  });
+
+  test("a code source larger than the read limit is skipped by name", () => {
+    writeCode();
+    writeFileSync(
+      join(vault, "Code", "widget.ts"),
+      `export const big = "${"x".repeat(PRE_EXTRACT_MAX_SOURCE_BYTES)}";\n`,
+    );
+    const res = ingestSource(vault, CODE_INPUT, { agent: "claude", now: NOW, preExtract: true });
+    expect(res.preExtract).toEqual({
+      extracted: false,
+      reason: `source is larger than ${PRE_EXTRACT_MAX_SOURCE_BYTES} bytes; code-structure pre-extraction skipped: ${CODE_INPUT.sourcePath}`,
+    });
+  });
+
+  // Windows has no FIFOs.
+  test.skipIf(IS_WINDOWS)(
+    "a FIFO code source has no readable bytes and the read does not block",
+    () => {
+      mkdirSync(join(vault, "Code"), { recursive: true });
+      const fifo = join(vault, "Code", "widget.ts");
+      expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+      // A writer that holds the FIFO open for two seconds and writes
+      // nothing: a reader that blocks fails on its answer after two seconds
+      // instead of hanging the run.
+      const writer = Bun.spawn(["sh", "-c", 'exec 3>"$0"; exec sleep 2', fifo]);
+      try {
+        const res = ingestSource(vault, CODE_INPUT, {
+          agent: "claude",
+          now: NOW,
+          preExtract: true,
+        });
+        expect(res.preExtract).toEqual({
+          extracted: false,
+          reason: `source has no readable file bytes for code-structure pre-extraction: ${CODE_INPUT.sourcePath}`,
+        });
+      } finally {
+        writer.kill();
+      }
+    },
+  );
 
   test("with the pass off the result carries no seeds and the page is byte-identical", () => {
     writeCode();

@@ -13,10 +13,15 @@
  * recall-budget primitive so one oversized entry cannot dominate.
  */
 
+import { posix } from "node:path";
+
+import { type ArtifactRefView, readerRefView } from "./artifact-ref-view.ts";
+import { BRAIN_PREFERENCES_REL } from "./path-constants.ts";
 import { brainDirs } from "./paths.ts";
 import { collectPreferences, resolveOwnerScopeDelivery } from "./preferences-collect.ts";
 import { applyCharBudget } from "./recall-budget.ts";
 import { readLogDay } from "./log-jsonl.ts";
+import { reconcileTopicPreferenceId } from "./log.ts";
 import { renderActivityTimeline, type ActivityItem } from "./render/activity-line.ts";
 import { isoDate, relativeAge } from "./time.ts";
 import { BRAIN_LOG_EVENT_KIND, BRAIN_PREFERENCE_STATUS } from "./types.ts";
@@ -62,6 +67,12 @@ export interface MorningBriefOptions {
    * output is byte-identical to a vault without the gate.
    */
   readonly agentScope?: string;
+  /**
+   * The caller's reach rule over vault-relative paths. A preference it
+   * answers false for is left out, as if it were not on disk; omitted,
+   * every preference is a candidate.
+   */
+  readonly readable?: (rel: string) => boolean;
 }
 
 interface ConfirmedPref {
@@ -71,16 +82,21 @@ interface ConfirmedPref {
   readonly createdAt: string;
 }
 
-function collectConfirmed(vault: string, agentScope: string | undefined): ConfirmedPref[] {
+function collectConfirmed(
+  vault: string,
+  agentScope: string | undefined,
+  readable: ((rel: string) => boolean) | undefined,
+): ConfirmedPref[] {
   const dir = brainDirs(vault).preferences;
   const out: ConfirmedPref[] = [];
   // Listing and parse come from the shared delivery-path walk
   // (context-integrity-gates, Unit A); the confirmed-status filter is
   // this surface's own and stays here.
-  for (const { pref } of collectPreferences(dir, {
+  for (const { name, pref } of collectPreferences(dir, {
     ownerScope: resolveOwnerScopeDelivery(vault, agentScope),
   }).entries) {
     if (pref.status !== BRAIN_PREFERENCE_STATUS.confirmed) continue;
+    if (readable !== undefined && !readable(posix.join(BRAIN_PREFERENCES_REL, name))) continue;
     out.push({
       id: pref.id,
       principle: pref.principle,
@@ -107,7 +123,12 @@ interface LogScan {
   readonly notes: ScannedNote[];
 }
 
-function scanRecentLog(vault: string, now: Date, lookbackDays: number): LogScan {
+function scanRecentLog(
+  vault: string,
+  now: Date,
+  lookbackDays: number,
+  refs: ArtifactRefView,
+): LogScan {
   const openQuestions: ScannedOpenQuestion[] = [];
   const notes: ScannedNote[] = [];
   const seenTopics = new Set<string>();
@@ -124,6 +145,11 @@ function scanRecentLog(vault: string, now: Date, lookbackDays: number): LogScan 
         // Auto-resolutions carry a `resolution` field; only open
         // questions (no resolution) are surfaced to the operator.
         if (typeof e.body["resolution"] === "string") continue;
+        // An open question is about the preference its topic names. The
+        // subject is asked as an id, so a topic with no preference file on
+        // disk names nothing that could be hidden.
+        const subject = reconcileTopicPreferenceId(e);
+        if (subject !== undefined && !refs.visible(subject)) continue;
         const topic = typeof e.body["topic"] === "string" ? e.body["topic"] : "";
         const domain = typeof e.body["domain"] === "string" ? e.body["domain"] : "";
         if (topic && !seenTopics.has(topic)) {
@@ -157,14 +183,19 @@ const TIMELINE_HEADER = "## Recent activity";
 export function buildMorningBrief(vault: string, opts: MorningBriefOptions): MorningBrief {
   const lookbackDays = opts.lookbackDays ?? 7;
 
-  const ranked = collectConfirmed(vault, opts.agentScope).toSorted((a, b) => {
+  const ranked = collectConfirmed(vault, opts.agentScope, opts.readable).toSorted((a, b) => {
     if (b.confidence !== a.confidence) return b.confidence - a.confidence;
     if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
   const topPrefs = ranked.slice(0, Math.max(0, opts.topK));
 
-  const { openQuestions, notes } = scanRecentLog(vault, opts.now, lookbackDays);
+  const { openQuestions, notes } = scanRecentLog(
+    vault,
+    opts.now,
+    lookbackDays,
+    readerRefView(vault, opts.readable),
+  );
 
   // Budget all variable-length entries together so one oversized entry
   // cannot crowd out the rest. Items are tagged by kind so the result

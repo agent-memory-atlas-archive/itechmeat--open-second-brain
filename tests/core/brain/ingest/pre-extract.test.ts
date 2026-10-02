@@ -1,5 +1,5 @@
 /**
- * P4 (t_ef786747): deterministic, stdlib-only code-structure pre-extractor.
+ * The deterministic, built-in-runtime-only code-structure pre-extractor.
  *
  * Turns a code source into JSON entity/edge seeds (classes/functions as
  * entities; imports and inheritance as edges) without any model. Same input
@@ -14,6 +14,8 @@ import {
   type PreExtractResult,
   type PreExtractSuccess,
 } from "../../../../src/core/brain/ingest/pre-extract.ts";
+import { REDACTION_PLACEHOLDER } from "../../../../src/core/redactor.ts";
+import { fakeCredential } from "../../../helpers/fake-credentials.ts";
 
 function asSuccess(res: PreExtractResult): PreExtractSuccess {
   if (!res.extracted) throw new Error(`expected extracted, got: ${res.reason}`);
@@ -122,7 +124,7 @@ describe("preExtractCodeStructure - unknown languages", () => {
   });
 });
 
-describe("preExtractCodeStructure - relative-import binding (t_2356dace)", () => {
+describe("preExtractCodeStructure - relative-import binding", () => {
   const INGESTED = new Set([
     "src/lib/dom.ts",
     "src/lib/widget.ts",
@@ -330,7 +332,7 @@ describe("preExtractCodeStructure - relative-import binding (t_2356dace)", () =>
   });
 });
 
-describe("preExtractCodeStructure - JSX component usage (t_998aa4e6)", () => {
+describe("preExtractCodeStructure - JSX component usage", () => {
   test("a capitalized opening tag in a .tsx source yields a uses edge", () => {
     const res = asSuccess(
       preExtractCodeStructure(
@@ -416,6 +418,65 @@ describe("preExtractCodeStructure - JSX component usage (t_998aa4e6)", () => {
       { kind: "uses", from: "src/app/View.tsx", to: "Footer" },
       { kind: "uses", from: "src/app/View.tsx", to: "Header" },
       { kind: "uses", from: "src/app/View.tsx", to: "Layout" },
+    ]);
+  });
+});
+
+describe("preExtractCodeStructure - URL credentials in import specifiers", () => {
+  const userInfo = `deploy:${fakeCredential("hunter", "2-", "pw")}`;
+  const withCredentials = `https://${userInfo}@registry.example.com/m.js`;
+  const redacted = `https://${REDACTION_PLACEHOLDER}@registry.example.com/m.js`;
+
+  test("a TypeScript from-specifier carrying user:password is redacted", () => {
+    const res = asSuccess(
+      preExtractCodeStructure("src/a.ts", `import { m } from "${withCredentials}";\n`),
+    );
+    expect(res.edges).toEqual([{ kind: "imports", from: "src/a.ts", to: redacted }]);
+    expect(JSON.stringify(res)).not.toContain(userInfo);
+  });
+
+  test("a JavaScript require specifier carrying user:password is redacted", () => {
+    const res = asSuccess(
+      preExtractCodeStructure("src/a.js", `const m = require("${withCredentials}");\n`),
+    );
+    expect(res.edges).toEqual([{ kind: "imports", from: "src/a.js", to: redacted }]);
+  });
+
+  test("a Python import specifier carrying user:password is redacted", () => {
+    const res = asSuccess(preExtractCodeStructure("pkg/a.py", `import ${withCredentials}\n`));
+    expect(res.edges).toEqual([{ kind: "imports", from: "pkg/a.py", to: redacted }]);
+  });
+
+  test("a TypeScript from-specifier whose userinfo is a bare token is redacted", () => {
+    const token = fakeCredential("tok", "1234", "56789");
+    const res = asSuccess(
+      preExtractCodeStructure(
+        "src/a.ts",
+        `import x from "https://${token}@host.example.com/m.js";\n`,
+      ),
+    );
+    expect(res.edges).toEqual([
+      {
+        kind: "imports",
+        from: "src/a.ts",
+        to: `https://${REDACTION_PLACEHOLDER}@host.example.com/m.js`,
+      },
+    ]);
+  });
+
+  test("specifiers without credentials are byte-identical", () => {
+    const plain = "https://registry.example.com:8443/m.js";
+    const ts = asSuccess(
+      preExtractCodeStructure("src/a.ts", `import { m } from "${plain}";\nimport "./local";\n`),
+    );
+    expect(ts.edges).toEqual([
+      { kind: "imports", from: "src/a.ts", to: "./local" },
+      { kind: "imports", from: "src/a.ts", to: plain },
+    ]);
+    const py = asSuccess(preExtractCodeStructure("pkg/a.py", "from .util import x\nimport os\n"));
+    expect(py.edges).toEqual([
+      { kind: "imports", from: "pkg/a.py", to: ".util" },
+      { kind: "imports", from: "pkg/a.py", to: "os" },
     ]);
   });
 });

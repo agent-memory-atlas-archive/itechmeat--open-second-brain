@@ -31,8 +31,8 @@
  * PostCompact hook + MCP resources") which closes BRAIN-FUT-006.
  */
 
-import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join, posix } from "node:path";
 
 import { atomicWriteFileSync } from "../fs-atomic.ts";
 import { parseFrontmatter } from "../vault.ts";
@@ -47,6 +47,7 @@ import { isPreferenceVisible } from "./owner-scoped-facts.ts";
 import { parseRetired } from "./preference.ts";
 import { collectPreferences, resolveOwnerScopeDelivery } from "./preferences-collect.ts";
 import { BRAIN_TOMBSTONE_STATUS } from "./types.ts";
+import { BRAIN_PREFERENCES_REL, BRAIN_RETIRED_REL } from "./path-constants.ts";
 import { brainActivePath, brainDirsForWrite } from "./paths.ts";
 import { isoSecond } from "./time.ts";
 import { sortByProvenanceTrust } from "./provenance/trust-order.ts";
@@ -88,6 +89,29 @@ export interface RenderActiveOptions extends RegenerateActiveOptions {
    * shared file does.
    */
   readonly generatedAt?: string;
+  /**
+   * May the reader see the record at this vault-relative path? A record
+   * it may not is treated as absent: its line, its count and its place in
+   * the most-applied list all go, exactly as if the file did not exist.
+   * Omitted, nothing is filtered. Like {@link agentScope}, it never
+   * reaches the shared write.
+   */
+  readonly readable?: (rel: string) => boolean;
+}
+
+/** Who is reading the shared digest: the two read-time narrowings. */
+export interface ActiveReaderOptions {
+  /** See {@link RenderActiveOptions.readable}. */
+  readonly readable?: (rel: string) => boolean;
+  /** See {@link RenderActiveOptions.agentScope}. */
+  readonly agentScope?: string;
+  /**
+   * The reader arrived below local reach. Such a reader is always handed
+   * the in-memory render, never the file: whether a record is withheld
+   * from it must not decide between a fresh render and a file that may
+   * be stale, or the choice itself tells it the record exists.
+   */
+  readonly restricted?: boolean;
 }
 
 /** A rendered digest that has NOT been written anywhere. */
@@ -138,8 +162,14 @@ export interface RegenerateActiveResult {
 export function renderActive(vault: string, opts: RenderActiveOptions = {}): ActiveRender {
   const now = opts.now ?? new Date();
 
-  const preferences = readActivePreferences(vault, opts.agentScope);
-  const retiredRecent = readRecentlyRetired(vault, RECENTLY_RETIRED_COUNT, opts.agentScope);
+  const readable = opts.readable ?? READ_EVERYTHING;
+  const preferences = readActivePreferences(vault, opts.agentScope, readable);
+  const retiredRecent = readRecentlyRetired(
+    vault,
+    RECENTLY_RETIRED_COUNT,
+    opts.agentScope,
+    readable,
+  );
 
   // Confirmed prefs sort by confidence then id. When provenance trust
   // ordering is on, re-rank stated > deduced > inferred as the primary key
@@ -207,6 +237,46 @@ export function renderActive(vault: string, opts: RenderActiveOptions = {}): Act
 }
 
 /**
+ * Must this reader be handed the in-memory render rather than the file?
+ *
+ * Decided on who is reading, never on what is withheld: an enforced owner
+ * scope or a restricted reach always renders, so the answer does not
+ * depend on whether a record the reader cannot see exists. The common
+ * case - a local reader with no enforced scope - is served the file's own
+ * bytes, unchanged.
+ */
+export function readerNarrowsActive(vault: string, opts: ActiveReaderOptions): boolean {
+  if (opts.restricted === true) return true;
+  return resolveOwnerScopeDelivery(vault, opts.agentScope).enforcedScope !== null;
+}
+
+/**
+ * The digest as ONE reader may see it, rendered in memory with the
+ * `generated_at` stamp already on disk, so the narrowed document names
+ * the same generation the shared file does. Nothing is written. Callers
+ * ask {@link readerNarrowsActive} first and serve the file otherwise.
+ */
+export function renderActiveForReader(vault: string, opts: ActiveReaderOptions): ActiveRender {
+  const generatedAt = readGeneratedAt(brainActivePath(vault));
+  return renderActive(vault, {
+    ...(opts.agentScope !== undefined ? { agentScope: opts.agentScope } : {}),
+    ...(opts.readable !== undefined ? { readable: opts.readable } : {}),
+    ...(generatedAt !== null ? { generatedAt } : {}),
+  });
+}
+
+/**
+ * The bytes of `Brain/active.md` this reader may be handed: the file
+ * itself for a local reader with no enforced scope, the reader render
+ * otherwise. The file must exist; the caller regenerates it first.
+ */
+export function readActiveForReader(vault: string, opts: ActiveReaderOptions): string {
+  return readerNarrowsActive(vault, opts)
+    ? renderActiveForReader(vault, opts).document
+    : readFileSync(brainActivePath(vault), "utf8");
+}
+
+/**
  * Regenerate `<vault>/Brain/active.md`. Returns whether the body
  * actually changed (callers don't need to skip the call themselves —
  * the function makes the right decision internally).
@@ -255,16 +325,39 @@ export function regenerateActiveQuiet(vault: string, opts: RegenerateActiveOptio
 
 // ----- Scan helpers --------------------------------------------------------
 
-function readActivePreferences(vault: string, agentScope: string | undefined): BrainPreference[] {
+const READ_EVERYTHING = (_rel: string): boolean => true;
+
+/**
+ * The `generated_at` stamp of a compiled digest file on disk, or null when
+ * absent or unreadable. Shared by the active and lessons reader renders.
+ */
+export function readGeneratedAt(path: string): string | null {
+  if (!existsSync(path)) return null;
+  try {
+    const [meta] = parseFrontmatter(path);
+    const value = meta["generated_at"];
+    return typeof value === "string" && value.trim().length > 0 ? value : null;
+  } catch {
+    // A torn header has no stamp to reuse; the render then stamps its own.
+    return null;
+  }
+}
+
+function readActivePreferences(
+  vault: string,
+  agentScope: string | undefined,
+  readable: (rel: string) => boolean,
+): BrainPreference[] {
   const dirs = brainDirsForWrite(vault);
   // The shared delivery-path walk (context-integrity-gates, Unit A) owns
   // the listing and the parse; a corrupted or status/folder-mismatched
   // file is omitted there, and `brain_doctor` is the surface that flags
   // it. See the module docblock for the rationale.
   const out: BrainPreference[] = [];
-  for (const { pref } of collectPreferences(dirs.preferences, {
+  for (const { name, pref } of collectPreferences(dirs.preferences, {
     ownerScope: resolveOwnerScopeDelivery(vault, agentScope),
   }).entries) {
+    if (!readable(posix.join(BRAIN_PREFERENCES_REL, name))) continue;
     // Belief lifecycle suite (t_7d5a3589): a tombstoned (incl.
     // superseded-non-tip) preference remains on disk for audit but
     // never appears in the active-preferences digest.
@@ -285,13 +378,16 @@ function readRecentlyRetired(
   vault: string,
   limit: number,
   agentScope: string | undefined,
+  readable: (rel: string) => boolean,
 ): BrainRetired[] {
   const dirs = brainDirsForWrite(vault);
   if (!existsSync(dirs.retired)) return [];
   const scope = resolveOwnerScopeDelivery(vault, agentScope).enforcedScope;
   const out: BrainRetired[] = [];
   for (const name of readdirSync(dirs.retired)) {
-    if (!name.endsWith(".md")) continue;
+    // Filtered BEFORE the newest-first cut, so a withheld record never
+    // pushes a visible one out of the list either.
+    if (!name.endsWith(".md") || !readable(posix.join(BRAIN_RETIRED_REL, name))) continue;
     const full = join(dirs.retired, name);
     try {
       const retired = parseRetired(full);

@@ -93,7 +93,12 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
       "calls core/search/search.ts's search() directly, which runs assembleRankedResults -> " +
       "applyPoolFilters -> applyVisibilityScope (pool-filters.ts:130) on every result before " +
       "returning it, unconditionally - the empty-scope-hides-tagged-pages rule applies even when " +
-      "the caller passes no visibility argument at all.",
+      "the caller passes no visibility argument at all. A zero-result answer below local " +
+      "reach carries no coverage receipt and no index count: a not_found names the index time " +
+      "only and an unknown states the fixed reason of its unknown_reason " +
+      "(corpusVerdictAtReach in pipeline/outcome.ts, withoutCorpusCounts). Residual: an " +
+      "authorized note root that holds only pages the caller cannot read is still a reached " +
+      "root, so its presence can still move the verdict to coverage-divergent.",
   },
   {
     surface: "brain_file_context",
@@ -310,14 +315,14 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
   {
     surface: "brain_doctor",
     kind: K.mcpTool,
-    category: C.excluded,
+    category: C.covered,
     reason:
       "the read-only report keeps every issue stream through the owner view ANDed with " +
-      "reachView, over the path, target, sources and message wikilinks each issue names, takes " +
-      "ok and trust_verdict again over the kept issues, and below local reach recounts the " +
-      "tier-drift warning over the rows readableAtContextReach(ctx) keeps. It stays EXCLUDED " +
-      "because the repair branch is bounded by the owner scope only, and its plan names the " +
-      "records it would fix, reserved ones included.",
+      "reachView, over the doctorIssueRefs each issue names (path, target, sources, message " +
+      "wikilinks), takes ok and trust_verdict again over the kept issues, and below local reach " +
+      "recounts the tier-drift warning over the rows readableAtContextReach(ctx) keeps. The " +
+      "repair branch hands applyRepair the caller's reach, which bounds the findings before the " +
+      "plan is derived, so a withheld record is neither planned, counted nor written.",
   },
   {
     surface: "schema_inspect",
@@ -341,11 +346,12 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
   {
     surface: "brain_health",
     kind: K.mcpTool,
-    category: C.excluded,
+    category: C.covered,
     reason:
       "runs runDoctor's semantic-health pass and names preferences by id in its contradiction, " +
-      "stale-claim and batch-inflation findings; those are kept through the gated owner view " +
-      "only, and no reach view is asked, so a reserved preference can be named at remote reach.",
+      "stale-claim and batch-inflation findings; each finding is kept only when every member " +
+      "passes the gated owner view ANDed with reachView, and the verdict is folded again over " +
+      "the kept families.",
   },
   {
     surface: "brain_status",
@@ -398,11 +404,12 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
   {
     surface: "brain_context",
     kind: K.mcpTool,
-    category: C.excluded,
+    category: C.covered,
     reason:
-      "toolBrainContext (context-tools.ts) returns Brain/active.md's rendered content via " +
-      "parseFrontmatter - the standing-rules digest, a Brain-authored artifact - with no " +
-      "visibility check; it is the always-loaded writer tool, not a general note reader.",
+      "toolBrainContext (context-tools.ts) serves Brain/active.md's bytes only to a local " +
+      "reader with no owner scope enforced; any other reader gets renderActiveForReader's " +
+      "in-memory render without the preference and retired records readableAtContextReach(ctx) " +
+      "withholds, counts included, so the choice never depends on what is withheld.",
   },
   {
     surface: "brain_agent_query",
@@ -490,12 +497,25 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
       "with no visibility check.",
   },
   {
-    surface: "brain_pre_compress_pack",
+    surface: "brain_brief",
     kind: K.mcpTool,
     category: C.excluded,
     reason:
-      "buildPreCompressPack (core/brain/pre-compress-pack.ts) returns id/principle items from " +
-      "the same Brain/preferences pool brain_context_pack draws from, gated by agentScope only.",
+      "view=digest (brief-tools.ts) is rendered for the caller below local reach - renderDigest " +
+      "is handed readableAtContextReach(ctx), so a reserved preference or retired record is " +
+      "absent from its rows and counts, and no report snapshot is taken or delta shown; " +
+      "view=morning is handed the same predicate and leaves such a preference out, and shows " +
+      "no pending trigger or trigger-queue failure and marks nothing delivered - but the " +
+      "daily, weekly, monthly, operator and today views count over the whole Brain layer.",
+  },
+  {
+    surface: "brain_pre_compress_pack",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "buildPreCompressPack (core/brain/pre-compress-pack.ts) is handed " +
+      "readableAtContextReach(ctx): the top-K walk skips a preference the caller cannot read, " +
+      "and below local reach the active head is always the reader render of Brain/active.md.",
   },
   {
     surface: "brain_pre_compact_extract",
@@ -512,7 +532,10 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
     category: C.excluded,
     reason:
       "a diagnostic classifier over caller-supplied scores/match_quality - it runs no search and " +
-      "returns no note content; included for completeness of the file-level sweep only.",
+      "returns no note content; included for completeness of the file-level sweep only. Its " +
+      "corpus statement below local reach carries no coverage receipt and no index count, for " +
+      "every state (corpusVerdictAtReach, withoutCorpusCounts); the coverage-divergent residual " +
+      "named on brain_search applies here too.",
   },
   {
     surface: "brain_recall_feedback",
@@ -626,8 +649,10 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
     category: C.excluded,
     reason:
       "reports install/config/vault status blocks - no note path, title, or body crosses this " +
-      "surface; included for completeness of the file-level sweep only (tools.ts imports " +
-      "listVaultPages for second_brain_query, defined in the same file).",
+      "surface, but its Brain block is computeBrainStatus over the whole Brain layer, so the " +
+      "preference counts and the last apply-evidence time move with a reserved record; included " +
+      "for the file-level sweep (tools.ts imports listVaultPages for second_brain_query, defined " +
+      "in the same file).",
   },
   {
     surface: "vault_health",
@@ -788,28 +813,39 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
       "src/cli/brain/verbs/maintenance.ts mirrors brain_maintenance; no note content crosses either.",
   },
 
-  // --- Excluded: MCP resources -----------------------------------------------
+  // --- MCP resources ---------------------------------------------------------
   {
     surface: "osb://preferences/active",
     kind: K.mcpResource,
-    category: C.excluded,
+    category: C.covered,
     reason:
-      "one of resources.ts's three whole-vault readers, deliberately unfiltered by its own " +
-      "docblock (Brain/active.md is shared by construction) - and visibility: is not part of " +
-      "that decision either way; the field is never consulted.",
+      "readActive (resources.ts) passes the request view (owner view ANDed with reachView) and " +
+      "whether the request is below local reach to readActiveForReader, which serves the shared " +
+      "file only to a local reader with no owner scope and otherwise renders the digest without " +
+      "the preference and retired records the reader cannot see, stamped with the file's " +
+      "generated_at.",
   },
   {
     surface: "osb://lessons",
     kind: K.mcpResource,
-    category: C.excluded,
+    category: C.covered,
     reason:
-      "same whole-vault-reader class as osb://preferences/active; visibility: is never consulted.",
+      "readLessons (resources.ts) serves Brain/lessons.md's bytes only to a local reader with no " +
+      "owner scope; any other reader gets renderLessonsForReader, handed the request view " +
+      "(owner view ANDed with reachView): a preference or dead-end it cannot read, and every " +
+      "apply-evidence event naming a page it cannot read, is absent, scored at the generation " +
+      "on disk.",
   },
   {
     surface: "osb://digest/latest",
     kind: K.mcpResource,
-    category: C.excluded,
-    reason: "renderDigest() output, same unfiltered whole-vault-reader class; no visibility check.",
+    category: C.covered,
+    reason:
+      "readDigestLatest (resources.ts) hands renderDigest the request view below local reach: a " +
+      "preference or retired record the caller cannot read is absent from every row and count, " +
+      "with the log events, backlink sources and action targets naming one, and the agent " +
+      "summary counts only the events the caller may read; the token-footprint action " +
+      "measures the whole vault.",
   },
   {
     surface: "osb://status",
