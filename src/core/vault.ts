@@ -72,7 +72,16 @@ import {
 } from "./graph/visibility.ts";
 import type { FrontmatterMap, FrontmatterValue, VaultPage } from "./types.ts";
 
-const FRONTMATTER_RE = /^---\s*\n([\s\S]*?)\n---\s*\n?/;
+/**
+ * A leading frontmatter block, its body captured. The opening fence takes
+ * horizontal whitespace only before its line end: with `\s*` there, a run
+ * of blank lines after an unclosed `---` was re-scanned to the end of the
+ * text once per blank line, quadratic in its length. Blank lines after the
+ * fence still open the block; they are the first lines of its body.
+ */
+export const FRONTMATTER_RE = /^---[^\S\n]*\n([\s\S]*?)\n---\s*\n?/;
+/** U+FEFF, which may precede a page's opening fence. */
+const BYTE_ORDER_MARK = 0xfeff;
 /**
  * The key grammar, written once and used by BOTH directions.
  *
@@ -244,11 +253,15 @@ export function parseFrontmatterWithNotices(
  * dropped, exactly as before; only the trace is new.
  */
 export function parseFrontmatterTextWithNotices(
-  text: string,
+  raw: string,
   opts: FrontmatterNoticeOptions = {},
 ): FrontmatterParseWithNotices {
   const notices: DegradationNotice[] = [];
   const site = opts.site ?? FRONTMATTER_SITE;
+  // A byte-order mark before the opening fence (a spreadsheet export, an
+  // editor's UTF-8 setting) must not hide the block: a hidden block is a
+  // hidden `visibility`, and the page would read as open.
+  const text = raw.charCodeAt(0) === BYTE_ORDER_MARK ? raw.slice(1) : raw;
   const match = FRONTMATTER_RE.exec(text);
   if (!match) {
     return [{}, text.trim(), notices];

@@ -39,6 +39,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { join, posix } from "node:path";
 
 import { readerRefView, type ArtifactRefView } from "./artifact-ref-view.ts";
+import { logEntriesAtReach, logEntryAtReach } from "./log-events-at-reach.ts";
 import { buildBacklinkIndex, type BacklinkIndex } from "./backlinks.ts";
 import { computeAgentSummary, type AgentSummaryEntry } from "./digest-agent-summary.ts";
 import { findMergeCandidates } from "./merge-candidates.ts";
@@ -55,7 +56,7 @@ import {
   resolveOwnerScopeDelivery,
 } from "./preferences-collect.ts";
 import { isPreferenceVisible } from "./owner-scoped-facts.ts";
-import { logEntryArtifactRefs, type BrainLogEntry } from "./log.ts";
+import type { BrainLogEntry } from "./log.ts";
 import { listLogDates, readLogDay } from "./log-jsonl.ts";
 import {
   BRAIN_APPLY_RESULT,
@@ -516,7 +517,7 @@ function collectDigestData(
   const idToPrinciple = new Map<string, string>();
   for (const { pref } of preferences) idToPrinciple.set(pref.id, pref.principle);
   for (const { ret } of retiredAll) idToPrinciple.set(ret.id, ret.principle);
-  const logEntries = refs.keep(readLogsInWindow(vault, since, until), logEntryArtifactRefs);
+  const logEntries = logEntriesAtReach(refs, readLogsInWindow(vault, since, until));
   // A shift or contradiction line is one string naming its preference
   // inside other text, so the event-level filter above cannot resolve it;
   // the parsed id is asked on its own.
@@ -564,7 +565,7 @@ function collectDigestData(
     vault,
     since,
     until,
-    refs.filtersNothing ? undefined : (e) => refs.row(...logEntryArtifactRefs(e)),
+    refs.filtersNothing ? undefined : (e) => logEntryAtReach(refs, e) !== null,
   );
 
   // Most-applied (Nd) — mirrors the section in `Brain/active.md`.
@@ -849,7 +850,7 @@ function findFirstAppliedArtifact(
 ): string | null {
   for (const date of listLogDates(vault)) {
     const { entries } = readLogDay(vault, date);
-    for (const e of refs.keep(entries, logEntryArtifactRefs)) {
+    for (const e of logEntriesAtReach(refs, entries)) {
       if (e.eventType !== BRAIN_LOG_EVENT_KIND.applyEvidence) continue;
       if (e.body["result"] !== BRAIN_APPLY_RESULT.applied) continue;
       const prefPayload = e.body["preference"];

@@ -14,6 +14,7 @@ import { planBatches, type BatchPlan } from "../../core/brain/ingest/batch-plan.
 import { clearCheckpoint, PLAN_ID_LABEL } from "../../core/brain/ingest/checkpoint.ts";
 import { assertCheckpointId } from "../../core/brain/checkpoint-store.ts";
 import { ingestSource } from "../../core/brain/ingest/ingest.ts";
+import type { PartsOutcome, TableOutcome } from "../../core/brain/ingest/extract-source.ts";
 import type { CodeEdgeSeed, PreExtractResult } from "../../core/brain/ingest/pre-extract.ts";
 import { reconcilePlan } from "../../core/brain/ingest/reconcile.ts";
 import { IntakeValidationError } from "../../core/brain/intake/extract-intake.ts";
@@ -103,11 +104,47 @@ async function toolBrainIngestSource(
       // it. Always present: absence would read as "full-local" to a caller
       // that never learned the key exists.
       capture_scope: res.captureScope,
+      // Only for an HTML or CSV/TSV source, so a text source's payload is
+      // byte-identical to before. Counts and tokens only, never content.
+      ...(res.parts !== undefined ? { parts: serializeParts(res.parts) } : {}),
+      ...(res.table !== undefined ? { table: serializeTable(res.table) } : {}),
       // Only emitted when the pre-extract pass ran, so a call without it is
       // byte-identical to before (P4).
       ...(res.preExtract !== undefined ? { pre_extract: serializePreExtract(res.preExtract) } : {}),
     };
   });
+}
+
+/** The HTML outcome on the wire: `{extracted, count, omitted?}` or `{extracted: false, reason}`. */
+function serializeParts(parts: PartsOutcome): Record<string, unknown> {
+  if (!parts.extracted) return { extracted: false, reason: parts.reason };
+  return {
+    extracted: true,
+    count: parts.count,
+    ...(parts.omitted !== undefined ? { omitted: parts.omitted } : {}),
+  };
+}
+
+/** The table outcome on the wire, snake_case, `truncated` only when a cap cut it. */
+function serializeTable(table: TableOutcome): Record<string, unknown> {
+  if (!table.rendered) {
+    return {
+      rendered: false,
+      format: table.format,
+      reason: table.reason,
+      ...(table.detail !== undefined ? { detail: table.detail } : {}),
+    };
+  }
+  return {
+    rendered: true,
+    format: table.format,
+    delimiter: table.delimiter,
+    columns: table.columns,
+    rows: table.rows,
+    rows_rendered: table.rowsRendered,
+    ...(table.truncated.length > 0 ? { truncated: [...table.truncated] } : {}),
+    redacted_cells: table.redactedCells,
+  };
 }
 
 /** The pre-extract result with its edge keys in the payload's snake_case. */
@@ -183,7 +220,10 @@ async function toolBrainSearchBySource(
   args: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const sourceFile = coerceStr(args, "source_file", true)!;
-  const hits = searchBySourceFile(ctx.vault, sourceFile);
+  // A page the caller may not read at its reach (a summary page that
+  // inherited a reserved source's visibility) is answered as an absent one.
+  const readable = readableAtContextReach(ctx);
+  const hits = searchBySourceFile(ctx.vault, sourceFile).filter((entry) => readable(entry.path));
   // Owner-scope isolation (context-integrity-gates, Unit A). Every entry
   // names a Brain page, so the ownership rule applies through the same
   // path-based resolver the ranked search path uses - including its
@@ -254,8 +294,9 @@ export function serializeBatchPlan(plan: BatchPlan): Record<string, unknown> {
     skipped: [...plan.skipped],
     // Only emitted when the extractable gate skipped something, so a plan with
     // no extractable declaration serializes byte-identically to before. The
-    // reason is the typed token (P4) and `detail` carries the schema_type
-    // value behind it, so a reader can check the skip without re-reading.
+    // reason is the typed token (P4) and `detail` carries the value behind
+    // it - the schema_type, or the format of a format skip - so a reader can
+    // check the skip without re-reading.
     ...(plan.skippedNonExtractable.length > 0
       ? {
           skipped_non_extractable: plan.skippedNonExtractable.map((s) => ({
@@ -298,7 +339,13 @@ export function serializeBatchPlan(plan: BatchPlan): Record<string, unknown> {
     batches: plan.batches.map((b) => ({
       index: b.index,
       total_bytes: b.totalBytes,
-      files: b.files.map((f) => ({ path: f.path, bytes: f.bytes, status: f.status })),
+      // `format` only for a non-text file, so a Markdown plan is unchanged.
+      files: b.files.map((f) => ({
+        path: f.path,
+        bytes: f.bytes,
+        status: f.status,
+        ...(f.format !== undefined ? { format: f.format } : {}),
+      })),
     })),
   };
 }

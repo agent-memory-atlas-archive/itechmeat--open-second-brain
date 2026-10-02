@@ -915,6 +915,12 @@ with a registered next command, `src/core/brain/doctor-exits.ts` for those
 without) and is CI-enforced by `tests/core/brain/doctor-exit-census.test.ts`,
 which fails on a code that appears in neither table.
 
+Since v1.69.0 the `orphan-evidence` and `malformed-evidence-range`
+findings carry `sources` (the preference the evidence is about) and
+`removed-tool-reference` carries `path` (vault-relative on the MCP
+wire), so every finding names its record structurally and `brain_doctor`
+leaves out a finding about a record the caller cannot read at its reach.
+
 With `--strict`, warnings demote `ok` to `false` so CI can gate on
 hygiene. `brain_doctor` itself stays read-only — auto-modifying state on
 a plain doctor run would break the "explicit-driven" invariant. The
@@ -1351,6 +1357,14 @@ containment only. On an existing overview or module note the new
 regions are appended at the end of the note, once, so the first run
 after an upgrade reports those notes `updated`.
 
+Since v1.69.0, when modules declare edges but every one of them touches
+such a module, the `module-dependencies` region says so in a fixed
+sentence and lists the dropped edges as code spans instead of claiming
+that no module depends on another; with some edges drawn, one line under
+the diagram names the dropped ones. A module note names the modules it
+depends on but cannot link on a `Not linked:` line, and its
+`depends_on` key still holds only links.
+
 ## The agent write contract (since v0.41.0)
 
 The Brain core stays deterministic - no LLM ever runs inside it. The write-session protocol is how that rule survives contact with agents that need to PROPOSE structured artifacts: schema-typed notes, handoffs, curated summaries, panel deliberations.
@@ -1484,6 +1498,87 @@ as backed only while its excerpt still matches its digest, and quarantined
 pages are skipped: they already carry the `untrusted_source` marker, which
 names the same condition (and which the retrieval trust gate excludes when
 `search_trust_gate_enabled` is on).
+
+## Non-Markdown sources (since v1.69.0)
+
+Ingest used to be text only: a file that was not Markdown or plain text
+was counted per extension and set aside. One format registry now maps a
+file's extension to a format and each format to an extractor. Markdown
+and the lightweight markups are read as they are; CSV, TSV and HTML are
+extracted; PDF, the Office formats, EPUB, RTF and images are named but
+not extracted, so the ingest plan lists each such file with reason
+`format-not-extractable` and its format, the hook a caller that runs
+its own converter or OCR routes on. Open Second Brain adds no parser
+dependency and runs no external program for this.
+
+The calling agent still writes the summary of a source. What the kernel
+adds is structure it can derive without judgement, written onto the
+summary page, because the summary page is what search indexes: the
+source file itself is not a Markdown page. `brain_ingest_source` does
+this by format, for a file in the vault, in the trusted lane, after
+the same reach check every reader applies, and reads the bytes once to
+derive the section and its `source_content_hash`.
+
+For HTML, a linear scanner (no regular expression over unbounded input)
+reduces the page to text: comments, scripts, styles and embedded SVG or
+MathML are dropped, entities are decoded, a `<private>` region becomes
+its placeholder and no attribute value is ever kept. The headings become
+parts, each with its level, its trail of ancestor headings and its line
+span in the extracted text. Only the parts reach the page, under
+`## Parts` inside one fenced block, so a heading that holds `[[...]]` or
+`#word` adds no link and no tag while full-text search still finds it.
+Each heading and the title are redacted (`key=value` credentials and URL
+userinfo) before they are capped, over their first 4,096 code units (a
+longer one ends in `…`), and in the parts list a backslash is written
+as `\\` and a `|` as `\|`, so a heading cannot forge a line span.
+The text itself stays out of the page; `o2b brain extract --json`
+returns it.
+
+For CSV and TSV, the first record is the header. Quoted fields follow
+RFC 4180 leniently, a semicolon export is recognised from its first
+record (at least two fields on semicolons and more than on commas, so a
+header such as `name;"price, eur";qty` reads as three columns), and an
+unterminated quote is refused by name with the record number. A leading
+frontmatter block in the source is skipped for HTML and tables alike, so
+it is never read as data. The rows are rendered as fenced plain text,
+not a Markdown table, in groups that each repeat the header and stay
+under one search chunk, so every chunk of the page carries the column
+names and a `Table > Rows a-b` heading path. Rows, columns, cell length
+and section size are capped, and every cut is named; only the first
+4,096 code units of a cell are read for redaction, and a longer cell
+counts as cut. A `<private>` region is hidden before the records are
+split, so a region spanning records hides every row between its tags. A column whose header names a
+credential has its values replaced, and every other cell goes through
+the output redactor. Inside a cell a backslash, `|`, a backtick, a line
+feed, a carriage return and a tab are escaped (`\\`, `\|`, ``\` ``,
+`\n`, `\r`, `\t`), and every other control character (C0, DEL and C1)
+is written as `\u{XXXX}` with its code point in four uppercase
+hexadecimal digits, so no row
+line can open or close a fence and no escape sequence reaches a
+terminal. One limit of the chunk alignment remains, and it loses no
+content: a single row longer than one group's token budget forms a
+group of its own and can still be split across search chunks.
+
+The redactor does not catch everything in a cell. It replaces whole
+columns under a credential-named header, `key=value` and `key: value`
+pairs, JSON entries, Bearer tokens, JWTs, private regions and URL
+userinfo. It does not redact a bare vendor token (an access key with a
+vendor prefix and nothing naming it), a base64 or other high-entropy
+blob, a PEM block inside a quoted multi-line cell, or a credential-like
+value under a header that does not name a credential. Bare tokens are
+left on purpose, because a token pass would also erase order ids, SKUs
+and hashes. Such a value reaches the summary page, full-text search and
+the embeddings, as it already sits in the source file in the vault.
+
+A summary page that carries a derived section is at most as visible as
+its source: it takes on the source's own `visibility` tokens, so a reader
+that cannot read the source cannot read what was derived from it. When
+the page already had a `visibility`, it gets the audience both the
+operator and the source allow; when they share none, the page is
+withheld below local reach.
+
+A Markdown or text source gets nothing new: its page is byte for byte
+what it was.
 
 ## Safety properties
 

@@ -1189,6 +1189,65 @@ unquoted. `--json` adds `capture_scope` (always: `full-local`,
 `unpaired`, `findings` (each `{ claim, outcome, span }`, capped at 25 with
 `total`, `returned` and `truncated`).
 
+### Non-Markdown sources (since v1.69.0)
+
+```text
+o2b brain extract             <file> [--json] - read-only preview of what ingest derives from a file, chosen by its extension; writes nothing
+o2b brain batch-plan          plans .csv .tsv .html .htm by default; a planned file of a non-text format shows it: "- <path> (<status>, <bytes>B, <format>)"; PDF, Office, EPUB, RTF and image files are listed as format-not-extractable with their format instead of counted as unclassifiable
+```
+
+`o2b brain extract` reads one file (a path on disk, inside a vault or
+not) up to 8 MiB and prints what `brain_ingest_source` would derive from
+it. For HTML it prints the title and one line per part:
+
+```text
+extract: <file> (html)
+  title: Release notes
+  2 part(s):
+    h1 Overview | lines 1-2
+    h2 Overview > Install | lines 3-4
+```
+
+`--json` adds the extracted `text` and each part's `index`, `level`,
+`heading`, `trail`, `line_start`, `line_end` and `source_offset` (the
+byte offset of its start tag in the source file), plus `parts_omitted` when more than 256
+headings were found. A leading frontmatter block in the file is left
+out, as ingest leaves it out. Each heading and the title are redacted
+(`key=value` credentials and URL userinfo) over their first 4,096 code
+units before they are capped at 200 characters (a longer one ends in
+`…`), and in the parts list a backslash in a heading is written as `\\`
+and a `|` as `\|`.
+The `text` has every `<private>` region replaced by its placeholder and
+is otherwise not redacted; it is a preview of a file the caller already
+reads, and it never reaches a page. For CSV and TSV it prints the delimiter and the
+counts, then the `## Table` section the summary page would hold:
+
+````text
+extract: <file> (csv)
+  comma-delimited, 2 column(s), 2 row(s), 2 rendered, 0 redacted cell(s)
+## Table
+
+### Rows 1-2
+
+```table
+name | qty
+bolt | 4
+nut | 7
+```
+````
+
+Any other file prints `not extracted: <reason>`, and `--json` returns
+`{ok: true, path, extracted: false, format, reason, detail?}`:
+`format-read-verbatim`
+for Markdown and plain text, `format-not-extractable` for a named format
+such as PDF, `format-unknown` (with `format: null`) for an extension the
+registry does not know (a named or unknown format is answered from the
+extension, without reading the file), and `not-a-regular-file`, `source-too-large`,
+`not-utf8` or a table refusal for a file that could not be read or
+parsed. The exit code is `0` in every one of these cases: a file that
+cannot be extracted is a result, not an error. A path that does not
+exist or is a symbolic link is an error (exit code `1`).
+
 ### Knowledge packs
 
 A knowledge pack is a selected subset of Brain knowledge - rules and the

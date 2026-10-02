@@ -47,6 +47,112 @@ instruction files such as `CLAUDE.md`/`AGENTS.md`, installed
 `.claude/skills/`) and warns with the exact replacement for any stale
 reference it finds (`removed-tool-reference`).
 
+## Upgrading to 1.69.0
+
+No step below is required. Ten changes are visible to an operator or a
+client.
+
+**CSV, TSV and HTML files are planned by default.** `o2b brain
+batch-plan` and `brain_ingest_batch_plan` now discover `.csv`, `.tsv`,
+`.html` and `.htm` files beside the Markdown and plain-text ones, and a
+planned file of one of these formats carries its `format`. The plan id
+of a tree holding such files therefore changes, and a resume checkpoint
+written for that tree before the upgrade no longer matches it; a tree of
+Markdown and plain-text files plans exactly as before. An `extensions`
+override is honoured as before.
+
+**PDF, Office, EPUB, RTF and image files are named, not counted.** A
+`.png`, `.pdf`, `.docx` or another file of a format the registry names
+but does not extract moves from the `unclassifiable` counts to
+`skipped_non_extractable`, one entry per file with reason
+`format-not-extractable` and the format as `detail`, so
+`skip_reason_counts` gains the `format-not-extractable` key and the plan
+id of a tree holding such files changes too. A reader that summed
+`unclassifiable` sees fewer files there and finds them in
+`skipped_non_extractable`.
+
+**Ingesting an HTML, CSV or TSV source adds a derived section.**
+`brain_ingest_source` writes a `## Parts` section (HTML headings and
+their line spans) or a `## Table` section (the rows as fenced plain
+text) onto the summary page of an in-vault source of these formats,
+with `source_format`, `source_content_hash` and, for a table, five
+`table_*` frontmatter keys, and returns `parts` or `table`. The first
+ingest after the upgrade of a CSV, TSV or HTML source already ingested
+rewrites its page once with the new section and keys. Text and Markdown
+sources are unchanged. A leading frontmatter block in such a source is
+not data: it is never rendered as a table row or as text. Table cells
+and headings pass the redactor; see [`mcp.md`](mcp.md) for what it
+catches and what it does not.
+
+**A summary page carries its source's visibility, and a re-ingest keeps
+the operator's.** A summary page with a derived section takes on its
+source's `visibility`, so a source an operator reserved yields a summary
+page reserved the same way. When both the page and the source declare
+tokens, the page gets the audience both the operator and the source
+allow; when they share none, the page is withheld below local reach. An
+operator-set `visibility` on any summary page used to be dropped when
+the source was ingested again; it is now kept, the way `created_at` is,
+for every source format. A byte-order mark before a frontmatter block
+no longer hides that block, on any page.
+
+**`brain_recall_gate` accepts `turn_id` and bounds its correlation
+arguments.** The optional argument (at most 512 characters) the Hermes
+plugin sends was refused by the closed input schema; it is now accepted
+and recorded on the `gate_telemetry` record. A `turn_id`, `session_id`
+or `telemetry_host` longer than its bound (512, 512 and 200 characters)
+is now refused with `INVALID_PARAMS` before the gate runs, with
+telemetry on or off; it used to be dropped from the telemetry record
+without a word, and not checked at all with telemetry off.
+
+**Multi-line prompts that start with a command name are now admitted.**
+The recall surfacing gate skipped a prompt whose first word is a command
+name such as `git` or `ls` as a shell command, even when the prompt went
+on over more lines. Such a multi-line prompt now retrieves. A
+single-line prompt that starts with a command name is still skipped as
+`shell_command`.
+
+**The daily and weekly briefs and the recall verdict answer at the
+caller's reach.** Below local reach the daily and weekly `brain_brief`
+views leave out rows and source pointers that only a record the caller
+cannot read accounts for, recompute `events_by_kind` and `vault_delta`
+from the events the caller may see, take no report snapshot and show no
+`delta`. The empty-search coverage verdict of `brain_search` and
+`brain_recall_gate` counts a root as reached only through a page the
+caller can read, so it no longer flips on a root that holds only pages
+the caller cannot read.
+
+**More readers treat a page or record the caller cannot read at its
+reach as absent.** Below local reach the daily log pages are no longer
+served by the generic page readers (`brain_search` and every tool that
+reads a page by path). `brain_analytics` `view="timeline"`,
+`view="belief_evolution"` and `view="concept_synthesis"`, the today,
+digest and `brain_event_trace` views, `brain_claims`, `brain_backlinks`,
+the `osb://backlinks`, `osb://log`, `osb://topic` and `osb://preference`
+resources, `brain_query` with `since`, `topic` or `preference`,
+`brain_moc_audit` and every `brain_doctor` finding answer at the
+caller's reach. `brain_search_by_source` and `brain_delete_by_source`
+honour the reach of a derived summary page, and a `brain_ingest_source`
+below local reach leaves a summary page the caller cannot read
+untouched. An entity intake of a source reserved against remote reads
+records no `source_content_hash`. The `brain_doctor` findings
+`orphan-evidence` and `malformed-evidence-range` gain `sources`, and
+`removed-tool-reference` gains `path` (vault-relative on the wire); the
+messages are unchanged. A local caller and the CLI see no change. See
+[`mcp.md`](mcp.md) for the full list.
+
+**Private regions open more readily.** An open `<private>` tag whose
+attributes hold a `<`, or that never closes, now opens a region, in the
+redactor, the session-recall externalisation and the continuity
+redaction alike; the text after it is hidden or flagged private where
+it used to pass. Private regions and table cells are now redacted in
+linear time.
+
+**Architecture notes name the edges a link cannot carry.**
+`o2b brain architect` no longer says that no module depends on another
+when every declared edge touches a module whose name a link cannot
+carry: it lists those edges as code spans, so an overview or module note
+in that state reports `updated` once.
+
 ## Upgrading to 1.68.0
 
 No step below is required. Six changes are visible to an operator or a

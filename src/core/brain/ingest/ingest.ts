@@ -32,6 +32,7 @@ import {
 import { dirname, join, relative } from "node:path";
 
 import type { FrontmatterMap } from "../../types.ts";
+import { normToken, REMOTE_DENY_VISIBILITY_TOKEN } from "../../graph/visibility.ts";
 import { canonicalNotePath, ensureInsideVault } from "../../path-safety.ts";
 import { assertCheckpointId } from "../checkpoint-store.ts";
 import {
@@ -58,6 +59,7 @@ import {
 } from "../provenance/provenance.ts";
 import { PLAN_ID_LABEL, recordCompleted } from "./checkpoint.ts";
 import { readManifest, updateManifest } from "./content-manifest.ts";
+import { deriveSourceSection, type PartsOutcome, type TableOutcome } from "./extract-source.ts";
 import {
   isCodeStructureSource,
   preExtractCodeStructure,
@@ -105,7 +107,8 @@ export interface IngestSourceOptions {
   /**
    * May the caller read the vault file at this vault-relative path? Handed to
    * the intake: a source the predicate refuses is classified as one with no
-   * local bytes (untrusted lane, no digest, `url-only`). A local caller passes
+   * local bytes (untrusted lane, no digest, `url-only`). A summary page it
+   * refuses is left as it is and answered as absent. A local caller passes
    * nothing.
    */
   readonly readable?: (rel: string) => boolean;
@@ -137,7 +140,26 @@ export interface IngestSourceResult {
    * never a fake empty success. Absent entirely when the pass was off.
    */
   readonly preExtract?: PreExtractResult;
+  /**
+   * What the HTML extractor made of an HTML source: a part count, or the
+   * named reason there is no `## Parts` section. Absent for every other
+   * format.
+   */
+  readonly parts?: PartsOutcome;
+  /**
+   * What the table note made of a CSV or TSV source: its counts, or the
+   * named reason there is no `## Table` section. Absent for every other
+   * format.
+   */
+  readonly table?: TableOutcome;
 }
+
+/**
+ * Frontmatter key an operator sets to scope a page's visibility. Kept on a
+ * rewrite like `created_at`: dropping it on re-ingest would widen a page the
+ * operator narrowed.
+ */
+const VISIBILITY_FRONTMATTER_KEY = "visibility";
 
 function renderLinkSection(heading: string, ids: readonly string[]): string {
   if (ids.length === 0) return "";
@@ -188,6 +210,9 @@ export function ingestSource(
   const captureScope = captureScopeForTrust(trust);
   const connections = intake.entitiesUpdated;
   const allEntities = [...intake.entitiesCreated, ...intake.entitiesUpdated];
+  // After the intake, which decided the lane: the derived section reads the
+  // source only in the trusted lane and only at the caller's reach.
+  const derivation = deriveSourceSection(vault, canonicalSource, trust, opts.readable);
 
   // The page filename keys on the source-identity hash, not just the slug:
   // two distinct non-ASCII / symbol-only source paths can slugify to the same
@@ -196,10 +221,19 @@ export function ingestSource(
   // source path always yields the same hash, hence the same file).
   const sourceHash = sourceIdentityHash([canonicalSource]);
   const absPath = sourcePagePath(vault, `${slugify(canonicalSource)}-${sourceHash.slice(0, 12)}`);
-  const existed = existsSync(absPath);
+  // A summary page the caller may not read (it inherited a reserved
+  // source's visibility) is neither read nor rewritten, and the answer is
+  // the one an absent page gets: its path is deterministic, so `created`
+  // would otherwise tell the caller the page exists.
+  const summaryPath = canonicalNotePath(relative(vault, absPath));
+  const withheld = existsSync(absPath) && opts.readable?.(summaryPath) === false;
+  const existed = !withheld && existsSync(absPath);
   const stamp = isoSecond(opts.now);
-  // Preserve the original created_at on a re-ingest; bump updated_at.
-  const createdAt = existed ? readCreatedAt(absPath, stamp) : stamp;
+  // Preserve the original created_at and an operator-set visibility on a
+  // re-ingest; bump updated_at.
+  const kept: KeptFrontmatter = existed
+    ? readKeptFrontmatter(absPath, stamp)
+    : { createdAt: stamp };
 
   const meta: FrontmatterMap = {
     kind: BRAIN_SOURCE_KIND,
@@ -214,9 +248,14 @@ export function ingestSource(
     // Says how much of the source was captured when it is less than the
     // whole file; a full-local source adds nothing, for the same reason.
     ...captureScopeFrontmatter(captureScope),
-    created_at: createdAt,
+    // An HTML, CSV or TSV source read in the trusted lane names its format,
+    // the digest of the bytes the section was derived from, and its own
+    // keys. Every other source adds nothing.
+    ...derivation?.frontmatter,
+    created_at: kept.createdAt,
     updated_at: stamp,
     tags: ["brain", "brain/source"],
+    ...visibilityFrontmatter(kept.visibility, derivation?.visibility),
   };
 
   const body = [
@@ -224,6 +263,7 @@ export function ingestSource(
     renderProvenanceSection(provenance),
     renderLinkSection("Entities", allEntities),
     renderLinkSection("Connections to existing notes", connections),
+    derivation?.section ?? "",
   ]
     .filter((section) => section.length > 0)
     .join("\n\n");
@@ -234,7 +274,7 @@ export function ingestSource(
   // unchanged source truly inert.
   const nextContents = formatFrontmatter(meta, body);
   const unchanged = existed && readFileSync(absPath, "utf8") === nextContents;
-  if (!unchanged) {
+  if (!withheld && !unchanged) {
     mkdirSync(dirname(absPath), { recursive: true });
     writeFrontmatterAtomic(absPath, meta, body, { overwrite: true });
   }
@@ -250,7 +290,10 @@ export function ingestSource(
   // Only in the trusted lane, which the intake grants only to a file the
   // caller may read at its reach: a source answered as absent records no
   // digest anywhere, the manifest included.
+  // Nor when the page was withheld: the manifest would then record a
+  // summary as current that this call did not write.
   if (
+    !withheld &&
     trust === INTAKE_TRUST.trusted &&
     resolvesInsideVault(vault, canonicalSource) &&
     existsSync(join(vault, canonicalSource))
@@ -274,13 +317,15 @@ export function ingestSource(
   }
 
   return {
-    summaryPath: canonicalNotePath(relative(vault, absPath)),
+    summaryPath,
     created: !existed,
     entitiesCreated: intake.entitiesCreated,
     entitiesUpdated: intake.entitiesUpdated,
     connections,
     captureScope,
     ...(preExtract !== undefined ? { preExtract } : {}),
+    ...(derivation?.parts !== undefined ? { parts: derivation.parts } : {}),
+    ...(derivation?.table !== undefined ? { table: derivation.table } : {}),
   };
 }
 
@@ -297,7 +342,8 @@ const SOURCE_UNREAD = Object.freeze({
   tooLarge: "larger than the read limit",
 } as const);
 
-type SourceUnread = (typeof SOURCE_UNREAD)[keyof typeof SOURCE_UNREAD];
+/** Why {@link readSourceBounded} read no text. */
+export type SourceUnread = (typeof SOURCE_UNREAD)[keyof typeof SOURCE_UNREAD];
 
 /**
  * How a source is opened: read-only and never blocking, so a FIFO met
@@ -310,32 +356,37 @@ const SOURCE_OPEN_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0);
 
 /**
  * Read a source through ONE descriptor, so the checks hold for the bytes
- * read: the descriptor must be a regular file, and no more than
- * {@link PRE_EXTRACT_MAX_SOURCE_BYTES} is read however large the file has
- * grown since the `fstat`.
+ * read: the descriptor must be a regular file, and no more than `maxBytes`
+ * is read however large the file has grown since the `fstat`. The buffer is
+ * sized to the file plus one byte, so a small source costs a small buffer;
+ * a file that grew under the cap is read on into one buffer of the cap plus
+ * one byte. `bytes` are exactly the bytes read, for a caller that must judge
+ * their encoding itself.
  */
-function readSourceBounded(
+export function readSourceBounded(
   absolute: string,
+  maxBytes: number,
 ):
-  | { readonly text: string; readonly unread?: undefined }
-  | { readonly text: null; readonly unread: SourceUnread } {
+  | { readonly text: string; readonly bytes: Uint8Array; readonly unread?: undefined }
+  | { readonly text: null; readonly bytes?: undefined; readonly unread: SourceUnread } {
   const fd = openSync(absolute, SOURCE_OPEN_FLAGS);
   try {
     const stat = fstatSync(fd);
     if (!stat.isFile()) return { text: null, unread: SOURCE_UNREAD.notAFile };
-    if (stat.size > PRE_EXTRACT_MAX_SOURCE_BYTES)
-      return { text: null, unread: SOURCE_UNREAD.tooLarge };
-    // One byte past the cap, so growth since the fstat is seen.
-    const buffer = Buffer.allocUnsafe(PRE_EXTRACT_MAX_SOURCE_BYTES + 1);
+    if (stat.size > maxBytes) return { text: null, unread: SOURCE_UNREAD.tooLarge };
+    // One byte past the size, so growth since the fstat is seen.
+    let buffer = Buffer.allocUnsafe(stat.size + 1);
     let filled = 0;
     for (;;) {
+      // A full buffer is under the cap here: past it, the loop has returned.
+      if (filled === buffer.length) buffer = Buffer.concat([buffer], maxBytes + 1);
       const count = readSync(fd, buffer, filled, buffer.length - filled, null);
       if (count === 0) break;
       filled += count;
-      if (filled > PRE_EXTRACT_MAX_SOURCE_BYTES)
-        return { text: null, unread: SOURCE_UNREAD.tooLarge };
+      if (filled > maxBytes) return { text: null, unread: SOURCE_UNREAD.tooLarge };
     }
-    return { text: buffer.toString("utf8", 0, filled) };
+    const bytes = buffer.subarray(0, filled);
+    return { text: bytes.toString("utf8"), bytes };
   } finally {
     closeSync(fd);
   }
@@ -380,7 +431,7 @@ function runPreExtract(
   };
   let content: string;
   try {
-    const read = readSourceBounded(join(vault, canonicalSource));
+    const read = readSourceBounded(join(vault, canonicalSource), PRE_EXTRACT_MAX_SOURCE_BYTES);
     if (read.text === null) return read.unread === SOURCE_UNREAD.tooLarge ? tooLarge : noBytes;
     content = read.text;
   } catch {
@@ -415,9 +466,53 @@ function resolvesInsideVault(vault: string, canonicalSource: string): boolean {
   }
 }
 
-/** Read a stable `created_at` from an existing summary page, else fall back. */
-function readCreatedAt(absPath: string, fallback: string): string {
+/** The frontmatter a rewrite keeps from the page it replaces. */
+interface KeptFrontmatter {
+  readonly createdAt: string;
+  readonly visibility?: FrontmatterMap[string];
+}
+
+/**
+ * Read the stable `created_at` and an operator-set `visibility` from an
+ * existing summary page; `created_at` falls back to `fallback`.
+ */
+function readKeptFrontmatter(absPath: string, fallback: string): KeptFrontmatter {
   const [meta] = parseFrontmatter(absPath);
   const value = meta["created_at"];
-  return typeof value === "string" && value.length > 0 ? value : fallback;
+  const createdAt = typeof value === "string" && value.length > 0 ? value : fallback;
+  const visibility = meta[VISIBILITY_FRONTMATTER_KEY];
+  return visibility === undefined || visibility === null
+    ? { createdAt }
+    : { createdAt, visibility };
+}
+
+/**
+ * The summary page's `visibility`. The page's audience is never wider than
+ * the source's or the operator's: when only one side declares tokens, that
+ * side's tokens are written (a page with neither gains none); when both do,
+ * the page keeps the tokens both allow, and when they share none it gets
+ * the reserved token, so it is withheld below local reach rather than
+ * widened. The reserved token is kept whenever either side carries it.
+ */
+function visibilityFrontmatter(
+  kept: KeptFrontmatter["visibility"],
+  source: readonly string[] | undefined,
+): FrontmatterMap {
+  if (source === undefined || source.length === 0) {
+    return kept !== undefined ? { [VISIBILITY_FRONTMATTER_KEY]: kept } : {};
+  }
+  let keptTokens: string[] = [];
+  if (Array.isArray(kept)) keptTokens = kept.map((k) => normToken(String(k)));
+  else if (kept !== undefined) keptTokens = [normToken(String(kept))];
+  keptTokens = keptTokens.filter((k) => k.length > 0);
+  if (keptTokens.length === 0) return { [VISIBILITY_FRONTMATTER_KEY]: [...source] };
+  const merged = source.filter((token) => keptTokens.includes(token));
+  const reserved =
+    merged.length === 0 ||
+    keptTokens.includes(REMOTE_DENY_VISIBILITY_TOKEN) ||
+    source.includes(REMOTE_DENY_VISIBILITY_TOKEN);
+  if (reserved && !merged.includes(REMOTE_DENY_VISIBILITY_TOKEN)) {
+    merged.push(REMOTE_DENY_VISIBILITY_TOKEN);
+  }
+  return { [VISIBILITY_FRONTMATTER_KEY]: merged };
 }

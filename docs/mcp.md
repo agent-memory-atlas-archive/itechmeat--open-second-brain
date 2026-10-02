@@ -508,7 +508,10 @@ to its owning vault at the configuration level. `brain_idea_lineage` accepts `id
 `max_depth`. `brain_note_history` accepts `path` and optional `gap_hours` /
 `max_count`.
 `brain_recall_gate` accepts optional `previous_prompt` and
-`explicit`; `explicit: true` always returns `retrieve: true`.
+`explicit`; `explicit: true` always returns `retrieve: true`. Since
+v1.69.0 it also accepts an optional `turn_id` (a string of at most 512
+characters), recorded on the `gate_telemetry` record when that telemetry
+is on.
 
 Optional decision-model `answerable` signal (see
 [decision-models/answerable.md](decision-models/answerable.md)): with rerank
@@ -2094,3 +2097,126 @@ format characters), when it contains NUL, or when it exceeds the cap.
   (`.tf`, `.tfvars`) and redacts credentials in import specifiers
   (see `o2b brain pre-extract` in
   [`cli-reference.md`](cli-reference.md)).
+- Since v1.69.0 ingest reads more than Markdown. One format registry
+  maps a file's extension to a format: Markdown and the lightweight
+  markups (`.md`, `.markdown`, `.txt`, `.text`, `.rst`, `.org`) are read
+  as they are, CSV, TSV and HTML (`.csv`, `.tsv`, `.html`, `.htm`) are
+  extracted, and PDF, the Office formats (`docx`, `xlsx`, `pptx`, `odt`,
+  `ods`, `odp`), EPUB, RTF and images are named but not extracted.
+  `brain_ingest_batch_plan` plans CSV, TSV and HTML files by default, and
+  a planned file whose format is not text carries `format` beside
+  `status`. A file of a named format that is not extracted is listed in
+  `skipped_non_extractable` with reason `format-not-extractable` and the
+  format as `detail` (before the schema skips, and counted in
+  `skip_reason_counts`) instead of adding to `unclassifiable`; an
+  `extensions` override that lists its extension still plans it.
+  `brain_ingest_source` derives a section from an HTML, CSV or TSV file
+  in the vault, by format and with no new argument, in the trusted lane
+  and only from a file the caller can read at its reach. The page gains
+  `source_format` and `source_content_hash`, and the derived section
+  comes after `## Connections to existing notes`. For HTML, `## Parts`
+  holds one fenced block with one line per heading, `h<level> <trail> |
+  lines <a>-<b>` (the trail joins the ancestor headings with ` > `, the
+  line span is 1-based in the extracted text), never body text: at most
+  256 parts, each heading capped at 200 characters; the result gains
+  `parts` (`{extracted: true, count, omitted?}` or `{extracted: false,
+  reason}`). For CSV and TSV, `## Table` holds fenced plain-text row
+  groups under `### Rows <a>-<b>`. The first record is always the header,
+  and every group repeats it, so each search chunk of the page carries
+  it, except the later pieces of a single row longer than a group's
+  token budget, which can still be split across chunks; a group holds at
+  most 50 rows and 600 tokens. A `.csv` file is read as
+  semicolon-delimited when its first record has at least two fields on
+  semicolons and more than on commas. Cells are joined by ` | `; inside
+  a cell a backslash, `|`, a backtick, a line feed, a carriage return
+  and a tab are written as `\\`, `\|`, ``\` ``, `\n`, `\r` and `\t`, and
+  every other control character (C0, DEL and C1) as `\u{XXXX}` with its
+  code point in four uppercase hexadecimal digits, so no cell can end the fence or reach a
+  terminal raw. The caps are 1,000 rows, 64 columns, 256 characters per
+  cell and 256 KiB per section, and each cut is named in
+  `table_truncated`; only the first 4,096 code units of a cell are read
+  for redaction, and a longer cell counts as cut. A `<private>` region
+  is hidden before the records are split, so a region spanning records
+  hides every row between its tags. Each HTML heading is redacted
+  (`key=value` credentials and URL userinfo) before it is capped, only
+  its first 4,096 code units are read for that (a longer heading ends in
+  `…`), and in the parts list a backslash in a heading is written as
+  `\\` and a `|` as `\|`. The page gains
+  `table_delimiter`, `table_columns`, `table_rows`,
+  `table_rows_rendered` and `table_truncated` (absent when nothing was
+  cut); the result gains `table` (`{rendered: true, format, delimiter,
+  columns, rows, rows_rendered, truncated?, redacted_cells}` or
+  `{rendered: false, format, reason, detail?}`, with reasons
+  `source-not-local`, `not-utf8`, `contains-nul`, `malformed-quoting`
+  and `empty`). Every value in a column whose header names a credential
+  is replaced, and every other cell goes through the output redactor
+  with URL credentials included; `redacted_cells` counts both. A
+  credential no pass recognises stays on the indexed page and in its
+  embeddings, as it already sits in the file in the vault. A summary page
+  that carries a derived section is at most as visible as its source: it
+  takes on the source's own `visibility` tokens; when the page already
+  had a `visibility`, it gets the audience both the operator and the
+  source allow; when they share none, the page is withheld below local
+  reach. A leading frontmatter block in an
+  HTML, CSV or TSV source is not extracted, so it is never read as table
+  data or text. A URL source, an absent file and a file the caller
+  cannot read at its reach all answer `source-not-local`, with no digest and no section. A Markdown or
+  text source has no `parts` and no `table` key and its page is
+  unchanged. An operator-set `visibility` on a summary page is now kept
+  when its source is ingested again. `brain_recall_gate` accepts an
+  optional `turn_id` (a string of at most 512 characters), recorded on
+  the `gate_telemetry` record, and refuses a `turn_id` or `session_id`
+  over 512 characters or a `telemetry_host` over 200 with
+  `INVALID_PARAMS` before it runs, with telemetry on or off. The recall
+  verdict's root coverage and the ids of the daily and weekly
+  `brain_brief` views answer at the caller's reach: below local reach a
+  root counts as reached only through a page the caller can read, and
+  the daily and weekly views leave out the status transitions,
+  retirements and contradictions that name a record the caller cannot
+  read (under its `pref-` or its `ret-` id), withhold a source pointer
+  when every evidence event citing it is about such a record, or when
+  the pointer names a page the caller cannot read, recompute the
+  `events_by_kind` and `vault_delta` counts from the events the caller
+  may see, and take no report snapshot and show no `delta`. The monthly
+  and operator views, and the today view outside its recent activity,
+  still count over the whole Brain layer and name no record. The
+  read-only preview of the same
+  extraction is the CLI verb `o2b brain extract` (see
+  [`cli-reference.md`](cli-reference.md)).
+- Since v1.69.0 more readers treat a page or record the caller cannot
+  read at its reach as absent; a local caller and the CLI see no change.
+  Below local reach the daily log pages (`Brain/log/`, the JSONL
+  sidecars included) are not served by the generic page readers
+  (`brain_search` and every other tool that reads a page by path).
+  `brain_analytics` `view="timeline"`, `view="belief_evolution"` and
+  `view="concept_synthesis"`, `brain_brief` `view="today"`,
+  `view="digest"` and `brain_event_trace`, `brain_claims` (current and
+  history), `brain_backlinks` and `osb://backlinks/{id}`,
+  `osb://log/{date}`, `osb://topic/{topic}`, `osb://preference/{id}`,
+  `brain_query` with `since`, `topic` or `preference`, `brain_moc_audit`
+  and every `brain_doctor` finding answer at the caller's reach: a record
+  is judged under each id it answers to (`pref-` and `ret-`), a log
+  entry naming such a record is dropped before any limit or total, and a
+  dream shared with a readable record is kept with its readable
+  transitions only. `osb://log/{date}` re-renders the day from the kept
+  entries. A refused preference or hub answers as an absent one, and a
+  refused MOC member is neither listed nor sized. The `brain_doctor`
+  findings `orphan-evidence` and `malformed-evidence-range` now carry
+  `sources` (the preference the evidence is about) and
+  `removed-tool-reference` carries `path` (vault-relative on the wire),
+  so each names its record structurally; the messages are unchanged.
+  `brain_search_by_source` and `brain_delete_by_source` honour the reach
+  of a derived summary page: such a page, and the content-manifest entry
+  of a source the caller cannot read, are left out of the answer and
+  left in place. A `brain_ingest_source` below local reach leaves a
+  summary page the caller cannot read untouched and answers as a first
+  ingest would. An entity intake of a source that is reserved against
+  remote reads records no `source_content_hash`. A byte-order mark
+  before a frontmatter block no longer hides that block, so its
+  `visibility` applies to the page. The empty-search coverage verdict no
+  longer counts a root as reached through a page the caller cannot read.
+  Some counts still run over the whole Brain layer and name no record:
+  the monthly and operator views, the status views, the cap on
+  `removed-tool-reference` warnings and the `brain_doctor`
+  stale-dependency note; the ranking statistics of `brain_search` are
+  taken over the shared index.

@@ -40,6 +40,7 @@ import { auditMoc, MocAuditError } from "../../core/brain/link-graph/moc-audit.t
 import { reachView } from "../../core/brain/reach-view.ts";
 import { everyArtifactRefView } from "../../core/brain/artifact-ref-view.ts";
 import { gatedOwnerScopeView } from "../../core/brain/owner-scope-view.ts";
+import { recordRefs } from "../../core/brain/log-events-at-reach.ts";
 import { normaliseWikilinkTarget } from "../../core/brain/wikilink.ts";
 import { isoSecond } from "../../core/brain/time.ts";
 import { normalizeAgentArgument } from "../../core/agent-identity.ts";
@@ -407,6 +408,7 @@ async function toolBrainMocAudit(
     // (a-label-is-not-a-boundary, U3, recon C4).
     const report = auditMoc(ctx.vault, targetId, {
       ownerScope: gatedOwnerScopeView(ctx.vault, ctx.agentName).scope,
+      readable: readableAtContextReach(ctx),
     });
     return {
       vault_path: vaultPathField(ctx),
@@ -772,9 +774,20 @@ function toolBrainClaims(
   // recon C6 to the "this bucket is metadata" label. Every row-returning
   // operation is filtered, and so is the rebuild count: a count the
   // caller cannot decompose still says how many claims exist.
-  const view = gatedOwnerScopeView(ctx.vault, ctx.agentName);
-  const visible = (rows: ReadonlyArray<ClaimNode>): ReadonlyArray<ClaimNode> =>
-    view.keep(rows, (n) => [n.path, n.id]);
+  // At the caller's reach a row is asked over every record it names: its
+  // page, its id under the pref- and ret- spellings, and the records that
+  // superseded or contest it.
+  const owner = gatedOwnerScopeView(ctx.vault, ctx.agentName);
+  const reach = reachView(ctx.vault, contextReach(ctx));
+  const shown = (n: ClaimNode): boolean =>
+    owner.row(n.path, n.id) &&
+    reach.row(
+      n.path,
+      ...recordRefs(n.id),
+      ...recordRefs(n.superseded_by ?? undefined),
+      ...n.contradicts.flatMap((id) => recordRefs(id)),
+    );
+  const visible = (rows: ReadonlyArray<ClaimNode>): ReadonlyArray<ClaimNode> => rows.filter(shown);
   switch (operation) {
     case "rebuild": {
       const graph = rebuildClaimGraph(ctx.vault);
@@ -788,8 +801,7 @@ function toolBrainClaims(
     case "replaced": {
       const id = coerceStr(args, "id", true)!;
       const tip = whatReplaced(resolveClaimGraph(ctx.vault), id);
-      const shown = tip !== null && view.row(tip.path, tip.id) ? tip : null;
-      return { operation, id, tip: shown ? renderClaimNode(shown) : null };
+      return { operation, id, tip: tip !== null && shown(tip) ? renderClaimNode(tip) : null };
     }
     case "contests": {
       const id = coerceStr(args, "id", true)!;

@@ -5,6 +5,7 @@ import {
   REDACTION_PLACEHOLDER,
   SCAN_TRUNCATED_MARKER,
   normaliseTextField,
+  privateRegionTexts,
   redactRawOutput,
   sanitiseTextField,
   stripPrivateRegions,
@@ -30,9 +31,51 @@ describe("stripPrivateRegions", () => {
     expect(stripPrivateRegions(input)).toBe(`keep ${PRIVATE_REGION_PLACEHOLDER}`);
   });
 
+  test("an open tag whose attributes hold a bracket still opens a region", () => {
+    const input = 'a <private note="x<y">hidden</private> b';
+    expect(stripPrivateRegions(input)).not.toContain("hidden");
+    expect(privateRegionTexts(input).join("")).toContain("hidden");
+  });
+
+  test("an open tag cut off by the end of the text opens a region there", () => {
+    expect(stripPrivateRegions("keep <private note=")).toBe(`keep ${PRIVATE_REGION_PLACEHOLDER}`);
+  });
+
   test("strips nested private regions atomically", () => {
     const input = "before <private>a<private>b</private>c</private> after";
     expect(stripPrivateRegions(input)).toBe(`before ${PRIVATE_REGION_PLACEHOLDER} after`);
+  });
+
+  describe("stays linear on adversarial tag runs", () => {
+    const MIB = 1 << 20;
+    const OPEN = "<private>";
+    const CLOSE = "</private>";
+    const runOf = (unit: string): string => unit.repeat(Math.ceil((2 * MIB) / unit.length));
+    const cases: ReadonlyArray<readonly [string, string, string]> = [
+      ["nested opens with one far close", runOf(OPEN) + CLOSE, PRIVATE_REGION_PLACEHOLDER],
+      [
+        "nested opens then as many closes",
+        runOf(OPEN) + CLOSE.repeat(Math.ceil((2 * MIB) / OPEN.length)),
+        PRIVATE_REGION_PLACEHOLDER,
+      ],
+      [
+        "open tags that never end in a bracket",
+        `x ${runOf("<private ")}`,
+        `x ${PRIVATE_REGION_PLACEHOLDER}`,
+      ],
+      ["a region of unended open tags", `${OPEN}${runOf("<private ")}`, PRIVATE_REGION_PLACEHOLDER],
+    ];
+    for (const [name, input, expected] of cases) {
+      test(name, () => {
+        const started = performance.now();
+        const out = stripPrivateRegions(input);
+        const elapsed = performance.now() - started;
+        expect(out).toBe(expected);
+        const kept = expected.replace(PRIVATE_REGION_PLACEHOLDER, "");
+        expect(privateRegionTexts(input).join("").length).toBe(input.length - kept.length);
+        expect(elapsed).toBeLessThan(LINEAR_CEILING_MS);
+      });
+    }
   });
 
   test("runs before assignment redaction in redactRawOutput", () => {
