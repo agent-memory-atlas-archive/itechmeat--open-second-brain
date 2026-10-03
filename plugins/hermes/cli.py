@@ -67,12 +67,28 @@ def _status() -> int:
     return 0 if available else 1
 
 
+#: ``settings_source:`` values. The command runs in its own process, which
+#: Hermes never marks as multiplexed, so the process-environment line says it
+#: describes this command and names where a multiplexed gateway reads instead.
+_SOURCE_PROFILE_SCOPE = "profile scope (multiplexed gateway)"
+_SOURCE_PROCESS_ENVIRONMENT = (
+    "process environment (this command; a gateway with gateway.multiplex_profiles "
+    "reads each profile's .env)"
+)
+
+
 def _config() -> int:
-    # The config path is resolved from the environment alone and is printable
-    # even when the file behind it is not, which is exactly the case an
-    # operator needs to see: the path this process looked at.
-    print(f"config_path: {config.config_path()}")
+    # Which source answered comes first and cannot fail: on a multiplexed
+    # gateway the profile scope does, and the gateway's own environment is
+    # ignored, so an operator comparing values needs to know which to check.
+    source = _SOURCE_PROFILE_SCOPE if config.is_multiplexed() else _SOURCE_PROCESS_ENVIRONMENT
+    print(f"settings_source: {source}")
     try:
+        # The config path is printable even when the file behind it is not,
+        # which is exactly the case an operator needs to see: the path this
+        # process looked at. It is inside the try because on a multiplexed
+        # gateway with no profile scope bound it cannot be resolved at all.
+        print(f"config_path: {config.config_path()}")
         vault = config.resolve_vault()
         agent_name = config.resolve_agent_name()
         timezone = config.resolve_timezone()

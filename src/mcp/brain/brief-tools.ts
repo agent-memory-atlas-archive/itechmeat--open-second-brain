@@ -44,6 +44,12 @@ import {
   normalizeMonthlyReviewMonth,
 } from "../../core/brain/monthly-review.ts";
 import { buildOperatorSummary } from "../../core/brain/trust/operator-summary.ts";
+import type { VerificationDeltaEntry } from "../../core/brain/trust/compute-verification-delta.ts";
+import { everyArtifactRefView } from "../../core/brain/artifact-ref-view.ts";
+import { doctorIssueRefs, type DoctorIssueNaming } from "../../core/brain/diagnostics.ts";
+import type { ActionItem } from "../../core/brain/maintenance/action-scorer.ts";
+import { gatedOwnerScopeView } from "../../core/brain/owner-scope-view.ts";
+import { reachView } from "../../core/brain/reach-view.ts";
 import { isoDate } from "../../core/brain/time.ts";
 import { captureReportDelta } from "../../core/brain/report-snapshot.ts";
 import { TRANSPORT_REACH } from "../../core/graph/transport-reach.ts";
@@ -404,7 +410,13 @@ async function toolBrainMonthlyReview(
       throw new MCPError(INVALID_PARAMS, "brain_brief view=monthly: month must be YYYY-MM");
     }
   }
-  const report = buildMonthlyReview(ctx.vault, month ? { month } : {});
+  // Below local reach (or under the ownership gate) the month is counted
+  // over the events this caller may see, in the form it may see them.
+  const refs = requestRefView(ctx);
+  const report = buildMonthlyReview(ctx.vault, {
+    ...(month ? { month } : {}),
+    ...(refs.filtersNothing ? {} : { eventAtReach: (ev) => eventAtReach(refs, ev) }),
+  });
   return {
     schema_version: report.schema_version,
     generated_at: report.generated_at,
@@ -492,9 +504,29 @@ async function toolBrainOperatorSummary(
       dreamError = (err as Error).message ?? String(err);
     }
   }
+  // The doctor, digest and top-action fields - and the trust verdict over
+  // them - answer at the caller's reach, through the view brain_doctor
+  // filters its own findings and actions by, and so do the verification
+  // entries, which name the records the dream claimed. The dry-run
+  // dream's own warning, uncertain and quarantined counts are taken over
+  // the whole Brain layer and name no record.
+  const view = everyArtifactRefView(
+    gatedOwnerScopeView(ctx.vault, ctx.agentName),
+    reachView(ctx.vault, contextReach(ctx)),
+  );
+  const readable = readableAtContextReachOrUndefined(ctx);
   const summary = buildOperatorSummary(ctx.vault, {
     ...(dreamSummary ? { dreamSummary } : {}),
     ...(topActionsN !== undefined ? { topActionsN } : {}),
+    ...(readable !== undefined ? { readable } : {}),
+    ...(view.filtersNothing
+      ? {}
+      : {
+          keepIssue: (issue: DoctorIssueNaming) => view.row(...doctorIssueRefs(ctx.vault, issue)),
+          keepAction: (action: ActionItem) => view.row(action.target),
+          keepVerification: (entry: VerificationDeltaEntry) =>
+            view.row(...recordRefs(entry.id), entry.path),
+        }),
   });
   return {
     vault_path: vaultPathField(ctx),
@@ -541,9 +573,13 @@ async function toolBrainToday(
   // (or under the ownership gate) it shows them as this caller may see
   // them, before the limit and the totals.
   const refs = requestRefView(ctx);
+  // Obligation pages and open-loop notes are listed only when the caller
+  // may read them, before the totals.
+  const readable = readableAtContextReachOrUndefined(ctx);
   const dashboard = buildTodayDashboard(ctx.vault, {
     now: new Date(),
     ...(refs.filtersNothing ? {} : { eventAtReach: (ev) => eventAtReach(refs, ev) }),
+    ...(readable === undefined ? {} : { readable }),
     ...(lookbackDays !== undefined ? { activityLookbackDays: lookbackDays } : {}),
     ...(limit !== undefined ? { activityLimit: limit } : {}),
   });

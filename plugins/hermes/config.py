@@ -19,10 +19,28 @@ fixture table through BOTH implementations rather than asserting each side's
 behaviour separately.
 
 - config path:  ``OPEN_SECOND_BRAIN_CONFIG`` -> ``XDG_CONFIG_HOME`` -> ``~/.config``
+                (``XDG_CONFIG_HOME`` and ``LOCALAPPDATA`` through
+                :func:`scope_first_setting`)
 - vault:        ``VAULT_DIR`` env -> project pointer walk-up -> active named
                 profile -> ``vault`` field -> ``None``, every result tilde-expanded
 - agent name:   ``VAULT_AGENT_NAME`` env -> ``agent_name``/``agentName`` -> ``"agent"``
 - timezone:     ``VAULT_TIMEZONE`` env -> ``timezone`` field -> ``None``
+
+## Two modes: a multiplexed Hermes gateway
+
+"env" above means :func:`env_setting`, the one reader of the names in
+:data:`PROFILE_SCOPED_ENV`. A Hermes gateway with ``multiplex_profiles`` serves
+several profiles from one process, and that process's environment belongs to
+the profile that launched it. So when Hermes reports multiplexing, a scoped
+name is read from the profile scope Hermes bound for the call (the profile's
+``.env`` and secret sources) and NEVER from ``os.environ``; an unset scoped
+value falls through to the rest of the chain (pointer, profile, config key,
+default), and a call with no scope bound refuses with
+:class:`ProfileScopeError`. Without multiplexing - and whenever Hermes or its
+``agent.secret_scope`` module is absent, which is how the parity suite and the
+doctor load this file - the reader is the plain ``os.environ`` lookup, so every
+answer is unchanged. A scope module that is present but fails to import is
+treated as multiplexed with no scope bound, never as absent.
 
 ## Where the mirror is deliberately imperfect
 
@@ -51,11 +69,13 @@ processing, and the LAST occurrence of a duplicate key winning.
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
 import re
 import stat
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -76,6 +96,30 @@ AGENT_NAME_ENV = "VAULT_AGENT_NAME"
 TIMEZONE_ENV = "VAULT_TIMEZONE"
 CONFIG_PATH_ENV = "OPEN_SECOND_BRAIN_CONFIG"
 XDG_CONFIG_HOME_ENV = "XDG_CONFIG_HOME"
+LOCALAPPDATA_ENV = "LOCALAPPDATA"
+#: Per-request deadline of the MCP bridge, read by ``bridge.py``.
+REQUEST_TIMEOUT_ENV = "OPEN_SECOND_BRAIN_MCP_TIMEOUT"
+
+#: The settings that belong to a Hermes profile rather than to the process.
+#: On a multiplexed gateway these come from the bound profile scope only.
+#: ``PATH``, ``PATHEXT`` and ``HOME`` describe the operating system and stay
+#: process-global in both modes: Hermes keeps them out of a profile scope.
+PROFILE_SCOPED_ENV: tuple[str, ...] = (
+    VAULT_DIR_ENV,
+    AGENT_NAME_ENV,
+    TIMEZONE_ENV,
+    CONFIG_PATH_ENV,
+    REQUEST_TIMEOUT_ENV,
+)
+
+#: The config directories, which are scope-first on a multiplexed gateway.
+#: Hermes scopes them like any other ``.env`` name, so a profile's value lives
+#: in its scope and only the launch profile's value is in ``os.environ``;
+#: reading ``os.environ`` alone would hand every profile the launch profile's
+#: config file. Unlike :data:`PROFILE_SCOPED_ENV`, a name the scope leaves
+#: unset falls back to the process environment, because on most installs it
+#: is the operating system's own value and no profile sets it.
+SCOPE_FIRST_ENV: tuple[str, ...] = (XDG_CONFIG_HOME_ENV, LOCALAPPDATA_ENV)
 
 #: Characters a config value may not contain, mirroring
 #: ``CONFIG_VALUE_REJECTED_CHARS`` in ``src/core/config.ts``. The reader strips
@@ -94,6 +138,12 @@ _TARGET = "hermes"
 _TARGET_TEMPLATE_PATH = _TEMPLATES_DIR / f"identity-reminder.{_TARGET}.txt"
 
 _template_cache: str | None = None
+
+# Scoped names already reported as ignored in this process, plus the scope
+# module's own name once its import failure is reported. One WARNING per name,
+# not per call: the resolvers run on every turn.
+_scope_warned: set[str] = set()
+_scope_warned_lock = threading.Lock()
 
 # Line splitter matching the TypeScript `text.split(/\r?\n/)`. `str.splitlines`
 # also breaks on form feed, U+2028 and friends, which would make the two
@@ -125,6 +175,180 @@ class ConfigReadError(Exception):
         )
         self.path = path
         self.reason = reason
+
+
+class ProfileScopeError(ConfigReadError):
+    """A profile-scoped setting was read on a multiplexed gateway with no scope.
+
+    A subclass of :class:`ConfigReadError` so every site that already refuses,
+    propagates or reports an unreadable configuration does the same here: the
+    setting the operator configured exists, and it is not the one this call
+    can see. The message names the setting and never a value; it does not use
+    the parent's file-read template, which is pinned to the file case.
+    """
+
+    def __init__(self, name: str) -> None:
+        Exception.__init__(
+            self,
+            f"{name} cannot be resolved: this multiplexed Hermes gateway bound no "
+            "profile scope for the call, and Open Second Brain does not fall back to "
+            "the gateway's process environment, which belongs to the launch profile. "
+            "Restart the gateway (hermes gateway restart); if it persists, report it.",
+        )
+        self.name = name
+        self.path = ""
+        self.reason = "no profile scope bound"
+
+
+#: Hermes's profile-scope module, and the module names whose absence means
+#: "not running inside a Hermes that scopes settings".
+_SCOPE_MODULE_NAME = "agent.secret_scope"
+_ABSENT_SCOPE_MODULE_NAMES = frozenset({"agent", _SCOPE_MODULE_NAME})
+
+
+#: Set once the scope module failed to import for a reason other than its
+#: absence, so later reads fail closed without importing it again (a present
+#: module that fails would otherwise rerun its top-level code on every read).
+#: Absent and present modules are still looked up per call.
+_scope_module_failed = False
+
+
+class _UnusableProfileScope:
+    """Stands in for a Hermes scope module that is present but failed to import.
+
+    It answers "multiplexed, no scope bound", so every profile-scoped read
+    refuses with :class:`ProfileScopeError` instead of serving the launch
+    profile's process environment to every profile.
+    """
+
+    class UnscopedSecretError(Exception):
+        """The scope module could not be imported, so no scope is bound."""
+
+    @staticmethod
+    def is_multiplex_active() -> bool:
+        return True
+
+    @classmethod
+    def get_secret(cls, name: str, default: str | None = None) -> str | None:
+        raise cls.UnscopedSecretError(name)
+
+
+def _profile_scope_module():
+    """Hermes's ``agent.secret_scope`` module, or ``None`` outside Hermes.
+
+    Imported lazily, absolutely and per call: this file is also loaded by file
+    location with no package and no Hermes (the resolver parity suite and the
+    doctor's parity check), where the import must fail quietly and leave the
+    process-environment answers in force. Only the absence of ``agent`` or of
+    ``agent.secret_scope`` counts as "outside Hermes"; any other import failure
+    is a Hermes whose scoping is broken, which fails closed: one WARNING naming
+    the exception type, then :class:`_UnusableProfileScope`, which later calls
+    return without importing the module again.
+    """
+    global _scope_module_failed
+    if _scope_module_failed:
+        return _UnusableProfileScope
+    try:
+        return importlib.import_module(_SCOPE_MODULE_NAME)
+    except ModuleNotFoundError as exc:
+        if exc.name in _ABSENT_SCOPE_MODULE_NAMES:
+            return None
+        failure: Exception = exc
+    except Exception as exc:  # noqa: BLE001 - any failure of a present module fails closed
+        failure = exc
+    _scope_module_failed = True
+    _warn_scope_module_failed(failure)
+    return _UnusableProfileScope
+
+
+def _warn_scope_module_failed(exc: Exception) -> None:
+    """Say once per process that the scope module failed, naming its type only."""
+    with _scope_warned_lock:
+        if _SCOPE_MODULE_NAME in _scope_warned:
+            return
+        _scope_warned.add(_SCOPE_MODULE_NAME)
+    logger.warning(
+        "%s: %s failed to import (%s); profile-scoped settings are refused until it imports",
+        PLUGIN_NAME,
+        _SCOPE_MODULE_NAME,
+        type(exc).__name__,
+    )
+
+
+def is_multiplexed() -> bool:
+    """Whether Hermes reports a multiplexed gateway for the current call."""
+    scope_module = _profile_scope_module()
+    return scope_module is not None and bool(scope_module.is_multiplex_active())
+
+
+def env_setting(name: str) -> str | None:
+    """The one reader of a profile-scoped setting; empty counts as unset.
+
+    Not multiplexed: ``os.environ``, exactly as before. Multiplexed: the bound
+    profile scope only - a miss is ``None`` and the caller's chain continues;
+    the process environment is never consulted. Names outside
+    :data:`PROFILE_SCOPED_ENV` are process-global and always read from
+    ``os.environ``.
+
+    :raises ProfileScopeError: when multiplexed and no scope is bound.
+    """
+    scope_module = _profile_scope_module() if name in PROFILE_SCOPED_ENV else None
+    if scope_module is None or not scope_module.is_multiplex_active():
+        return os.environ.get(name) or None
+    _warn_ignored_process_value(name)
+    try:
+        value = scope_module.get_secret(name, None)
+    except scope_module.UnscopedSecretError as exc:
+        raise ProfileScopeError(name) from exc
+    return value or None
+
+
+def scope_first_setting(name: str) -> str | None:
+    """A :data:`SCOPE_FIRST_ENV` name: the bound scope's value, else ``os.environ``.
+
+    Not multiplexed: ``os.environ``, exactly as before, and the scope is never
+    read. Multiplexed: the bound profile scope's non-empty value, falling back
+    to the process environment when the scope has none.
+
+    :raises ProfileScopeError: when multiplexed and no scope is bound.
+    """
+    scope_module = _profile_scope_module()
+    if scope_module is not None and scope_module.is_multiplex_active():
+        try:
+            value = scope_module.get_secret(name, None)
+        except scope_module.UnscopedSecretError as exc:
+            raise ProfileScopeError(name) from exc
+        if value:
+            return value
+    return os.environ.get(name) or None
+
+
+def _warn_ignored_process_value(name: str) -> None:
+    """Say once per process that a gateway-environment value is not used.
+
+    Names the variable and never its value: the value belongs to the launch
+    profile and may be a path or an identity the other profiles must not see.
+    """
+    if not os.environ.get(name):
+        return
+    with _scope_warned_lock:
+        if name in _scope_warned:
+            return
+        _scope_warned.add(name)
+    logger.warning(
+        "%s: ignoring %s from the gateway process environment on a multiplexed gateway; "
+        "set it in the profile's .env instead",
+        PLUGIN_NAME,
+        name,
+    )
+
+
+def _reset_scope_warnings_for_tests() -> None:
+    """Test-only: forget which ignored names were already reported and a failed import."""
+    global _scope_module_failed
+    with _scope_warned_lock:
+        _scope_warned.clear()
+    _scope_module_failed = False
 
 
 class ConfigValueError(ValueError):
@@ -179,16 +403,16 @@ def expand_tilde(value: str) -> str:
 
 def _windows_local_app_data() -> Path:
     """``%LOCALAPPDATA%``, or ``~/AppData/Local`` in a stripped environment."""
-    local = os.environ.get("LOCALAPPDATA")
+    local = scope_first_setting(LOCALAPPDATA_ENV)
     return Path(local) if local else Path.home() / "AppData" / "Local"
 
 
 def config_path() -> Path:
     """Resolve the plugin config path (``OPEN_SECOND_BRAIN_CONFIG`` -> XDG -> platform default)."""
-    override = os.environ.get(CONFIG_PATH_ENV)
+    override = env_setting(CONFIG_PATH_ENV)
     if override:
         return Path(expand_tilde(override))
-    xdg = os.environ.get(XDG_CONFIG_HOME_ENV)
+    xdg = scope_first_setting(XDG_CONFIG_HOME_ENV)
     if xdg:
         return Path(expand_tilde(xdg)) / PLUGIN_NAME / CONFIG_FILENAME
     if os.name == "nt":
@@ -355,7 +579,7 @@ def resolve_agent_name() -> str:
 
     :raises ConfigReadError: when the config file is present but unreadable.
     """
-    env_value = os.environ.get(AGENT_NAME_ENV)
+    env_value = env_setting(AGENT_NAME_ENV)
     if env_value:
         return env_value
     data = _config_data()
@@ -377,7 +601,7 @@ def resolve_vault(cwd: str | None = None) -> str | None:
         directory when omitted, which is what the gateway passes implicitly.
     :raises ConfigReadError: when the config file is present but unreadable.
     """
-    env_value = os.environ.get(VAULT_DIR_ENV)
+    env_value = env_setting(VAULT_DIR_ENV)
     if env_value:
         return expand_tilde(env_value)
     pointer_vault = _resolve_pointer_vault(cwd if cwd is not None else os.getcwd())
@@ -403,7 +627,7 @@ def resolve_timezone() -> str | None:
 
     :raises ConfigReadError: when the config file is present but unreadable.
     """
-    env_value = os.environ.get(TIMEZONE_ENV)
+    env_value = env_setting(TIMEZONE_ENV)
     if env_value:
         return env_value
     return _config_data().get("timezone") or None
@@ -474,7 +698,10 @@ def shadowing_source(key: str) -> str | None:
     env_key = {"vault": VAULT_DIR_ENV, "agent_name": AGENT_NAME_ENV, "timezone": TIMEZONE_ENV}.get(
         key
     )
-    if env_key and os.environ.get(env_key):
+    if env_key and is_multiplexed():
+        if env_setting(env_key):
+            return f"the {env_key} setting in this Hermes profile's .env overrides the config file"
+    elif env_key and os.environ.get(env_key):
         return f"the {env_key} environment variable overrides the config file"
     if key != "vault":
         return None

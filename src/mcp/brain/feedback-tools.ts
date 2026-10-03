@@ -91,7 +91,7 @@ import {
   vaultRelativeSafe,
 } from "./shared.ts";
 import { OPERATION } from "../../core/brain/safeguard.ts";
-import { readableAtContextReach } from "./reach-readable.ts";
+import { readableAtContextReach, readableAtContextReachOrUndefined } from "./reach-readable.ts";
 
 /**
  * Build the slug used in the signal / preference filename. We never let
@@ -240,8 +240,12 @@ async function toolBrainFeedback(
   // advisory when it closely resembles an existing rule. Computed BEFORE
   // any force-confirmed write so it never matches the pref this very call
   // is about to create. The write has already landed; this never blocks it.
+  // Both advisories answer at the caller's reach: a preference or signal
+  // the caller may not read is never scored, named or counted.
+  const readable = readableAtContextReachOrUndefined(ctx);
   const advisory: WriteConflictAdvisory | null = adviseIncomingFeedback(ctx.vault, {
     principle,
+    ...(readable !== undefined ? { readable } : {}),
     ...(effectiveScope !== undefined ? { scope: effectiveScope } : {}),
     agent,
     now,
@@ -251,6 +255,7 @@ async function toolBrainFeedback(
   // no scope, so no scoped recall reaches it. Non-blocking like the
   // advisory, and absent entirely when this vault uses no scopes yet.
   const routingHint: CaptureRoutingHint | null = adviseUnroutableCapture(ctx.vault, {
+    ...(readable !== undefined ? { readable } : {}),
     ...(effectiveScope !== undefined ? { scope: effectiveScope } : {}),
     agent,
     now,
@@ -434,6 +439,10 @@ function scopedDreamRows<R extends string>(
   };
 }
 
+/** The one answer a caller below local reach gets for anything but a dry run. */
+const DREAM_LOCAL_REACH_ONLY =
+  "brain_dream: below local reach only action=run with dry_run is served; a real pass, a step and the staged lifecycle run at local reach only";
+
 async function toolBrainDream(
   ctx: ServerContext,
   args: Record<string, unknown>,
@@ -465,6 +474,16 @@ async function toolBrainDream(
   // The rollup step's link candidates leave out a page the caller may not
   // read at its reach, exactly as an absent page.
   const readable = readableAtContextReach(ctx);
+  // Below local reach only a dry run is served, planned over the records
+  // the caller may read as if the others were absent. A real pass, a
+  // single step and the staged lifecycle move, rewrite or report records
+  // the caller may not read, so they are refused with one fixed answer
+  // before anything is read or written, whatever the vault holds.
+  const previewReadable = readableAtContextReachOrUndefined(ctx);
+  if (previewReadable !== undefined && (action !== "run" || !dryRun || stepArg)) {
+    throw new MCPError(INVALID_PARAMS, DREAM_LOCAL_REACH_ONLY);
+  }
+  const previewScope = previewReadable !== undefined ? { previewReadable } : {};
 
   // Single-step requests (no-dead-ends, Unit E - operator surface).
   // Deliberately checked before any environment work: a step the pass
@@ -641,6 +660,7 @@ async function toolBrainDream(
       dryRun: true,
       safeguard,
       readable,
+      ...previewScope,
       ...(nowDate ? { now: nowDate } : {}),
       ...(agent ? { agentName: agent } : {}),
       // Preview the run being guarded, overrides and all.
@@ -665,6 +685,7 @@ async function toolBrainDream(
     dryRun,
     safeguard,
     readable,
+    ...previewScope,
     ...(nowDate ? { now: nowDate } : {}),
     ...(agent ? { agentName: agent } : {}),
     ...(gates !== undefined ? { gates } : {}),
@@ -783,9 +804,13 @@ async function toolBrainApplyEvidence(
   // payload that explains what to do next, not a JSON-RPC error frame.
   // v0.10.16: assert applier role at the MCP boundary so the structural
   // permission gate fires before any I/O.
+  // A preference the caller may not read is refused as a missing one,
+  // before anything is written.
+  const readable = readableAtContextReachOrUndefined(ctx);
   try {
     const res = appendApplyEvidence(ctx.vault, input, {
       role: BRAIN_ROLES.applier,
+      ...(readable !== undefined ? { readable } : {}),
     });
     return {
       logged_at: res.logged_at,
@@ -917,9 +942,13 @@ async function toolBrainExpire(
   const id = coerceStr(args, "id", true)!;
   const expires = coerceStr(args, "expires", true)!;
   const agent = coerceStr(args, "agent", false);
+  // A record the caller may not read is refused as an unknown id, before
+  // anything is written.
+  const readable = readableAtContextReachOrUndefined(ctx);
   try {
     const res = setExpiration(ctx.vault, id, expires, {
       ...(agent ? { agent } : {}),
+      ...(readable !== undefined ? { readable } : {}),
     });
     return {
       id: res.id,

@@ -5,13 +5,18 @@
  * confirmed and quarantined preferences without explicitly calling
  * `brain_query` first.
  *
- * Two lanes share the surface, and the order between them is the point.
+ * Three lanes share the surface, and the order between them is the point.
  * `Brain/standing-rules.md` is operator-authored and goes FIRST, read
  * outside the fail-open memory load so it survives a memory-layer
- * failure and never enters the inject cache. Everything after it -
- * runtime notices, `active.md`, `lessons.md` - is what the agent learned
- * about itself, assembled inside the fail-open boundary and charged
- * against the configured injection budget.
+ * failure and never enters the inject cache. The scoped operator rules
+ * for this session's project and this device
+ * (`Brain/standing-rules/{project,host}/<key>.md`) come next, also read
+ * outside the boundary and never cached - the cache key is vault-wide, so
+ * a cached block could replay one project's rules in another - but
+ * charged against the injection budget. Everything after them - runtime
+ * notices, `active.md`, `lessons.md` - is what the agent learned about
+ * itself, assembled inside the fail-open boundary and charged against
+ * what is left of the configured injection budget.
  *
  * Contract (identical for Claude Code and Codex):
  *   stdin: hook payload JSON. The vault path is resolved from the
@@ -23,9 +28,10 @@
  *     {
  *       "hookSpecificOutput": {
  *         "hookEventName": "SessionStart" | "PostCompact",
- *         "additionalContext": "<standing-rules block, then the budgeted
- *                               memory context: runtime notices, the
- *                               rendered Brain/active.md body, lessons>"
+ *         "additionalContext": "<standing-rules block, the scoped rules
+ *                               block, then the budgeted memory context:
+ *                               runtime notices, the rendered
+ *                               Brain/active.md body, lessons>"
  *       }
  *     }
  *
@@ -59,8 +65,15 @@ import { budgetActiveBody } from "../src/core/brain/active-budget.ts";
 import {
   INJECT_BUDGET_CHARS_DEFAULT,
   loadBrainConfig,
+  resolveScopedRulesMaxChars,
   resolveStandingRulesMaxChars,
 } from "../src/core/brain/policy.ts";
+import {
+  readScopedRules,
+  SCOPED_RULES_HEADER,
+  SCOPED_RULES_NOTICE_RESERVE,
+} from "../src/core/brain/scoped-rules.ts";
+import { resolveHostScope, resolveProjectScope } from "../src/core/brain/scope-identity.ts";
 import {
   readStandingRules,
   renderStandingRules,
@@ -74,7 +87,13 @@ import { loadInjectContextFailOpen } from "../src/core/brain/inject-failopen.ts"
 import { collectRuntimeNotices, renderRuntimeNotices } from "../src/core/brain/runtime-notices.ts";
 import { asHookPayload, readHookInput } from "./lib/stdin.ts";
 import { isContextEventName } from "./lib/context-events.ts";
-import { emitContextReceipt } from "../src/core/brain/context-receipts.ts";
+import {
+  emitContextReceipt,
+  RECEIPT_ITEM_ACTIVE_BODY,
+  RECEIPT_ITEM_LESSONS_BODY,
+  RECEIPT_ITEM_SCOPED_RULES,
+  RECEIPT_ITEM_STANDING_RULES,
+} from "../src/core/brain/context-receipts.ts";
 import { estimateTokens } from "../src/core/brain/text/tokenizer.ts";
 import type { InjectContextSource } from "../src/core/brain/inject-failopen.ts";
 import type { BrainConfig } from "../src/core/brain/types.ts";
@@ -163,8 +182,13 @@ async function main(): Promise<void> {
       });
     }
 
-    const meter: InjectionMeter = { sources: [], budgetChars: null };
     const limits = resolveInjectionLimits(vault);
+    const meter: InjectionMeter = {
+      sources: [],
+      configuredBudgetChars: limits.injectBudgetChars,
+      budgetChars: null,
+      scopedRulesChars: 0,
+    };
 
     // The operator's standing rules, read BEFORE and OUTSIDE the fail-open
     // load below. That single placement buys three properties at once:
@@ -175,6 +199,17 @@ async function main(): Promise<void> {
     // is unreadable.
     const standingBlock = renderStandingBlock(vault, limits.standingRulesMaxChars, meter);
 
+    // The scoped operator rules for the project this session runs in (the
+    // payload's `cwd`, else this process's) and for this device. Outside
+    // the fail-open boundary and never cached, like the constitution; but
+    // CHARGED: its length comes off the budget the memory body gets, and
+    // the whole block - header and notices included - fits that budget:
+    // the cap over its sections is what is left once they are reserved.
+    const workspaceDir =
+      typeof payload.cwd === "string" && payload.cwd.length > 0 ? payload.cwd : process.cwd();
+    const scopedBlock = renderScopedBlock(vault, workspaceDir, scopedSectionCap(limits), meter);
+    const memoryBudget = Math.max(0, limits.injectBudgetChars - scopedBlock.length);
+
     // Fail-open context load: assemble the injected body inside a guard that
     // degrades to the last-good cache (or empty) on any error, never emitting
     // a partial or poisoned payload. A successful non-empty body refreshes the
@@ -182,7 +217,7 @@ async function main(): Promise<void> {
     const { context: memoryContext, source } = await loadInjectContextFailOpen({
       vault,
       key: "active",
-      assemble: () => assembleActiveContext(vault, limits.injectBudgetChars, meter),
+      assemble: () => assembleActiveContext(vault, memoryBudget, meter),
       audit: (degradedSource) =>
         auditHook(vault, "inject_failopen_degraded", {
           hook: "active-inject",
@@ -191,7 +226,7 @@ async function main(): Promise<void> {
     });
     // The early return now fires only when there are NEITHER standing rules
     // NOR memory - a vault with rules and a broken memory layer still speaks.
-    const context = joinBlocks([standingBlock, memoryContext]);
+    const context = joinBlocks([standingBlock, scopedBlock, memoryContext]);
     if (context.length === 0) return;
 
     const out = {
@@ -220,9 +255,10 @@ async function main(): Promise<void> {
  *     its own cap, not `inject_budget_chars`, and emitted whatever the
  *     memory layer does - so it is the one lane still real in a
  *     degraded injection.
- *   - BUDGETED: charged against `inject_budget_chars`. Two of these
- *     exist today and each is charged against the FULL configured
- *     ceiling, which is why the receipt records their count.
+ *   - BUDGETED: charged against `inject_budget_chars`. The scoped rules
+ *     are charged first and their length is subtracted; the active and
+ *     lessons bodies are each charged against what is left, which is why
+ *     the receipt records the count and the scoped length.
  *   - UNBUDGETED: assembled inside the boundary but not charged (the
  *     runtime notices, which are bounded by the number of conditions
  *     that can hold rather than by a character count).
@@ -244,20 +280,34 @@ interface InjectionSource {
   readonly name: string;
   readonly text: string;
   readonly lane: InjectionLane;
+  /**
+   * Produced outside the fail-open boundary (the standing and scoped
+   * rules), so it reached the payload even when the memory body was
+   * replaced by the cache, and stays in a degraded receipt.
+   */
+  readonly outsideBoundary: boolean;
 }
 
 /** Mutable accumulator threaded through the assembly, read after it returns. */
 interface InjectionMeter {
   readonly sources: InjectionSource[];
-  /** The `inject_budget_chars` the budgeted sub-bodies were charged against. */
+  /** The configured `inject_budget_chars`, before the scoped rules are charged. */
+  readonly configuredBudgetChars: number;
+  /**
+   * The configured `inject_budget_chars` once a budgeted body was measured
+   * under it; `null` while nothing was.
+   */
   budgetChars: number | null;
+  /** Length of the rendered scoped-rules block, subtracted from the budget; 0 when absent. */
+  scopedRulesChars: number;
 }
 
 /** Sub-body identifiers recorded per injection. Structural, not content-derived. */
-const SOURCE_STANDING_RULES = "standing-rules";
+const SOURCE_STANDING_RULES = RECEIPT_ITEM_STANDING_RULES;
+const SOURCE_SCOPED_RULES = RECEIPT_ITEM_SCOPED_RULES;
 const SOURCE_RUNTIME_NOTICES = "runtime-notices";
-const SOURCE_ACTIVE_BODY = "active-body";
-const SOURCE_LESSONS_BODY = "lessons-body";
+const SOURCE_ACTIVE_BODY = RECEIPT_ITEM_ACTIVE_BODY;
+const SOURCE_LESSONS_BODY = RECEIPT_ITEM_LESSONS_BODY;
 
 /** Blank line between two injected blocks. */
 const BLOCK_SEPARATOR = "\n\n";
@@ -295,9 +345,10 @@ interface RecordInjectionSizeInput {
  * sub-bodies in `meter` were never emitted (assembly threw), so the
  * record says `sources_measured: false` and drops them - a per-source
  * breakdown of a body that was replaced by a cached one would be a
- * finding that never happened. The exempt lane is kept in that case,
- * because it is produced outside the boundary and did reach the payload;
- * omitting it would understate an injection that really happened.
+ * finding that never happened. The sources produced outside the boundary
+ * (the standing and scoped rules) are kept in that case, because they did
+ * reach the payload; omitting them would understate an injection that
+ * really happened.
  *
  * FAIL-SOFT. The whole body sits in one try/catch. The receipt sink takes
  * a continuity-store lock and writes to disk; contention, a read-only
@@ -313,7 +364,7 @@ function recordInjectionSize(vault: string, input: RecordInjectionSizeInput): vo
     emitContextReceipt(vault, {
       options: { host: "hook", trigger: "session_inject" },
       items: input.meter.sources
-        .filter((source) => measured || source.lane === LANE_EXEMPT)
+        .filter((source) => measured || source.outsideBoundary)
         .map((source) => ({
           id: source.name,
           bytes: byteLength(source.text),
@@ -323,12 +374,13 @@ function recordInjectionSize(vault: string, input: RecordInjectionSizeInput): vo
       ...(input.meter.budgetChars !== null && measured
         ? {
             budget: {
+              // The CONFIGURED ceiling, unchanged by the scoped block.
               inject_budget_chars: input.meter.budgetChars,
-              // Both budgeted sub-bodies are charged against the SAME
-              // configured ceiling, so the effective ceiling is this
-              // count times `inject_budget_chars`. Recorded as two
-              // numbers rather than implied by one.
+              // The active and lessons bodies are each charged against
+              // `inject_budget_chars - scoped_rules_chars`; the scoped
+              // block itself is counted here when it rendered.
               budgeted_source_count: budgetedSourceCount(input.meter),
+              scoped_rules_chars: input.meter.scopedRulesChars,
             },
           }
         : {}),
@@ -364,6 +416,23 @@ function budgetedSourceCount(meter: InjectionMeter): number {
 interface InjectionLimits {
   readonly injectBudgetChars: number;
   readonly standingRulesMaxChars: number;
+  readonly scopedRulesMaxChars: number;
+}
+
+/**
+ * The cap over the scoped block's sections: the configured cap, clamped
+ * to what the injection budget leaves once the block's header and the
+ * room for its notices are reserved, floor 0. With it the whole block -
+ * not only its sections - fits the budget it is charged against.
+ */
+function scopedSectionCap(limits: InjectionLimits): number {
+  return Math.max(
+    0,
+    Math.min(
+      limits.scopedRulesMaxChars,
+      limits.injectBudgetChars - SCOPED_RULES_HEADER.length - SCOPED_RULES_NOTICE_RESERVE,
+    ),
+  );
 }
 
 /**
@@ -398,6 +467,7 @@ function resolveInjectionLimits(vault: string): InjectionLimits {
   return {
     injectBudgetChars: cfg?.active?.inject_budget_chars ?? INJECT_BUDGET_CHARS_DEFAULT,
     standingRulesMaxChars: resolveStandingRulesMaxChars(cfg),
+    scopedRulesMaxChars: resolveScopedRulesMaxChars(cfg),
   };
 }
 
@@ -422,7 +492,61 @@ function renderStandingBlock(vault: string, maxChars: number, meter: InjectionMe
   } catch (err) {
     block = renderStandingRulesFailure(path, err);
   }
-  meter.sources.push({ name: SOURCE_STANDING_RULES, text: block, lane: LANE_EXEMPT });
+  meter.sources.push({
+    name: SOURCE_STANDING_RULES,
+    text: block,
+    lane: LANE_EXEMPT,
+    outsideBoundary: true,
+  });
+  return block;
+}
+
+/**
+ * Render the scoped operator rules for this session's project and this
+ * device, or "" when none applies.
+ *
+ * Project and host only: a harness file renders on the MCP surfaces,
+ * where the harness comes from the packaged `--harness`. This hook is
+ * shared by Claude Code and Codex through one `o2b-hook` shim and has no
+ * harness signal of its own, so it resolves the harness to nothing and
+ * matches no harness file.
+ *
+ * Never throws: a failure to resolve the scope or read the directory
+ * must not take the constitution and the memory context down with it.
+ */
+function renderScopedBlock(
+  vault: string,
+  workspaceDir: string,
+  maxChars: number,
+  meter: InjectionMeter,
+): string {
+  let block: string;
+  try {
+    let host: { readonly host: string | null; readonly unreadable: boolean };
+    try {
+      host = resolveHostScope(undefined);
+    } catch {
+      host = { host: null, unreadable: true };
+    }
+    block = readScopedRules(
+      vault,
+      { project: resolveProjectScope(workspaceDir, vault), harness: null, host: host.host },
+      { maxChars, hostUnreadable: host.unreadable },
+    ).text;
+  } catch {
+    return "";
+  }
+  if (block.length === 0) return "";
+  meter.sources.push({
+    name: SOURCE_SCOPED_RULES,
+    text: block,
+    lane: LANE_BUDGETED,
+    outsideBoundary: true,
+  });
+  meter.scopedRulesChars = block.length;
+  // A budgeted source was measured under the configured ceiling, so the
+  // receipt carries the budget block even when no memory body follows.
+  meter.budgetChars = meter.configuredBudgetChars;
   return block;
 }
 
@@ -446,6 +570,7 @@ function assembleActiveContext(vault: string, budget: number, meter: InjectionMe
       name: SOURCE_RUNTIME_NOTICES,
       text: noticesBlock,
       lane: LANE_UNBUDGETED,
+      outsideBoundary: false,
     });
   }
 
@@ -480,8 +605,11 @@ function readActiveBody(
   // the default here rather than raising. Recorded on the meter only at
   // this point, because a vault with no `active.md` charged nothing
   // against it and a receipt naming a budget nothing was measured under
-  // would be a number with no measurement behind it.
-  meter.budgetChars = budget;
+  // would be a number with no measurement behind it. The CONFIGURED
+  // ceiling is recorded, not the `budget` argument: that is what is left
+  // after the scoped rules were charged, and the receipt reports the two
+  // separately (`inject_budget_chars`, `scoped_rules_chars`).
+  meter.budgetChars = meter.configuredBudgetChars;
 
   // Auto-load the lessons digest alongside active.md so the agent gets
   // the unified, signed, recency-scored corpus (preferences + dead-ends)
@@ -491,9 +619,19 @@ function readActiveBody(
   const lessonsBody = readLessonsBody(brainLessonsPath(vault), budget);
 
   const budgetedActive = budgetActiveBody(trimmed, budget);
-  meter.sources.push({ name: SOURCE_ACTIVE_BODY, text: budgetedActive, lane: LANE_BUDGETED });
+  meter.sources.push({
+    name: SOURCE_ACTIVE_BODY,
+    text: budgetedActive,
+    lane: LANE_BUDGETED,
+    outsideBoundary: false,
+  });
   if (lessonsBody !== null) {
-    meter.sources.push({ name: SOURCE_LESSONS_BODY, text: lessonsBody, lane: LANE_BUDGETED });
+    meter.sources.push({
+      name: SOURCE_LESSONS_BODY,
+      text: lessonsBody,
+      lane: LANE_BUDGETED,
+      outsideBoundary: false,
+    });
   }
 
   return lessonsBody === null ? budgetedActive : joinBlocks([budgetedActive, lessonsBody]);

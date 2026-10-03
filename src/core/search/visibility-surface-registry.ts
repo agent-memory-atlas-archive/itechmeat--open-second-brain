@@ -273,11 +273,15 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
   {
     surface: "brain_dead_ends",
     kind: K.mcpTool,
-    category: C.excluded,
+    category: C.covered,
     reason:
-      "listDeadEnds / recordDeadEnd (core/brain/dead-ends.ts) read and write Brain/dead-ends/ " +
-      "notes directly via parseFrontmatterText, with no visibility check - though these are " +
-      "Brain-authored records rather than general vault notes.",
+      "list keeps only the entries and parse warnings whose page readableAtContextReach(ctx) " +
+      "keeps, so a withheld dead end is absent from the answer; record writes the caller's own " +
+      "dead end and, below local reach, leaves out the ids the overflow trim archived. The trim " +
+      "still counts every active dead end against the cap but, handed the same predicate, " +
+      "archives only the readable ones, so a withheld dead end is never moved; a same-day id " +
+      "collision with a withheld dead end still takes a suffix (inherent create-collision " +
+      "residual).",
   },
   {
     surface: "brain_claims",
@@ -302,13 +306,11 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
   {
     surface: "brain_labels",
     kind: K.mcpTool,
-    category: C.excluded,
+    category: C.covered,
     reason:
-      "show reads a caller-named page with parseFrontmatter and returns the caller's own path " +
-      "plus its label set; at remote reach it asks reachView first and answers a reserved page " +
-      "with the same refusal an absent one gets. It stays EXCLUDED because assign and remove " +
-      "are write operations whose reply also carries the resulting label set, and they run no " +
-      "visibility check.",
+      "show and suggest ask reachView; assign and remove resolve the page through " +
+      "resolveNotePath with readableAtContextReach(ctx), so a page the caller may not read is " +
+      "refused with 'note does not exist' before its frontmatter is read or written.",
   },
   {
     surface: "brain_tiers",
@@ -329,8 +331,16 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
       "reachView, over the doctorIssueRefs each issue names (path, target, sources, message " +
       "wikilinks), takes ok and trust_verdict again over the kept issues, and below local reach " +
       "recounts the tier-drift warning over the rows readableAtContextReach(ctx) keeps. The " +
+      "doctor pass is handed the same predicate, so the counts its checks take before any " +
+      "issue is filtered answer at the caller's reach too: a withheld page spends no slot of " +
+      "the removed-tool warning cap or of the per-code uncertain cap, is neither a state nor a " +
+      "consumer in the stale-dependency audit, and adds no principle, topic or preference to " +
+      "the semantic-health detectors behind the concept-gap and contradiction warnings, and a " +
+      "withheld vault-root instruction file raises no ceiling warning. The " +
       "repair branch hands applyRepair the caller's reach, which bounds the findings before the " +
-      "plan is derived, so a withheld record is neither planned, counted nor written.",
+      "plan is derived, and the same predicate, so the checks behind the plan count and cap " +
+      "over readable pages too: a withheld record is neither planned, counted nor written, and " +
+      "the unfixable counts are those of a vault without it.",
   },
   {
     surface: "schema_inspect",
@@ -356,10 +366,13 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
     kind: K.mcpTool,
     category: C.covered,
     reason:
-      "runs runDoctor's semantic-health pass and names preferences by id in its contradiction, " +
-      "stale-claim and batch-inflation findings; each finding is kept only when every member " +
-      "passes the gated owner view ANDed with reachView, and the verdict is folded again over " +
-      "the kept families.",
+      "runs runDoctor's semantic-health pass handed readableAtContextReach(ctx), so the " +
+      "detectors read only the preferences and signals the caller may read: concept_gaps (a " +
+      "term and its frequency over principle text, which no reference view can judge) and the " +
+      "suppressed counts are taken over those principles and topics, and a withheld preference " +
+      "joins no contradiction, stale claim or batch. Each finding naming preferences by id is " +
+      "then kept only when every member passes the gated owner view ANDed with reachView, and " +
+      "the verdict is folded again over the kept families.",
   },
   {
     surface: "brain_status",
@@ -375,12 +388,12 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
   {
     surface: "brain_maintenance",
     kind: K.mcpTool,
-    category: C.excluded,
+    category: C.covered,
     reason:
-      "the bridges and clusters lanes of this maintenance runner call discoverBridges / " +
-      "detectCommunities directly in their own `run` steps, the same unfiltered vec-index and " +
-      "link-graph reads brain_bridges/brain_clusters make - the response surfaces only per-lane " +
-      "counts, but the reads themselves are unfiltered.",
+      "below local reach run is refused with a fixed sentence (MAINTENANCE_RUN_LOCAL_ONLY) " +
+      "before the lease or any write, because it runs the dream pass, the reindex, the bridges " +
+      "and clusters lanes and custom tasks over the whole vault; status returns the lease and " +
+      "journal only.",
   },
   {
     surface: "brain_secrets",
@@ -405,10 +418,12 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
   {
     surface: "brain_diarize",
     kind: K.mcpTool,
-    category: C.excluded,
+    category: C.covered,
     reason:
-      "diarize() (core/brain/diarization.ts) returns document_set - the entity's assembled " +
-      "document set from the registry and sources - with no visibility check on any member path.",
+      "diarize() is handed readableAtContextReach(ctx): a subject page the caller may not read " +
+      "answers as an unknown entity, an ingested-source page the caller may not read is neither " +
+      "evidence, counted nor named in document_set, and the link candidates are filtered by the " +
+      "same predicate beside the owner scope.",
   },
   {
     surface: "brain_context",
@@ -457,17 +472,31 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
     kind: K.mcpTool,
     category: C.excluded,
     reason:
-      "reads the anticipatory-context cache (core/brain/anticipatory-cache.ts), which mirrors " +
-      "brain_context_pack's own candidate items - no visibility check runs over the cached read.",
+      "below local reach the handler builds the bundle for the caller with the same reachView " +
+      "candidate filter brain_context_pack hands packContext, asked before ranking and " +
+      "budgeting; it neither reads nor writes the shared per-root cache entry, so a bundle " +
+      "cached for the operator is never served to a remote caller and a filtered bundle never " +
+      "replaces the operator's, and it answers cache_state miss. Session hits follow the " +
+      "session tools' <private> region model, a stated residual. Local reach is byte-identical. " +
+      "It stays EXCLUDED for the reason brain_context_pack does: the bundle carries the bodies " +
+      "of readable pages, and a readable page's body can name a reserved page in a wikilink.",
   },
   {
     surface: "brain_context_receipts",
     kind: K.mcpTool,
     category: C.excluded,
     reason:
-      "show returns a stored receipt's full payload verbatim - the same content a prior " +
-      "brain_context_pack call recorded - with no visibility re-check at read time; only a " +
-      "receipt-level private/redacted flag applies, which is a different axis.",
+      "show returns a stored receipt's payload - the same content a prior brain_context_pack " +
+      "call recorded - with no visibility re-check at read time; only a receipt-level " +
+      "private/redacted flag applies, which is a different axis. Below local reach a " +
+      "SessionStart injection receipt (pack-tools.ts receiptAtReach) drops the standing-rules " +
+      "and scoped-rules items and source references and every figure that counts or measures " +
+      "them (item_count, final_text_hash, final_text_chars, total_bytes, total_tokens, " +
+      "scoped_rules_chars, budgeted_source_count), drops the budget block when no budgeted body " +
+      "is left, and summary folds without the rule items, so a degraded injection that kept " +
+      "only the rules counts as an empty receipt. A measured injection receipt whose every item " +
+      "was a rule block (isRuleOnlyInjection) is withheld whole: list and summary exclude it " +
+      "before their limit and fold bound, and show answers it as an unknown id.",
   },
   {
     surface: "brain_event_trace",
@@ -529,10 +558,22 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
       "not counted), and no report snapshot is taken or delta shown; view=today renders its " +
       "recent activity through the shared log-event rule (log-events-at-reach.ts via " +
       "reach-events.ts) before the limit and the totals, so an event naming a withheld record " +
-      "is absent and a shared dream shows only its readable transitions. Residual: the monthly " +
-      "and operator views still count over the whole Brain layer (summary events, status " +
-      "transitions, retired and contradiction counts; preference, retired and doctor counts " +
-      "and the trust verdict), and name no id.",
+      "is absent and a shared dream shows only its readable transitions, and lists an obligation " +
+      "or an open loop only when readableAtContextReach(ctx) passes its page, tested before the " +
+      "note is read, so neither its text, its path nor the totals move; view=monthly counts the " +
+      "month's events through the same log-event rule before the transition, retirement, " +
+      "contradiction and neglected-area counts; view=operator takes its doctor counts over the " +
+      "findings the owner view ANDed with reachView keeps (the doctor pass itself handed " +
+      "readableAtContextReach(ctx), so the removed-tool and uncertain caps, the " +
+      "stale-dependency states and consumers and the semantic-health detectors count only " +
+      "readable pages), its digest counts over the preference, retired and inbox pages the " +
+      "caller may read, its instruction-file warnings over the vault-root files the caller may " +
+      "read, its top actions by target before the top-N slice, its verification entries and " +
+      "their counts by the record and page each names, and the trust verdict again over those " +
+      "kept streams. " +
+      "Residual: the operator view's dream_summary counts (dream warnings, uncertain and " +
+      "quarantined entries of the dry-run dream), and the dream warnings the trust verdict " +
+      "folds in, are still taken over the whole Brain layer and name no id.",
   },
   {
     surface: "brain_analytics",
@@ -606,14 +647,15 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
     kind: K.mcpTool,
     category: C.covered,
     reason:
-      "the freshness detector's population comes from listVaultPages(MAINTENANCE_LANE_REACH), so " +
-      "reserved pages are walked IN on purpose - a scan that stopped seeing them would diagnose a " +
-      "smaller vault than the one it is diagnosing - and every finding puts its page's " +
-      "vault-relative path in `targets` with a title stating a fact about it. The rule is asked " +
-      "on the seam the owner rule already sits on, over what the caller is told, so a detector " +
-      "registered after this one inherits it; `counts` is recomputed from the visible findings and " +
-      "a withheld " +
-      "id lands in `unknown_ids` exactly as one nobody issued does.",
+      "the freshness detector's population comes from listVaultPages(MAINTENANCE_LANE_REACH), " +
+      "so reserved pages are walked IN on purpose - a scan that stopped seeing them would " +
+      "diagnose a smaller vault than the one it is diagnosing - and every finding puts its " +
+      "page's vault-relative path in `targets` with a title stating a fact about it. The rule " +
+      "is asked on the seam the owner rule already sits on, over what the caller is told, so a " +
+      "detector registered after this one inherits it; `counts` is recomputed from the visible " +
+      "findings and a withheld id lands in `unknown_ids` exactly as one nobody issued does. " +
+      "refresh plans only the derived pages readableAtContextReach(ctx) keeps, so a withheld " +
+      "stale or orphaned page is neither named, re-derived nor archived.",
   },
   {
     surface: "brain_skill_proposals",
@@ -703,6 +745,232 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
     reason:
       "runs vault/config/plugin-manifest health checks and state-surface inventory - no note " +
       "content crosses this surface; included for completeness of the file-level sweep only.",
+  },
+  {
+    surface: "brain_obligation",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "every operation asks readableAtContextReach(ctx) about Brain/obligations/<slug>.md " +
+      "before the page is read or written: list keeps only the obligations the caller may read, " +
+      "show answers a withheld slug as an absent one ({present: false}), and done and remove " +
+      "refuse it with the 'no obligation' error an absent slug gets, so the page is neither " +
+      "completed nor archived. Below local reach remove leaves the archive name, which steps " +
+      "past withheld archived pages, out of the answer. Residual: add over a taken slug is " +
+      "refused whoever may read the page, because creating it would replace the withheld page.",
+  },
+  {
+    surface: "brain_agenda",
+    kind: K.mcpTool,
+    category: C.excluded,
+    reason:
+      "swept in for file-level completeness because calendar-tools.ts also registers " +
+      "brain_obligation: synthesizeAgenda folds the caller-supplied calendar events into " +
+      "conflicts and focus blocks and never reads a vault page, so no note path, title or body " +
+      "crosses this surface.",
+  },
+  {
+    surface: "brain_trigger",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "scan runs scanTriggers handed readableAtContextReach(ctx), so its semantic-health and " +
+      "retention sources read only the records the caller may read: the candidates total counts " +
+      "none it may not, and a scan from a remote caller writes no trigger about a withheld " +
+      "record. Every trigger row - created, skipped, list, history - is kept only when each " +
+      "artifact it names (source_artifacts, the wikilinks in its reason, the cooldown key " +
+      "segments) passes the gated owner view ANDed with reachView, and a transition on a trigger " +
+      "the caller may not see is refused with the 'unknown trigger' error an absent id gets.",
+  },
+  {
+    surface: "brain_intention",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "list and show return intention chains - Brain-authored scope records with their text, " +
+      "history and path; the handler asks readableAtContextReach(ctx) about each chain's page, " +
+      "so below local reach a withheld chain is listed by no row, shown as absent and refused " +
+      "by move with the error an absent scope gets. set over a withheld chain is refused rather " +
+      "than read and rewritten (the one answer that cannot match an absent chain's), and move " +
+      "leaves the archive name, which steps past withheld history files, out of the answer.",
+  },
+  {
+    surface: "brain_stale_scan",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "findStaleEntries walks the preference and signal records and names each stale one by id, " +
+      "topic and vault-relative path; the handler keeps a row only when its path and id pass the " +
+      "gated owner view ANDed with reachView, so below local reach a withheld record is listed " +
+      "by no row. stale_log_files names Brain/log shards by date, which are shared by " +
+      "construction and carry no page content.",
+  },
+  {
+    surface: "brain_review_candidates",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "the dry-run dream preview runs with previewReadable bound to readableAtContextReach(ctx), " +
+      "so below local reach it clusters, counts and routes only the signals, preferences and " +
+      "retired records the caller may read: clusters_below_threshold and intent_reviews fold no " +
+      "withheld signal. would_create, would_promote, would_retire, would_supersede and " +
+      "gated_retires keep a row only when both the pref- and the ret- spelling of its id pass " +
+      "the gated owner view ANDed with reachView, and signal_novelty asks the same of each " +
+      "signal's path and id.",
+  },
+  {
+    surface: "brain_retention",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "buildRetentionReview names retired preferences and processed signals by id and " +
+      "vault-relative path; the handler keeps a recommendation only when its path and id pass " +
+      "the gated owner view ANDed with reachView, and counts the summary again over the kept " +
+      "rows, so a withheld record moves neither a row nor a count.",
+  },
+  {
+    surface: "brain_tension",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "detect hands detectTensionsInVault readableAtContextReach(ctx), so a note the caller " +
+      "may not read is skipped before it is opened: it is not counted in scanned_files, takes " +
+      "part in no pair and names no tension. A persisted tension page carries the stricter " +
+      "visibility of its two source notes (strictestVisibility), and list, verify, show and the " +
+      "confirm, dismiss and resolve transitions ask the same predicate about the tension page's " +
+      "vault-relative path, answering a withheld one as absent ('no tension') before any write.",
+  },
+  {
+    surface: "brain_lifecycle",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "tombstone, supersede and temporal-replace resolve each page argument through " +
+      "resolveNotePath with readableAtContextReach(ctx): a page the caller may not read is " +
+      "refused with the 'note does not exist' error a missing page gets, before anything is " +
+      "written. curator keeps a slice row only when its key (a page path or a memory id) passes " +
+      "the gated owner view ANDed with reachView. tip builds its chain lookup over the Brain " +
+      "pages readableAtContextReach(ctx) keeps (buildChainLookup), so a withheld id reads as " +
+      "unknown and a walk stops at it.",
+  },
+  {
+    surface: "brain_derive_fact",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "deriveFact is handed readableAtContextReach(ctx): a premise preference the caller may " +
+      "not read is refused with the missing-premise error before anything is written. A slug " +
+      "colliding with a withheld preference still refuses as existing, the inherent " +
+      "create-collision residual.",
+  },
+  {
+    surface: "brain_decision",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "every action asks readableAtContextReach(ctx) about Brain/decisions/decision-<slug>.md: " +
+      "list, compare, similar and recall skip a page the caller may not read; show, outcome and " +
+      "rate refuse it with 'no decision: <slug>' before any write; history drops receipts whose " +
+      "subject the gated owner view ANDed with reachView hides, before the total and paging. " +
+      "record over an occupied withheld slug refuses 'decision already exists', the inherent " +
+      "create-collision residual; the review obligation record opens names the decision's title " +
+      "at default visibility unless the operator reserves it too.",
+  },
+  {
+    surface: "brain_scaffold_stub",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "list drops sources the caller may not read (the owner scope ANDed with " +
+      "readableAtContextReach(ctx)) and a target left with no readable source; write refuses an " +
+      "unreadable source as unknown_source; the target_resolves and target_ambiguous refusals " +
+      "name no unreadable path. An occupied withheld target still refuses, the inherent " +
+      "create-collision residual.",
+  },
+  {
+    surface: "brain_note_lifecycle",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "swept in for file-level completeness because lifecycle-file-tools.ts also registers " +
+      "brain_scaffold_stub: rename, move, archive and delete resolve the note through the reach " +
+      "predicate and refuse a page the caller may not read with the error a missing note gets, " +
+      "before anything is read or written. A move or rename onto an occupied withheld " +
+      "destination still refuses as occupied, the inherent create-collision residual, and an " +
+      "applied move still rewrites links inside withheld pages without naming them.",
+  },
+  {
+    surface: "brain_expire",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "setExpiration is handed readableAtContextReach(ctx) and passes over a candidate file the " +
+      "caller may not read as if it were not there, so a withheld signal or preference is " +
+      "refused with the unknown-id error (ExpirationTargetNotFoundError, the same searched " +
+      "list) and nothing is written to it.",
+  },
+  {
+    surface: "brain_feedback",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "it writes the caller's own inbox signal (and, with force_confirmed, its preference) from " +
+      "the caller's arguments; the conflict advisory and the routing hint " +
+      "(adviseIncomingFeedback, adviseUnroutableCapture) score and count only the preferences " +
+      "and signals readableAtContextReach(ctx) keeps. force_confirmed over an occupied withheld " +
+      "slug still refuses with 'preference already exists', the inherent create-collision " +
+      "residual: only overwriting the page would hide it.",
+  },
+  {
+    surface: "brain_note",
+    kind: K.mcpTool,
+    category: C.excluded,
+    reason:
+      "swept in for file-level completeness because feedback-tools.ts also registers " +
+      "brain_expire: appendBrainNote appends the caller's own line to today's log and answers " +
+      "with the log path and agent; it reads no vault page.",
+  },
+  {
+    surface: "brain_observed_use",
+    kind: K.mcpTool,
+    category: C.excluded,
+    reason:
+      "swept in for file-level completeness because feedback-tools.ts also registers " +
+      "brain_expire: emitObservedUse stores the caller-supplied verdicts as one continuity " +
+      "record and answers with its id, the entry count and the timestamp; it reads no vault page.",
+  },
+  {
+    surface: "brain_apply_evidence",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "appendApplyEvidence is handed readableAtContextReach(ctx): a preference the caller may " +
+      "not read is refused with the missing-preference error (BrainPreferenceNotFoundError) " +
+      "before any write, exactly as an absent id, and the apply_evidence operation of " +
+      "brain_write_batch asks the same predicate.",
+  },
+  {
+    surface: "brain_dream",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "Below local reach only a dry run is served, planned over the records the caller may read " +
+      "as if the others were absent (previewReadable, the readableAtContextReach(ctx) " +
+      "predicate); a real pass, a single step and the staged lifecycle are refused with one " +
+      "fixed answer before anything is read or written. A preference the pass drafts carries " +
+      "the strictest visibility of the signals it is drafted from and of the record it " +
+      "supersedes or rebuts (strictestVisibilityOf), so reserved signal text never becomes a " +
+      "default-visibility preference; a refresh keeps the page's own visibility line.",
+  },
+  {
+    surface: "brain_intent_review",
+    kind: K.mcpTool,
+    category: C.covered,
+    reason:
+      "buildIntentReview folds inbox signal clusters into a topic, a decision, a signal count " +
+      "and a risk band; the handler hands it readableAtContextReach(ctx), so below local reach " +
+      "it folds only the signals and rejected retired records the caller may read, and a " +
+      "withheld one moves no topic, count or decision.",
   },
 
   // --- Excluded: CLI verbs, one per MCP tool above that has a CLI mirror ----

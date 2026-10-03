@@ -27,8 +27,10 @@ import { assessRecallAdequacy } from "../../core/brain/recall-adequacy.ts";
 import { recordRecallAdequacyDemand } from "../../core/brain/query-demand.ts";
 import { emitGatedTelemetry } from "../../core/brain/continuity/emit.ts";
 import {
+  buildReaderAnticipatoryContext,
   readAnticipatoryContext,
   refreshAnticipatoryCache,
+  type ReadAnticipatoryContextResult,
 } from "../../core/brain/anticipatory-cache.ts";
 import { loadBrainConfig } from "../../core/brain/policy.ts";
 import { buildPreCompressPack } from "../../core/brain/pre-compress-pack.ts";
@@ -38,10 +40,15 @@ import {
   getContextReceipt,
   isContextReceiptTrigger,
   listContextReceipts,
+  RECEIPT_ITEM_ACTIVE_BODY,
+  RECEIPT_ITEM_LESSONS_BODY,
+  RECEIPT_ITEM_SCOPED_RULES,
+  RECEIPT_ITEM_STANDING_RULES,
   summarizeContextReceipt,
   summarizeContextReceiptSession,
   type ContextReceiptOptions,
 } from "../../core/brain/context-receipts.ts";
+import type { ContinuityRecord } from "../../core/brain/continuity/types.ts";
 import { observedReuseRates } from "../../core/brain/observed-use.ts";
 import {
   diffContextPreset,
@@ -347,13 +354,17 @@ async function toolBrainContextReceipts(
     const host = optionalStringArg("brain_context_receipts", args, "host");
     const sessionId = optionalStringArg("brain_context_receipts", args, "session_id");
     const limit = coercePositiveInteger("brain_context_receipts", "limit", args["limit"]);
+    const local = contextReach(ctx) === TRANSPORT_REACH.local;
     const receipts = listContextReceipts(ctx.vault, {
       ...(trigger !== undefined ? { trigger } : {}),
       ...(host !== undefined ? { host } : {}),
       ...(sessionId !== undefined ? { sessionId } : {}),
       ...(limit !== undefined ? { limit } : {}),
+      ...(local ? {} : { exclude: isRuleOnlyInjection }),
     });
-    const summaries = receipts.map(summarizeContextReceipt);
+    const summaries = receipts
+      .map((receipt) => receiptAtReach(receipt, local))
+      .map(summarizeContextReceipt);
     return {
       vault_path: vaultPathField(ctx),
       total: summaries.length,
@@ -366,10 +377,14 @@ async function toolBrainContextReceipts(
     if (id === undefined) {
       throw new MCPError(INVALID_PARAMS, "brain_context_receipts: id is required for show");
     }
-    const receipt = getContextReceipt(ctx.vault, id);
-    if (receipt === null) {
+    const local = contextReach(ctx) === TRANSPORT_REACH.local;
+    const stored = getContextReceipt(ctx.vault, id);
+    // Below local reach a receipt that recorded only the operator rules
+    // is answered as an unknown id: showing it would say rules applied.
+    if (stored === null || (!local && isRuleOnlyInjection(stored))) {
       throw new MCPError(INVALID_PARAMS, `brain_context_receipts: receipt not found: ${id}`);
     }
+    const receipt = receiptAtReach(stored, local);
     return {
       id: receipt.id,
       kind: receipt.kind,
@@ -384,6 +399,104 @@ async function toolBrainContextReceipts(
   if (operation === "summary") return summarizeReceipts(ctx, args);
 
   throw unknownOperationError("brain_context_receipts: operation must be list, show, or summary");
+}
+
+/** Predicate: a receipt item whose `id` is one of `ids`. */
+const itemIdIn =
+  (ids: ReadonlySet<string>) =>
+  (item: unknown): boolean => {
+    const id = (item as { id?: unknown } | null)?.id;
+    return typeof id === "string" && ids.has(id);
+  };
+
+/** Receipt items naming the operator-rule blocks the SessionStart hook injected. */
+const OPERATOR_RULE_ITEM_IDS: ReadonlySet<string> = new Set([
+  RECEIPT_ITEM_STANDING_RULES,
+  RECEIPT_ITEM_SCOPED_RULES,
+]);
+
+const isOperatorRuleItem = itemIdIn(OPERATOR_RULE_ITEM_IDS);
+
+/**
+ * A measured injection receipt whose every item was an operator-rule
+ * block: the hook recorded it only because rules applied (a session with
+ * no `active.md` body to inject). Below local reach it
+ * is withheld whole - left out of list and summary, refused by show -
+ * since even its empty remainder would say that rules applied.
+ */
+function isRuleOnlyInjection(record: ContinuityRecord): boolean {
+  if (record.payload["trigger"] !== "session_inject") return false;
+  // A degraded injection that served a cached body beside the rules is
+  // recorded whether or not rules applied: it stays, emptied of them. One
+  // with no cached body (`loader_source: "empty"`) exists only because the
+  // rules were injected, so it is rule-only like a measured one.
+  const injection = record.payload["injection"] as
+    | { sources_measured?: unknown; loader_source?: unknown }
+    | undefined;
+  if (injection?.sources_measured === false && injection.loader_source !== "empty") return false;
+  const items = record.payload["items"];
+  return Array.isArray(items) && items.length > 0 && items.every(isOperatorRuleItem);
+}
+
+/** Receipt items charged against the injection budget besides the scoped rules. */
+const BUDGETED_BODY_ITEM_IDS: ReadonlySet<string> = new Set([
+  RECEIPT_ITEM_ACTIVE_BODY,
+  RECEIPT_ITEM_LESSONS_BODY,
+]);
+
+const isBudgetedBodyItem = itemIdIn(BUDGETED_BODY_ITEM_IDS);
+
+/** Payload fields of an injection receipt whose figures include the operator-rule blocks. */
+const INJECTION_TOTAL_FIELDS = ["final_text_hash", "final_text_chars"] as const;
+const INJECTION_EXTRA_TOTAL_FIELDS = ["total_bytes", "total_tokens"] as const;
+const BUDGET_RULE_FIELDS = ["scoped_rules_chars", "budgeted_source_count"] as const;
+
+/**
+ * A stored receipt as the caller may see it at its reach.
+ *
+ * At local reach the record is returned unchanged. Below it, an injection
+ * receipt says nothing about the operator's standing and scoped rules:
+ * their items and source references are dropped (the remaining items
+ * re-ranked), and every figure that counts or measures them - the item
+ * count, the whole-text hash and lengths, the scoped characters and the
+ * budgeted source count - is removed, so a session that injected rules
+ * answers like one that did not.
+ */
+function receiptAtReach(record: ContinuityRecord, local: boolean): ContinuityRecord {
+  if (local || record.payload["trigger"] !== "session_inject") return record;
+  const payload: Record<string, unknown> = { ...record.payload };
+  if (Array.isArray(payload["items"])) {
+    const items = (payload["items"] as ReadonlyArray<unknown>).filter(
+      (item) => !isOperatorRuleItem(item),
+    );
+    payload["items"] = items.map((item, index) =>
+      typeof item === "object" && item !== null ? { ...item, original_rank: index + 1 } : item,
+    );
+    payload["item_count"] = items.length;
+  }
+  for (const field of INJECTION_TOTAL_FIELDS) delete payload[field];
+  const injection = payload["injection"];
+  if (typeof injection === "object" && injection !== null) {
+    const kept: Record<string, unknown> = { ...(injection as Record<string, unknown>) };
+    for (const field of INJECTION_EXTRA_TOTAL_FIELDS) delete kept[field];
+    payload["injection"] = kept;
+  }
+  const budget = payload["budget"];
+  const remaining = Array.isArray(payload["items"]) ? (payload["items"] as unknown[]) : [];
+  if (!remaining.some(isBudgetedBodyItem)) {
+    // The block exists only because the scoped rules were charged: with
+    // no budgeted body left, a receipt without the rules carries none.
+    delete payload["budget"];
+  } else if (typeof budget === "object" && budget !== null) {
+    const kept: Record<string, unknown> = { ...(budget as Record<string, unknown>) };
+    for (const field of BUDGET_RULE_FIELDS) delete kept[field];
+    payload["budget"] = kept;
+  }
+  return {
+    ...record,
+    sourceRefs: record.sourceRefs.filter((ref) => !isOperatorRuleItem(ref)),
+    payload,
+  };
 }
 
 /**
@@ -442,9 +555,13 @@ async function summarizeReceipts(
     ...(since !== undefined ? { since } : {}),
     ...(until !== undefined ? { until } : {}),
   };
+  const local = contextReach(ctx) === TRANSPORT_REACH.local;
   const fold = summarizeContextReceiptSession(ctx.vault, {
     ...window,
     ...(maxReceipts !== undefined ? { maxReceipts } : {}),
+    // Below local reach the operator-rule items leave the item figures,
+    // and a receipt that recorded nothing else is not folded at all.
+    ...(local ? {} : { exclude: isRuleOnlyInjection, excludeItem: isOperatorRuleItem }),
   });
   if (!fold.recorded) {
     return {
@@ -743,6 +860,26 @@ async function toolBrainAnticipatoryContext(
   }
   const anticipatoryScope = coerceAgentScope(ctx, args, true);
   const now = new Date();
+  // Below local reach the bundle is built for this caller with the same
+  // candidate filter `brain_context_pack` applies, and the shared cache is
+  // neither read nor written: a cached bundle may hold pages this caller
+  // cannot read, and a filtered bundle must not replace the operator's.
+  const view = reachView(ctx.vault, contextReach(ctx));
+  const remote = view.reach !== TRANSPORT_REACH.local;
+  if (remote) {
+    // A refresh takes the caller's signal exactly as the cached path does;
+    // a plain read has no cached signal to reuse here.
+    const signal = coerceBool(args, "refresh") === true ? coerceStr(args, "signal_text") : null;
+    const result = buildReaderAnticipatoryContext(ctx.vault, {
+      sessionId,
+      now,
+      visible: (abs: string) => view.visible(vaultRelative(ctx.vault, abs)),
+      ...(anticipatoryScope !== undefined ? { agentScope: anticipatoryScope } : {}),
+      ...(maxTokens !== undefined ? { maxTokens } : {}),
+      ...(typeof signal === "string" ? { signalText: signal } : {}),
+    });
+    return anticipatoryAnswer(result);
+  }
   if (coerceBool(args, "refresh") === true) {
     const signal = coerceStr(args, "signal_text");
     refreshAnticipatoryCache(ctx.vault, {
@@ -761,6 +898,10 @@ async function toolBrainAnticipatoryContext(
     ...(ttlSeconds !== undefined ? { ttlSeconds } : {}),
     ...(maxTokens !== undefined ? { maxTokens } : {}),
   });
+  return anticipatoryAnswer(result);
+}
+
+function anticipatoryAnswer(result: ReadAnticipatoryContextResult): Record<string, unknown> {
   return {
     cache_state: result.cache_state,
     root_session_id: result.root_session_id,

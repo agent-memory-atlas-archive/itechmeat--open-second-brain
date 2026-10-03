@@ -94,6 +94,7 @@ import {
   isInstallTargetId,
   type InstallTargetId,
 } from "../core/runtime/host-facts.ts";
+import { HARNESS_IDS, isHarnessId, type HarnessId } from "../core/brain/scoped-rules.ts";
 
 // ── Subcommands ─────────────────────────────────────────────────────────────
 
@@ -722,6 +723,22 @@ async function cmdIndex(argv: string[]): Promise<number> {
   return 0;
 }
 
+/** The C1 control range, which `JSON.stringify` leaves as raw characters. */
+const C1_CONTROL_RE = /[\u0080-\u009f]/g;
+
+/**
+ * A refused argv value as it is echoed to stderr: JSON-quoted, which
+ * escapes the C0 controls, with the C1 controls (the 8-bit CSI U+009B
+ * among them) escaped as `\uXXXX` too, so no terminal control sequence
+ * reaches the operator's screen.
+ */
+function quoteRefusedValue(value: string): string {
+  return JSON.stringify(value).replace(
+    C1_CONTROL_RE,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
 async function cmdMcp(argv: string[]): Promise<number> {
   const { flags } = parseFlags(argv, {
     vault: { type: "string" },
@@ -731,6 +748,7 @@ async function cmdMcp(argv: string[]): Promise<number> {
     "writer-only": { type: "boolean" },
     "tool-profile": { type: "string" },
     "host-target": { type: "string" },
+    harness: { type: "string" },
     probe: { type: "boolean" },
     json: { type: "boolean" },
     transport: { type: "string", default: "stdio" },
@@ -767,15 +785,35 @@ async function cmdMcp(argv: string[]): Promise<number> {
   // An unrecognised value is refused rather than dropped: silently
   // ignoring it would report the ceiling as unchecked on a host that
   // publishes one, which is the exact silence this flag exists to end.
+  // The refused value is echoed quoted and escaped (quoteRefusedValue),
+  // so a control character in it reaches stderr escaped.
   const hostTargetFlag = flags["host-target"] as string | undefined;
   if (hostTargetFlag !== undefined && !isInstallTargetId(hostTargetFlag)) {
     process.stderr.write(
-      `o2b mcp: invalid --host-target value: ${hostTargetFlag}; ` +
+      `o2b mcp: invalid --host-target value: ${quoteRefusedValue(hostTargetFlag)}; ` +
         `expected one of: ${INSTALL_TARGET_IDS.join(", ")}\n`,
     );
     return 2;
   }
   const hostTarget = hostTargetFlag as InstallTargetId | undefined;
+
+  // Which harness launched this server, for the scoped standing rules
+  // (`Brain/standing-rules/harness/<id>.md`). Written by the packager into
+  // the plugin registration (Claude Code) or the bridge argv (Hermes);
+  // absent falls back to `--host-target`. Refused when unknown for the
+  // same reason `--host-target` is: a typo would silently match no file.
+  const harnessFlag = flags["harness"] as string | undefined;
+  if (harnessFlag !== undefined && !isHarnessId(harnessFlag)) {
+    process.stderr.write(
+      `o2b mcp: invalid --harness value: ${quoteRefusedValue(harnessFlag)}; ` +
+        `expected one of: ${HARNESS_IDS.join(", ")}\n`,
+    );
+    return 2;
+  }
+  const harness = harnessFlag as HarnessId | undefined;
+  // Captured once, at launch: the project scope is the directory the
+  // runtime started this server in, not wherever a later chdir points.
+  const workspaceDir = process.cwd();
 
   const config = (flags["config"] as string | undefined) ?? defaultConfigPath();
   const transport = flags["transport"] as string;
@@ -875,7 +913,7 @@ async function cmdMcp(argv: string[]): Promise<number> {
       const handle = await startHttp(
         { vault, configPath: config, repoRoot },
         { host, port, apiKey, faultCounts: () => faults.counts() },
-        { scope, serverName, capabilityWindow, hostTarget },
+        { scope, serverName, capabilityWindow, hostTarget, harness, workspaceDir },
       );
       // Log the actually-bound endpoint. With the default --port 0 the OS
       // assigns an ephemeral port, so the requested `port` value ("0") would
@@ -914,7 +952,7 @@ async function cmdMcp(argv: string[]): Promise<number> {
             stdio.signals = installMcpSignalDrain({ close: () => live.close() });
           },
         },
-        { scope, serverName, capabilityWindow, hostTarget },
+        { scope, serverName, capabilityWindow, hostTarget, harness, workspaceDir },
       );
       return stdio.signals?.exitCode() ?? code;
     } finally {

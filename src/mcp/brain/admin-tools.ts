@@ -10,6 +10,7 @@ import { existsSync } from "node:fs";
 import { relative } from "node:path";
 
 import { toPosix } from "../../core/path-safety.ts";
+import { TRANSPORT_REACH } from "../../core/graph/transport-reach.ts";
 import { reachView } from "../../core/brain/reach-view.ts";
 import { resolveAgentName } from "../../core/config.ts";
 import { resolveSearchConfig } from "../../core/search/index.ts";
@@ -28,7 +29,7 @@ import { loadSchemaPack } from "../../core/brain/schema-pack.ts";
 import { listSecrets } from "../../core/brain/secrets/store.ts";
 import { runWithSecret, SecretExecDeniedError } from "../../core/brain/secrets/exec.ts";
 import type { ProgressSink } from "../../core/brain/progress.ts";
-import { readableAtContextReach } from "./reach-readable.ts";
+import { readableAtContextReach, readableAtContextReachOrUndefined } from "./reach-readable.ts";
 import { requiredStringArg, toolSafeguard } from "./shared.ts";
 import { currentLease } from "../../core/brain/maintenance/lease.ts";
 import { listJournal, MAINTENANCE_JOURNAL_CAP } from "../../core/brain/maintenance/journal.ts";
@@ -130,9 +131,13 @@ function toolBrainLabels(
   if (typeof dimension !== "string" || dimension.trim() === "") {
     throw new MCPError(INVALID_PARAMS, `brain_labels ${op}: dimension must be non-empty`);
   }
+  // A note the caller may not read at its reach is refused as a missing
+  // one, before its frontmatter is read or written.
+  const readable = readableAtContextReachOrUndefined(ctx);
+  const reach = readable !== undefined ? { readable } : {};
   try {
     if (op === "remove") {
-      return { ...removeNoteLabel(ctx.vault, path, { dimension, pack }) };
+      return { ...removeNoteLabel(ctx.vault, path, { dimension, pack, ...reach }) };
     }
     const value = args["value"];
     if (typeof value !== "string" || value.trim() === "") {
@@ -143,7 +148,14 @@ function toolBrainLabels(
       normalizeAgentArgument(typeof agentArg === "string" ? agentArg : null) ??
       resolveAgentName(ctx.configPath ?? undefined);
     return {
-      ...assignNoteLabel(ctx.vault, path, { dimension, value, pack, agent, now: new Date() }),
+      ...assignNoteLabel(ctx.vault, path, {
+        dimension,
+        value,
+        pack,
+        agent,
+        now: new Date(),
+        ...reach,
+      }),
     };
   } catch (exc) {
     if (exc instanceof LabelVocabularyError) {
@@ -344,6 +356,9 @@ async function toolBrainSecrets(
  */
 const MAX_RETRY_TASKS = LANE_TASKS.length + CUSTOM_TASK_MAX;
 
+/** The refusal of a lane run below local reach; it names nothing in the vault. */
+export const MAINTENANCE_RUN_LOCAL_ONLY = "brain_maintenance: run executes at local reach only";
+
 /** Quiet-window, lease-guarded heavy maintenance lane. */
 async function toolBrainMaintenance(
   ctx: ServerContext,
@@ -366,6 +381,16 @@ async function toolBrainMaintenance(
       journal: listJournal(ctx.vault, coerceInt(args, "limit", 10, 1, MAINTENANCE_JOURNAL_CAP)),
       ...(notice !== null ? { notice } : {}),
     };
+  }
+  // A run executes the whole lane - a real dream pass that moves records,
+  // reindexing and the operator's custom tasks - over every page of the
+  // vault, so it is the operator's own operation. Below local reach it is
+  // refused with one fixed sentence, before the lease or any write, and
+  // whatever the vault holds. The test is the transport reach itself, not
+  // the owner gate: an owner-gated caller at local reach is still the
+  // operator.
+  if (contextReach(ctx) !== TRANSPORT_REACH.local) {
+    throw new MCPError(INVALID_PARAMS, MAINTENANCE_RUN_LOCAL_ONLY);
   }
   let window: DailyWindow | undefined;
   const startHour = args["window_start_hour"];

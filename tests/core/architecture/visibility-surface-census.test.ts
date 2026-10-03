@@ -276,10 +276,73 @@ const NOTE_CONTENT_PRODUCERS: ReadonlyArray<ProducerRule> = Object.freeze([
       "allClaims",
     ],
   },
+  // Obligation pages are vault pages the today view already filtered by
+  // reach while the tool that lists, shows and completes them did not.
+  {
+    specifierIncludes: "/brain/obligations.ts",
+    identifiers: ["listObligations", "showObligation"],
+  },
+  // The trigger scan folds semantic health and the retention review into
+  // queued triggers that name the records they fired on.
+  { specifierIncludes: "/brain/triggers/scan.ts", identifiers: ["scanTriggers"] },
+  // The lifecycle review readers name preferences and signals by id and
+  // vault-relative path.
+  { specifierIncludes: "/brain/temporal/stale-watch.ts", identifiers: ["findStaleEntries"] },
+  { specifierIncludes: "/brain/review-candidates.ts", identifiers: ["buildReviewCandidates"] },
+  { specifierIncludes: "/brain/retention.ts", identifiers: ["buildRetentionReview"] },
+  // A tension page quotes the two notes it pairs, the lifecycle writes
+  // and the expiration writer resolve a page or record by path or id and
+  // answer with it, and the curator rows name pages by path.
+  {
+    specifierIncludes: "/brain/tensions.ts",
+    identifiers: ["detectTensionsInVault", "listTensions", "showTension"],
+  },
+  {
+    specifierIncludes: "/brain/lifecycle/tombstone.ts",
+    identifiers: ["tombstone", "supersede", "buildChainLookup", "resolveChainTipInVault"],
+  },
+  { specifierIncludes: "/brain/lifecycle/temporal-replace.ts", identifiers: ["temporalReplace"] },
+  { specifierIncludes: "/brain/lifecycle/curator.ts", identifiers: ["curatorSlices"] },
+  { specifierIncludes: "/brain/expiration-set.ts", identifiers: ["setExpiration"] },
   {
     specifierIncludes: "/brain/truth/",
     identifiers: ["computeTruthStateWithConflicts", "aggregateQuantities", "detectAgentCollisions"],
   },
+  {
+    specifierIncludes: "/brain/decisions/record.ts",
+    identifiers: [
+      "showDecision",
+      "listDecisions",
+      "listRatedDecisions",
+      "compareDecisions",
+      "findSimilarDecisions",
+      "backfillOutcome",
+      "updateRating",
+    ],
+  },
+  { specifierIncludes: "/brain/decisions/recall.ts", identifiers: ["recallRatedDecisions"] },
+  {
+    specifierIncludes: "/brain/decisions/receipts.ts",
+    identifiers: ["queryDecisionChangeHistory"],
+  },
+  { specifierIncludes: "/brain/labels.ts", identifiers: ["assignNoteLabel", "removeNoteLabel"] },
+  {
+    specifierIncludes: "/brain/notes/scaffold-stub.ts",
+    identifiers: ["scaffoldStub", "listDanglingTargets"],
+  },
+  { specifierIncludes: "/brain/design-note.ts", identifiers: ["designNoteGrounding"] },
+  { specifierIncludes: "/brain/apply-evidence.ts", identifiers: ["appendApplyEvidence"] },
+  {
+    specifierIncludes: "/brain/write-advisory.ts",
+    identifiers: ["adviseIncomingFeedback", "adviseUnroutableCapture"],
+  },
+  { specifierIncludes: "/brain/derived-fact.ts", identifiers: ["deriveFact"] },
+  {
+    specifierIncludes: "/brain/anticipatory-cache.ts",
+    identifiers: ["readAnticipatoryContext", "buildReaderAnticipatoryContext"],
+  },
+  { specifierIncludes: "/brain/diarization.ts", identifiers: ["diarize"] },
+  { specifierIncludes: "/brain/recompile.ts", identifiers: ["planRecompile"] },
 ]);
 
 /**
@@ -483,8 +546,36 @@ function reasonProblems(entries: ReadonlyArray<VisibilitySurfaceEntry>): {
  * 55 before the vocabulary gained `buildConceptCluster`. The one new name
  * is `brain_analytics`, whose timeline, belief-evolution and
  * concept-synthesis views render log events and backlinks.
+ *
+ * 56 before the vocabulary gained the obligation readers. The two new
+ * names are `brain_obligation`, which listed and showed a withheld
+ * obligation page, and `brain_agenda` on the file-level rule.
+ *
+ * 58 before the vocabulary gained the trigger scan. The two new names
+ * are `brain_trigger`, whose scan queued and counted triggers about
+ * withheld records, and `brain_intention` on the file-level rule.
+ *
+ * 60 before the vocabulary gained the lifecycle review readers. The four
+ * new names are `brain_stale_scan`, `brain_review_candidates` and
+ * `brain_retention`, which named withheld preferences and signals by id
+ * and path, and `brain_intent_review` on the file-level rule.
+ *
+ * 64 before the vocabulary gained the tension, lifecycle and expiration
+ * producers. The eight new names are `brain_tension`, which paired and
+ * quoted withheld notes, `brain_lifecycle` and `brain_expire`, which
+ * wrote to withheld pages and records, and `brain_feedback`,
+ * `brain_apply_evidence`, `brain_dream`, `brain_note` and
+ * `brain_observed_use` on the file-level rule.
+ *
+ * 72 before the vocabulary gained the decision, label, scaffold, chain
+ * tip, design-note, evidence, advisory, derived-fact, anticipatory,
+ * diarization and recompile producers. The four new names are
+ * `brain_decision`, which showed and rewrote a withheld decision page,
+ * `brain_derive_fact` and `brain_scaffold_stub`, which accepted a
+ * withheld premise or source, and `brain_note_lifecycle` on the
+ * file-level rule.
  */
-const MCP_TOOL_POPULATION_SIZE = 56;
+const MCP_TOOL_POPULATION_SIZE = 76;
 /** Measured: MCP resources + templates. */
 const MCP_RESOURCE_POPULATION_SIZE = 8;
 /** Measured: hand-enumerated CLI verb mirrors. */
@@ -544,27 +635,48 @@ describe("visibility surface census", () => {
       expect(covered).toEqual([
         "brain_agent_diff",
         "brain_agent_query",
+        "brain_apply_evidence",
         "brain_backlinks",
         "brain_bridges",
         "brain_claims",
         "brain_clusters",
         "brain_context",
+        "brain_dead_ends",
+        "brain_decision",
         "brain_deep_synthesis",
+        "brain_derive_fact",
+        "brain_diarize",
         "brain_doctor",
+        "brain_dream",
         "brain_eval",
         "brain_event_trace",
+        "brain_expire",
+        "brain_feedback",
         "brain_file_context",
         "brain_health",
         "brain_hygiene",
         "brain_idea_discovery",
+        "brain_intent_review",
+        "brain_intention",
+        "brain_labels",
+        "brain_lifecycle",
+        "brain_maintenance",
+        "brain_note_lifecycle",
+        "brain_obligation",
         "brain_pre_compress_pack",
         "brain_procedural_memory",
         "brain_query",
         "brain_recall_feedback",
+        "brain_retention",
+        "brain_review_candidates",
+        "brain_scaffold_stub",
         "brain_search",
         "brain_search_expand",
         "brain_skill_proposals",
+        "brain_stale_scan",
+        "brain_tension",
         "brain_tiers",
+        "brain_trigger",
         "brain_unlinked_mentions",
         "brain_writes",
         "schema_inspect",

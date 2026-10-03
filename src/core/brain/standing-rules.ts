@@ -52,9 +52,10 @@
  */
 
 import { readFileSync, realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 
-import { brainStandingRulesPath } from "./paths.ts";
+import { BRAIN_SCOPED_RULES_DIR, BRAIN_STANDING_RULES_FILE } from "./path-constants.ts";
+import { brainDirs, brainStandingRulesPath } from "./paths.ts";
 import { applySectionBudget } from "./text/text-budget.ts";
 
 /**
@@ -189,9 +190,10 @@ export class StandingRulesWriteRefusedError extends Error {
 }
 
 /**
- * Refuse a write whose target is `Brain/standing-rules.md`.
+ * Refuse a write whose target is `Brain/standing-rules.md` or any path
+ * inside the scoped rules directory `Brain/standing-rules/`.
  *
- * Narrow on purpose: it names ONE file, and it is called from the write
+ * Narrow on purpose: it names one file and one directory, and it is called from the write
  * paths that resolve a caller-named path without going through the
  * note-target envelope that already refuses the whole `Brain/` root. It
  * runs before any I/O in its callers, so a refused call also performs no
@@ -209,10 +211,61 @@ export function assertStandingRulesNotTargeted(
   notePath: string,
   surface: string,
 ): void {
-  const target = brainStandingRulesPath(vault);
+  // Lexical joins, not the containment-checked helpers: a rules file or
+  // folder symlinked out of the vault must not break unrelated writes, and
+  // the canonical comparison below still refuses its own paths.
+  const brainDir = brainDirs(vault).brain;
+  const target = join(brainDir, BRAIN_STANDING_RULES_FILE);
   const candidate = resolve(vault, notePath);
   if (candidate === target || canonicalPath(candidate) === canonicalPath(target)) {
     throw new StandingRulesWriteRefusedError(target, surface);
+  }
+  // The scoped rules directory (`Brain/standing-rules/`) is operator-authored
+  // too. A write usually names a file that does not exist yet, so the
+  // canonical side resolves the nearest existing ancestor and re-appends the
+  // missing tail: a new file under a symlinked folder is still caught. Both
+  // sides go through the same resolution, so a directory that does not
+  // exist yet under a symlinked vault root compares like for like.
+  const scopedDir = join(brainDir, BRAIN_SCOPED_RULES_DIR);
+  if (
+    isSameOrInside(candidate, scopedDir) ||
+    isSameOrInside(canonicalTail(candidate), canonicalTail(scopedDir))
+  ) {
+    throw new StandingRulesWriteRefusedError(candidate, surface);
+  }
+}
+
+/**
+ * The default file systems of macOS and Windows compare names without
+ * case, so there `brain/Standing-Rules/x.md` names the guarded directory.
+ * The native realpath returns the on-disk casing for the part that
+ * exists; the fold covers the tail that does not exist yet.
+ */
+const FOLD_PATH_CASE = process.platform === "darwin" || process.platform === "win32";
+
+function isSameOrInside(path: string, dir: string): boolean {
+  const p = FOLD_PATH_CASE ? path.toLowerCase() : path;
+  const d = FOLD_PATH_CASE ? dir.toLowerCase() : dir;
+  return p === d || p.startsWith(d.endsWith(sep) ? d : d + sep);
+}
+
+/**
+ * Canonical form of `path` when part of it does not exist yet: the nearest
+ * existing ancestor is canonicalized and the missing tail re-appended.
+ */
+function canonicalTail(path: string): string {
+  const missing: string[] = [];
+  let current = path;
+  for (;;) {
+    try {
+      const real = realpathSync.native(current);
+      return missing.length === 0 ? real : join(real, ...missing.toReversed());
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return path;
+      missing.push(basename(current));
+      current = parent;
+    }
   }
 }
 
@@ -224,7 +277,7 @@ export function assertStandingRulesNotTargeted(
  */
 function canonicalPath(path: string): string {
   try {
-    return realpathSync(path);
+    return realpathSync.native(path);
   } catch {
     return path;
   }

@@ -25,7 +25,7 @@ import type { DoctorIssue } from "../../core/brain/types.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { coerceBool, coerceFormat } from "../coerce.ts";
 import { vaultRelativeSafe } from "./shared.ts";
-import { readableAtContextReach } from "./reach-readable.ts";
+import { readableAtContextReach, readableAtContextReachOrUndefined } from "./reach-readable.ts";
 import { findingRefs } from "./hygiene-tools.ts";
 import { everyArtifactRefView } from "../../core/brain/artifact-ref-view.ts";
 import { reachView } from "../../core/brain/reach-view.ts";
@@ -118,6 +118,11 @@ async function toolBrainDoctor(
   if (apply && !repair) {
     throw new Error("brain_doctor: apply requires repair");
   }
+  // The counts the checks take before any finding is filtered - the
+  // removed-tool warning cap, the stale-dependency note, the concept
+  // gaps - are taken over the pages this caller may read, in the repair
+  // preview as in the report.
+  const readable = readableAtContextReachOrUndefined(ctx);
   if (repair) {
     if (strict && apply) {
       throw new Error("brain_doctor: cannot combine strict (read-only) with repair + apply");
@@ -134,6 +139,7 @@ async function toolBrainDoctor(
       // And by the caller's reach: a record it cannot read there is
       // neither planned nor written, and counts toward nothing.
       reach: contextReach(ctx),
+      ...(readable !== undefined ? { readable } : {}),
     });
     return { format, repair: outcome };
   }
@@ -146,6 +152,7 @@ async function toolBrainDoctor(
     // the config this server was started against, not whatever default
     // discovery would find.
     ...(ctx.configPath !== null ? { configPath: ctx.configPath } : {}),
+    ...(readable !== undefined ? { readable } : {}),
   });
 
   // Every issue names the artifact it is about - `path`, `target`, the
@@ -279,7 +286,13 @@ async function toolBrainHealth(
   args: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const format = coerceFormat(args);
-  const result = runDoctor(ctx.vault);
+  // The detectors run over the records this caller may read: a concept
+  // gap is a term and its frequency taken over principle TEXT, so the
+  // reference view below cannot judge it, and a withheld principle would
+  // otherwise name its own words. `undefined` at local reach with the
+  // owner gate off, so the operator's report is unchanged.
+  const readable = readableAtContextReachOrUndefined(ctx);
+  const result = runDoctor(ctx.vault, readable !== undefined ? { readable } : {});
   const sh = result.semantic_health;
   // Three of the four finding families name preferences by id, and the
   // batch-inflation family names their topics as well
@@ -321,7 +334,8 @@ async function toolBrainHealth(
       a_sign: c.aSign,
       b_sign: c.bSign,
     })),
-    // A term and its frequency; the only family that names no artifact.
+    // A term and its frequency, taken over the principles this caller
+    // may read; the only family that names no artifact.
     concept_gaps: conceptGaps.map((g) => ({
       term: g.term,
       frequency: g.frequency,

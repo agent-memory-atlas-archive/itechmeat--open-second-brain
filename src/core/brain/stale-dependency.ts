@@ -51,7 +51,7 @@
  */
 
 import { readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 
 import { buildBacklinkIndex } from "./backlinks.ts";
 import type { ContinuityRecord } from "./continuity/types.ts";
@@ -77,6 +77,7 @@ import { readLifecycleState } from "./lifecycle/tombstone.ts";
 import { boundaryToMs, VALID_UNTIL_KEY } from "./lifecycle/temporal-replace.ts";
 import { brainDirs } from "./paths.ts";
 import { MS_PER_DAY } from "./time.ts";
+import { toPosix } from "../path-safety.ts";
 import { parseFrontmatter } from "../vault.ts";
 import { brainArtifactSlug } from "./wikilink.ts";
 
@@ -115,6 +116,13 @@ export interface StaleDependencyOptions {
   readonly lookbackDays?: number;
   /** Per-state report cap; defaults to {@link STALE_DEPENDENCY_MAX_CONSUMERS_PER_STATE}. */
   readonly maxConsumersPerState?: number;
+  /**
+   * Whether the caller may read a vault-relative path. A state whose page
+   * it rejects is left out before the join and `states_changed`, so it
+   * moves no count. Omitted, every state counts (the operator's own
+   * shell).
+   */
+  readonly readable?: (rel: string) => boolean;
 }
 
 /**
@@ -182,8 +190,20 @@ export function auditStaleDependencies(
   const windowSince = new Date(now.getTime() - lookbackDays * MS_PER_DAY).toISOString();
   const contextReceipts = readContextReceipts(vault, windowSince);
   const decisionReceipts = readDecisionCitations(vault, windowSince);
-  const artifacts = walkBrainArtifacts(vault);
-  const states = collectStates(vault, artifacts, now.getTime());
+  const readable = opts.readable;
+  const isReadable = (path: string): boolean =>
+    readable === undefined || readable(toPosix(relative(vault, path)));
+  // Bounded once, before both passes: a page the caller may not read is
+  // neither a state nor a consumer, so it adds to no consumer count, takes
+  // no consumer slot, and cannot hide a readable state's row by being
+  // named in it.
+  const allArtifacts = walkBrainArtifacts(vault);
+  const artifacts =
+    readable === undefined ? allArtifacts : allArtifacts.filter((a) => isReadable(a.path));
+  const allStates = collectStates(vault, artifacts, now.getTime());
+  // Retired records are read from their own folder rather than from the
+  // walk, so the states are bounded as well.
+  const states = readable === undefined ? allStates : allStates.filter((s) => isReadable(s.path));
   const stateKeys = new Set(states.map((state) => state.key));
 
   // The artifact arm runs unconditionally, and that is the point. It reads

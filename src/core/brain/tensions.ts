@@ -33,6 +33,8 @@ import { normalizeAgentArgument } from "../agent-identity.ts";
 import { resolveAgentName } from "../config.ts";
 import { atomicWriteFileSync } from "../fs-atomic.ts";
 import { sanitiseTextField } from "../redactor.ts";
+import { pageVisibility, strictestVisibility } from "../graph/visibility.ts";
+import type { FrontmatterMap } from "../types.ts";
 import { parseFrontmatter } from "../vault.ts";
 import {
   detectNoteContradictions,
@@ -164,6 +166,13 @@ export interface TensionRecord {
   readonly quoteA: string;
   /** Subject-bearing span quoted from {@link subjectB}. */
   readonly quoteB: string;
+  /**
+   * The `visibility:` tokens the tension page carries: the stricter of
+   * its two source notes' ({@link strictestVisibility}), so a page that
+   * quotes a note is read under that note's rule. Empty is default
+   * visibility.
+   */
+  readonly visibility: ReadonlyArray<string>;
   readonly path: string;
 }
 
@@ -171,6 +180,12 @@ export interface PersistTensionOptions {
   readonly agent?: string;
   readonly now?: Date;
   readonly configPath?: string;
+  /**
+   * The `visibility:` tokens to stamp on the page, normally the stricter
+   * of the two source notes'. Absent, a new page carries none and a
+   * refreshed page keeps what it had.
+   */
+  readonly visibility?: ReadonlyArray<string>;
 }
 
 export interface PersistTensionResult {
@@ -183,6 +198,12 @@ export interface DetectTensionsOptions extends DetectNoteContradictionsOptions {
   readonly agent?: string;
   readonly now?: Date;
   readonly configPath?: string;
+  /**
+   * The `visibility:` tokens of the source note with this id. Each
+   * persisted tension carries the stricter of its two subjects'. Absent,
+   * no tension page carries any.
+   */
+  readonly visibilityOf?: (id: string) => ReadonlyArray<string>;
 }
 
 export interface DetectTensionsResult {
@@ -294,6 +315,9 @@ function render(record: Omit<TensionRecord, "path">): string {
     lines.push(`resolution_reason: ${JSON.stringify(record.resolutionReason)}`);
   }
   lines.push(`agent: ${JSON.stringify(record.agent)}`);
+  if (record.visibility.length > 0) {
+    lines.push(`visibility: [${record.visibility.map((t) => JSON.stringify(t)).join(", ")}]`);
+  }
   lines.push("---", "");
   lines.push(`- ${record.subjectA}: ${record.quoteA}`);
   lines.push(`- ${record.subjectB}: ${record.quoteB}`);
@@ -355,6 +379,7 @@ function parsePage(vault: string, slug: string): TensionRecord | null {
     agent: scalarString(meta, "agent"),
     quoteA: quotes.get(subjectA) ?? "",
     quoteB: quotes.get(subjectB) ?? "",
+    visibility: Object.freeze(pageVisibility(meta)),
     path,
   });
 }
@@ -422,6 +447,7 @@ export function persistTension(
       detectedAt: stampedAt,
       quoteA: cleanQuote(quoteLow),
       quoteB: cleanQuote(quoteHigh),
+      visibility: opts.visibility ?? prior.visibility,
     };
     mkdirSync(tensionsDir(vault), { recursive: true });
     atomicWriteFileSync(prior.path, render(next));
@@ -448,6 +474,7 @@ export function persistTension(
     agent,
     quoteA: cleanQuote(quoteLow),
     quoteB: cleanQuote(quoteHigh),
+    visibility: opts.visibility ?? [],
   };
 
   mkdirSync(tensionsDir(vault), { recursive: true });
@@ -488,8 +515,12 @@ export function detectTensions(
   const records: TensionRecord[] = [];
   let created = 0;
   let updated = 0;
+  const visibilityOf = opts.visibilityOf;
   for (const finding of findings) {
     const res = persistTension(vault, finding, {
+      ...(visibilityOf !== undefined
+        ? { visibility: strictestVisibility(visibilityOf(finding.aId), visibilityOf(finding.bId)) }
+        : {}),
       ...(opts.agent !== undefined ? { agent: opts.agent } : {}),
       ...(opts.now !== undefined ? { now: opts.now } : {}),
       ...(opts.configPath !== undefined ? { configPath: opts.configPath } : {}),
@@ -521,6 +552,13 @@ export interface DetectTensionsInVaultOptions {
   readonly configPath?: string;
   /** Byte cap per scanned file; defaults to {@link NOTE_SCAN_MAX_BYTES}. */
   readonly maxFileSizeBytes?: number;
+  /**
+   * The vault-relative note paths the caller may read. A note it may not
+   * read is skipped before it is opened: it is not counted in
+   * `scannedFiles`, takes part in no pair and so names no tension.
+   * Absent, every note under the roots is read.
+   */
+  readonly readable?: (rel: string) => boolean;
 }
 
 export interface DetectTensionsInVaultResult extends DetectTensionsResult {
@@ -552,8 +590,10 @@ export function detectTensionsInVault(
   const rules = buildNoteWalkRules(vault);
   const cap = opts.maxFileSizeBytes ?? NOTE_SCAN_MAX_BYTES;
   const notes: NoteForContradiction[] = [];
+  const visibilityById = new Map<string, ReadonlyArray<string>>();
   for (const file of walkMarkdownFiles(vault, roots, rules, { maxFileSizeBytes: cap })) {
-    let meta: Readonly<Record<string, unknown>>;
+    if (opts.readable !== undefined && !opts.readable(file.relPath)) continue;
+    let meta: FrontmatterMap;
     let body: string;
     try {
       [meta, body] = parseFrontmatter(file.absPath);
@@ -566,10 +606,14 @@ export function detectTensionsInVault(
     const subject =
       typeof rawSubject === "string" && rawSubject.trim() !== "" ? rawSubject.trim() : undefined;
     notes.push({ id, ...(subject !== undefined ? { subject } : {}), text: body });
+    // Two notes may share a frontmatter id; the id then reads under the
+    // stricter of their rules.
+    visibilityById.set(id, strictestVisibility(visibilityById.get(id) ?? [], pageVisibility(meta)));
   }
 
   const result = detectTensions(vault, notes, {
     jaccard: opts.jaccard ?? BRAIN_HEALTH_DEFAULTS.contradiction_jaccard,
+    visibilityOf: (id) => visibilityById.get(id) ?? [],
     ...(opts.negationMarkers !== undefined ? { negationMarkers: opts.negationMarkers } : {}),
     ...(opts.agent !== undefined ? { agent: opts.agent } : {}),
     ...(opts.now !== undefined ? { now: opts.now } : {}),

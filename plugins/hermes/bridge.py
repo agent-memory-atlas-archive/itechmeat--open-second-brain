@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -24,7 +25,13 @@ from collections import deque
 from collections.abc import Mapping
 from typing import Any, Protocol, runtime_checkable
 
+from .config import REQUEST_TIMEOUT_ENV, env_setting
+
 PROTOCOL_VERSION = "2025-06-18"
+# The harness this bridge launches the server for. The server resolves its
+# harness scope (which harness-scoped operator rules apply) from this launch
+# argument alone, never from the name a client gives about itself.
+HARNESS_ARGV: tuple[str, ...] = ("--harness", "hermes")
 CLIENT_NAME = "open-second-brain-hermes-provider"
 logger = logging.getLogger(__name__)
 
@@ -36,7 +43,9 @@ logger = logging.getLogger(__name__)
 # generous on purpose: a tool call can legitimately take tens of seconds when
 # it opens the store for writing and the integrity scan runs.
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
-REQUEST_TIMEOUT_ENV = "OPEN_SECOND_BRAIN_MCP_TIMEOUT"
+# ``REQUEST_TIMEOUT_ENV`` lives in config.py with the other profile-scoped
+# names and is re-exported from here; on a multiplexed Hermes gateway it is
+# read from the profile scope, never from the gateway's process environment.
 
 # The child's stderr is where the runtime says why it refused to start ("error:
 # 'bun' is not on PATH."), and the JSON-RPC channel only ever reports the
@@ -61,22 +70,31 @@ def resolve_request_timeout() -> float | None:
     A non-positive value disables the deadline, which is the escape hatch for
     an operator whose vault legitimately outruns it; it is spelled explicitly
     rather than reached by a malformed value, and a malformed value falls back
-    to the default rather than to no bound at all.
+    to the default rather than to no bound at all. ``nan`` is malformed (it
+    never compares equal, so it would also split every shared-bridge key);
+    ``inf`` is an explicit "no bound", like a non-positive value. The WARNING
+    names the variable only: the value belongs to a profile and lands in the
+    shared gateway log.
+
+    :raises config.ProfileScopeError: on a multiplexed gateway with no profile
+        scope bound; the provider resolves it once where the scope is bound
+        and hands the bridge the result (see ``McpBrainBridge(timeout=...)``).
     """
-    raw = os.environ.get(REQUEST_TIMEOUT_ENV)
+    raw = env_setting(REQUEST_TIMEOUT_ENV)
     if raw is None or raw.strip() == "":
         return DEFAULT_REQUEST_TIMEOUT_SECONDS
     try:
         seconds = float(raw)
     except ValueError:
+        seconds = math.nan
+    if math.isnan(seconds):
         logger.warning(
-            "%s is not a number (%r); using the %.0fs default",
+            "%s is not a number; using the %.0fs default",
             REQUEST_TIMEOUT_ENV,
-            raw,
             DEFAULT_REQUEST_TIMEOUT_SECONDS,
         )
         return DEFAULT_REQUEST_TIMEOUT_SECONDS
-    return None if seconds <= 0 else seconds
+    return None if seconds <= 0 or math.isinf(seconds) else seconds
 
 
 class BridgeError(RuntimeError):
@@ -251,6 +269,12 @@ class McpBrainBridge:
     ``PATH`` too small to contain Bun, and the ``o2b`` wrapper refuses to run
     when its own ``command -v bun`` misses - so the caller that resolved an
     absolute Bun passes an environment carrying that Bun's directory.
+
+    ``timeout`` fixes the per-request deadline at construction; a non-positive
+    value disables it. ``None`` (the default) reads it at every ``start`` as
+    before. A multiplexed Hermes gateway passes it, because a restart can run
+    on the plugin's own capture thread, where no profile scope is bound and the
+    scoped setting cannot be read.
     """
 
     def __init__(
@@ -262,8 +286,10 @@ class McpBrainBridge:
         spawn: Any = None,
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
     ) -> None:
         self._vault = vault
+        self._timeout = timeout
         self._repo_root = repo_root
         self._command = command
         self._spawn = spawn or self._default_spawn
@@ -291,6 +317,7 @@ class McpBrainBridge:
         # directory - which silently empties skill_auto_attach.
         if self._repo_root:
             argv += ["--repo", self._repo_root]
+        argv += HARNESS_ARGV
         return argv
 
     _watchdog_absent_warned = False
@@ -444,6 +471,11 @@ class McpBrainBridge:
             return exc
         return type(exc)(f"{exc}\n--- child stderr (last lines) ---\n{excerpt}")
 
+    def _request_timeout(self) -> float | None:
+        if self._timeout is None:
+            return resolve_request_timeout()
+        return None if self._timeout <= 0 else self._timeout
+
     def start(self) -> None:
         with self._lock:
             if self._started:
@@ -452,7 +484,7 @@ class McpBrainBridge:
             self._stderr_thread = None
             self._proc = self._spawn(self._argv())
             self._client = JsonRpcStdioClient(
-                self._proc.stdin, self._proc.stdout, timeout=resolve_request_timeout()
+                self._proc.stdin, self._proc.stdout, timeout=self._request_timeout()
             )
             pid = getattr(self._proc, "pid", "unknown")
             logger.debug("open-second-brain MCP child spawned pid=%s", pid)

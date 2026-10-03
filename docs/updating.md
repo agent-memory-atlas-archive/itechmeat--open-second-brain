@@ -47,6 +47,101 @@ instruction files such as `CLAUDE.md`/`AGENTS.md`, installed
 `.claude/skills/`) and warns with the exact replacement for any stale
 reference it finds (`removed-tool-reference`).
 
+## Upgrading to 1.70.0
+
+One step is required for Hermes users: update the `o2b` CLI and the
+Hermes plugin together. Seven changes are visible to an operator or a
+client.
+
+**Update `o2b` and the Hermes plugin together.** The Hermes plugin now
+launches its MCP bridge as `o2b mcp --harness hermes`, and an `o2b`
+older than 1.70.0 refuses `--harness` as an unknown flag, so the bridge
+does not start; the bridge's stderr in the gateway log names the flag.
+The `o2b` links that `scripts/o2b install-cli` creates follow the
+plugin; an `o2b` installed some other way must be updated as well. The
+Claude Code plugin's two MCP registrations gain `--harness claude-code`
+in the same release, so they need no step.
+
+**Hermes settings come from the profile on a multiplexed gateway.** With
+`gateway.multiplex_profiles: true`, `VAULT_DIR`, `VAULT_AGENT_NAME`,
+`VAULT_TIMEZONE`, `OPEN_SECOND_BRAIN_CONFIG` and
+`OPEN_SECOND_BRAIN_MCP_TIMEOUT` are read from each turn's profile scope
+(the profile's `.env`), no longer from the gateway process environment.
+A profile that relied on the launch profile's environment now falls
+through to the Open Second Brain config chain instead; move such a
+setting into that profile's `.env`. The gateway log names each ignored
+variable once with a WARNING. A single-profile gateway is unchanged.
+See "Multiple Hermes profiles" in [`install/hermes.md`](../install/hermes.md).
+
+**`hermes open-second-brain config` prints the settings source first.**
+The first line is now `settings_source: ...`, naming the source this
+command resolved from (`profile scope (multiplexed gateway)`, or
+`process environment` with a note that a multiplexed gateway reads each
+profile's `.env`), and `config_path:` follows it; when no profile
+scope is bound, the named error replaces the path. A script that reads
+`config_path:` from the first line must look for it by name. On a
+multiplexed gateway each profile identity (vault, agent name, timezone,
+config path and timeout) gets its own `o2b mcp` child, so the gateway
+runs more child processes, and a child whose identity changed (for
+example after an edited `.env`) stays alive until the gateway exits. A
+call with no bound profile scope reports a `ProfileScopeError` naming
+the variable, and `prefetch` omits the vault reminder for that turn with
+one WARNING.
+
+**Scoped operator rules.** Files under `Brain/standing-rules/project/`,
+`Brain/standing-rules/harness/` and `Brain/standing-rules/host/` are
+now rendered for the matching project, harness and device, after the
+operator standing rules, in the SessionStart hook (project and host
+only) and in `brain_context`, for a local caller only. A vault without
+the directory renders exactly as before. The block is charged against
+`active.inject_budget_chars` and capped by the new
+`active.scoped_rules_max_chars` (default 2,000); the hook receipt's
+`budget` block gains `scoped_rules_chars`, and `brain_context` gains an
+optional `scoped_rules` key. Every write path now refuses paths inside
+`Brain/standing-rules/`. See "Scoped operator rules" in
+[`how-it-works.md`](how-it-works.md).
+
+**`o2b mcp --harness <id>`.** A new optional flag naming the harness;
+an unknown value exits `2`. `--host-target` now also stands in for it
+when it is absent, and a refused `--host-target` value is now echoed as
+a JSON string with its control characters escaped, as a refused
+`--harness` value is; a script that matches the raw value on stderr must
+match the quoted one.
+
+**More brief and doctor counts answer at the caller's reach.** Below
+local reach `brain_brief` `view="today"` no longer lists an open loop
+or obligation from a page the caller cannot read, `view="monthly"`
+counts from the events the caller may see, `view="operator"` computes
+its doctor and digest counts, top actions, verification entries and
+trust verdict from what the caller may see, and the `brain_doctor`
+removed-tool warning cap, `uncertain` cap, stale-dependency counts,
+concept-gap and contradiction detectors and instruction-file warnings
+leave out what the caller cannot read, and the `brain_doctor` `repair`
+preview plans from the same checks. `brain_obligation`,
+`brain_intention`, `brain_health`, `brain_trigger` scans,
+`brain_stale_scan`, `brain_review_candidates`, `brain_intent_review`,
+`brain_retention`, `brain_tension` and `brain_context_receipts` answer
+the same way. A local caller and the CLI see no change.
+
+**A remote client runs only a dry dream.** Below local reach (an HTTP
+bind on a non-loopback interface) `brain_dream` serves a dry run and
+refuses a real pass, a step and the staged lifecycle, and
+`brain_maintenance` refuses `run`; schedule them on the vault's own
+host (`o2b brain dream`, `o2b brain maintenance run`, or a stdio or
+loopback client). The lifecycle (including the chain tip), expire,
+evidence, feedback, derived-fact, decision, label, scaffold, dead-end,
+diarize, hygiene refresh and anticipatory-context tools treat a page the
+caller cannot read as absent, and a write aimed at such a page is
+refused before anything is written.
+
+**Derived pages keep the visibility of their sources.** A preference
+the dream pass drafts from signals reserved with `visibility`, or that
+supersedes or rebuts a reserved record, now carries the strictest
+`visibility` of those sources, and a tension page carries the stricter
+`visibility` of its two source notes, refreshed when it is detected
+again. Such pages were written without a `visibility` line before, so
+they may now be withheld from a remote caller.
+
 ## Upgrading to 1.69.0
 
 No step below is required. Ten changes are visible to an operator or a

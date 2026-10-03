@@ -44,6 +44,9 @@
  */
 
 import { statSync } from "node:fs";
+import { relative, resolve } from "node:path";
+
+import { toPosix } from "../path-safety.ts";
 
 import { activeBudgetPressureCheck } from "./doctor/active-budget-check.ts";
 import type { DoctorCheck, DoctorCheckContext, DoctorFindings } from "./doctor/check.ts";
@@ -100,6 +103,7 @@ import {
 } from "./doctor/uncertainty-probes.ts";
 import type { DoctorUncertainEntry, RunDoctorOptions, RunDoctorResult } from "./doctor/report.ts";
 import { reportSweptSkip, sweptFailureReason, sweptPathWarning } from "./doctor/unreadable-path.ts";
+import { uncertainStream, type UncertainAdmission } from "./doctor/uncertain-stream.ts";
 import type { SemanticHealthReport } from "./health/reconcile.ts";
 import { brainDirs } from "./paths.ts";
 import {
@@ -134,6 +138,29 @@ export type {
 
 // ----- The registry ---------------------------------------------------------
 
+/** The stale-dependency check over the unbounded collector. */
+const STALE_DEPENDENCY_CHECK_UNBOUNDED = makeStaleDependencyCheck(auditStaleDependencies);
+
+/**
+ * The stale-dependency check, its collector bounded to the pages the
+ * pass may read when the context carries a predicate, so a page the
+ * caller cannot read is neither a state nor a consumer of one, and moves
+ * no count of the note or the rows it renders.
+ */
+const staleDependencyCheck: DoctorCheck = {
+  failSoft: STALE_DEPENDENCY_CHECK_UNBOUNDED.failSoft,
+  run(ctx, out) {
+    const readable = ctx.readable;
+    if (readable === undefined) {
+      STALE_DEPENDENCY_CHECK_UNBOUNDED.run(ctx, out);
+      return;
+    }
+    makeStaleDependencyCheck((vault, opts) =>
+      auditStaleDependencies(vault, { ...opts, readable }),
+    ).run(ctx, out);
+  },
+};
+
 /**
  * Every check the pass runs, in report order.
  *
@@ -156,7 +183,7 @@ const DOCTOR_CHECKS: ReadonlyArray<DoctorCheck> = Object.freeze([
   // pure kernel is the leaf both halves share, so this registry - which
   // already reaches every check module and the store beneath them - is
   // where the two meet without closing a loop.
-  makeStaleDependencyCheck(auditStaleDependencies),
+  staleDependencyCheck,
   removedToolReferenceCheck,
   duplicatePreferenceCheck,
   topicKeyCollisionCheck,
@@ -282,7 +309,10 @@ export function runDoctor(vault: string, opts: RunDoctorOptions = {}): RunDoctor
   // its three directory reads have to be able to report. Resolved before
   // any check runs, an unreadable `Brain/preferences` or a `Brain/log`
   // that is a regular file ended the pass with no findings at all.
-  const findings: DoctorFindings = { issues: [], uncertain: [] };
+  const findings: DoctorFindings = {
+    issues: [],
+    uncertain: uncertainStream(uncertainAdmission(vault, opts.readable)),
+  };
   const ctx = resolveContext(vault, opts, findings.uncertain);
   for (const check of DOCTOR_CHECKS) {
     if (!check.failSoft) {
@@ -308,7 +338,14 @@ export function runDoctor(vault: string, opts: RunDoctorOptions = {}): RunDoctor
   let semanticReport: SemanticHealthReport | undefined;
   try {
     const health = ctx.config ? resolveHealth(ctx.config) : BRAIN_HEALTH_DEFAULTS;
-    semanticReport = checkSemanticHealth(vault, ctx.preferences, findings.issues, health, ctx.now);
+    semanticReport = checkSemanticHealth(
+      vault,
+      ctx.preferences,
+      findings.issues,
+      health,
+      ctx.now,
+      ctx.readable,
+    );
   } catch {
     /* doctor never throws */
   }
@@ -325,6 +362,7 @@ export function runDoctor(vault: string, opts: RunDoctorOptions = {}): RunDoctor
   try {
     instructionWarnings = checkInstructionFileCeiling(vault, {
       maxLines: guardrails.instruction_file_max_lines,
+      ...(opts.readable !== undefined ? { readable: opts.readable } : {}),
     });
   } catch {
     /* doctor never throws */
@@ -366,6 +404,29 @@ export function runDoctor(vault: string, opts: RunDoctorOptions = {}): RunDoctor
   });
 }
 
+/** The extension of the pages the reference grammar judges by path. */
+const PAGE_EXT = ".md";
+
+/**
+ * Which uncertainty entries a pass handed `readable` may report.
+ *
+ * Judged the way the handlers' reference view judges an issue's path, so
+ * the entries it keeps are the ones the view would keep after the cap: a
+ * page path is admitted only when the reader may read it, and any other
+ * path - a directory, a lock, a file outside the vault - names no page
+ * and is admitted as before. `undefined` when nothing is withheld.
+ */
+function uncertainAdmission(
+  vault: string,
+  readable: ((rel: string) => boolean) | undefined,
+): UncertainAdmission | undefined {
+  if (readable === undefined) return undefined;
+  return (entry) =>
+    entry.path === undefined ||
+    !entry.path.endsWith(PAGE_EXT) ||
+    readable(toPosix(relative(vault, resolve(vault, entry.path))));
+}
+
 /**
  * Resolve everything the checks read, once.
  *
@@ -398,6 +459,7 @@ function resolveContext(
     config,
     dbPath: opts.dbPath,
     configPath: opts.configPath,
+    ...(opts.readable !== undefined ? { readable: opts.readable } : {}),
     knownBasenames: collectAllBasenames(vault, {
       site: CONTEXT_SITE,
       consequence:
