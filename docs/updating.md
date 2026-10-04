@@ -47,6 +47,65 @@ instruction files such as `CLAUDE.md`/`AGENTS.md`, installed
 `.claude/skills/`) and warns with the exact replacement for any stale
 reference it finds (`removed-tool-reference`).
 
+## Upgrading to 1.71.0
+
+No step is required. Three changes are visible to an operator who runs
+with `recall_inject_enabled` on, and one to every Claude Code and Codex
+install.
+
+**The recall brief no longer repeats notes within a session.**
+`recall_inject_dedupe` (env `OPEN_SECOND_BRAIN_RECALL_INJECT_DEDUPE`)
+defaults to `true`: with a host that sends a `session_id`, a note span
+already shown in the session, by an earlier brief or by the SessionStart
+digest, is not injected again until the next SessionStart, and a prompt
+whose candidates were all shown before abstains with
+`all_already_injected`. Set `recall_inject_dedupe: "false"` (or `"0"`) to
+restore the previous behaviour. See "Session dedupe and slices" in
+[`decision-models/recall-inject.md`](decision-models/recall-inject.md).
+
+**The recall caps are configurable.** `recall_inject_max_notes`,
+`recall_inject_max_chars`, `recall_inject_time_budget_ms` and
+`recall_inject_confidence_floor` keep their previous values as defaults;
+an out-of-range value keeps the default and is named (by its env
+variable when it came from the env) as `config_invalid` on the audit
+line.
+
+**Recall slices are opt-in vault policy.** A `recall_inject:` block in
+`Brain/_brain.yaml` is new and absent from the generated template; a vault
+without it recalls exactly as before. A malformed block makes
+`_brain.yaml` fail to load, and the recall decision then ends in `error`
+with fault `retriever_failed` until the file is fixed. The contract is in
+[`cli-reference.md`](cli-reference.md).
+
+**A new `reground-deliver` hook is registered.** The Claude Code and
+Codex hook manifests run it on every `PostToolUse` and `UserPromptSubmit`
+event. It does nothing unless `reground_parts_enabled` is on (default
+off), and it checks that flag before resolving the vault. Turn the flag
+on to have an oversized SessionStart payload split into parts instead of
+emitted whole; the keys and the receipt fields are in
+[`cli-reference.md`](cli-reference.md) and
+[`observability.md`](observability.md).
+
+**Hook-state files are private and some are renamed.** The per-session
+files under `.open-second-brain/hook-state/` are now written with mode
+`0600`, because the re-grounding queue holds parts of the SessionStart
+payload. Existing files become private on their next write; a file never
+written again stays as it was until the prune removes it. A session id
+that is not already a lowercase slug (one with upper case, separators or
+more than 64 characters) now gets a file name with a hash suffix, so two
+such ids no longer share a file. Claude Code and Codex session ids keep
+their file names. A host that sends other ids starts its hook state
+afresh once after the upgrade: once-per-session nudges can repeat in an
+open session, and the old file is pruned after seven days.
+
+The last-good SessionStart snapshot under
+`.open-second-brain/inject-cache/` and the search session focus file are
+written with mode `0600` as well, and setting a focus answers
+`INVALID_INPUT` when a directory on the way to the focus file is a
+symbolic link. A search `path_prefix` that starts with a drive letter is
+now refused with `INVALID_INPUT`, like one containing `..` or starting
+with `/`.
+
 ## Upgrading to 1.70.0
 
 One step is required for Hermes users: update the `o2b` CLI and the
