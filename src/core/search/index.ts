@@ -20,10 +20,23 @@ import {
   loadProviderRegistry,
   expandRegisteredProvider,
   type ExpandedProvider,
+  type ProviderProfile,
 } from "./embeddings/registry.ts";
+import {
+  EMBEDDING_KEY_CONFIG,
+  EMBEDDING_KEY_ENV,
+  type CredentialSourceContext,
+} from "./embeddings/credential-report.ts";
 import { loadRerankRegistry, expandRegisteredRerankProvider } from "./rerank/registry.ts";
 import { decisionModelModeFor, resolveDecisionModelConfig } from "../decision-model/config.ts";
 import { resolveEmbeddingPrefixes } from "./embeddings/presets.ts";
+import {
+  EMBEDDING_PRICE_MODEL_ENV,
+  EMBEDDING_PRICE_MODEL_KEY,
+  EMBEDDING_PRICE_RATE_ENV,
+  EMBEDDING_PRICE_RATE_KEY,
+  type EmbeddingPriceOverride,
+} from "./embeddings/pricing.ts";
 import { SearchError } from "./types.ts";
 import type {
   ResolvedEmbeddingConfig,
@@ -51,6 +64,7 @@ export type {
   ExpandHitInput,
   ExpandHitResult,
   IndexCheckReport,
+  CredentialSourceReport,
   EmbedderRecordCensus,
   IndexStats,
   IndexStatusSnapshot,
@@ -310,11 +324,82 @@ function parsePositiveFloat(raw: string | null, fallback: number, fieldName: str
 /** Parse a non-negative finite float (e.g. a cost gate; 0 disables). */
 function parseNonNegativeFloat(raw: string | null, fallback: number, fieldName: string): number {
   if (raw === null) return fallback;
+  // `Number("  ")` is 0: a blank gate would read as a gate switched off.
+  if (raw.trim() === "") {
+    throw new SearchError("INVALID_INPUT", `${fieldName} must be a number >= 0, got empty string`);
+  }
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) {
     throw new SearchError("INVALID_INPUT", `${fieldName} must be a number >= 0, got '${raw}'`);
   }
   return n;
+}
+
+/** The highest declarable embedding rate, in USD per million tokens. */
+const EMBEDDING_PRICE_RATE_CEILING = 1_000_000;
+
+/**
+ * Parse a declared embedding rate. Only a plain decimal spelling is a
+ * price: `Number()` would read `0x10`, `1e3` or `Infinity` as numbers an
+ * operator never wrote as a rate. A rate above the ceiling is a typo, not
+ * a price, and would overflow every estimate built on it.
+ */
+function parseEmbeddingPriceRate(raw: string, fieldName: string): number {
+  if (!/^\d+(\.\d+)?$/.test(raw)) {
+    throw new SearchError(
+      "INVALID_INPUT",
+      `${fieldName} must be a plain decimal number >= 0 (for example 0.02), got '${raw}'`,
+    );
+  }
+  const n = Number(raw);
+  if (n > EMBEDDING_PRICE_RATE_CEILING) {
+    throw new SearchError(
+      "INVALID_INPUT",
+      `${fieldName} must be at most ${EMBEDDING_PRICE_RATE_CEILING} USD per million tokens, got '${raw}'`,
+    );
+  }
+  return n;
+}
+
+/**
+ * The operator's declared embedding price: `embedding_price_model` and
+ * `embedding_price_usd_per_mtok`, both or neither, overridable as a unit
+ * by their `OPEN_SECOND_BRAIN_EMBEDDING_PRICE_*` env twins. A pair, not a
+ * model-keyed map, because the flat parser splits a key on its first
+ * colon and model ids carry colons (`nomic-embed-text:latest`); the value
+ * side keeps them. Binding the rate to one model name means a model
+ * switch never silently re-targets the price. The pair resolves from ONE
+ * source: when either env twin is set both halves come from env, so an
+ * env model never borrows a config rate into a price nobody declared.
+ * Null when neither source sets either half.
+ */
+function resolveEmbeddingPriceOverride(
+  env: NodeJS.ProcessEnv,
+  config: Readonly<Record<string, string>>,
+): EmbeddingPriceOverride | null {
+  // A blank half is a missing half: `Number("  ")` is 0, so a whitespace
+  // rate would otherwise declare an unpriced model free.
+  const set = (layer: Readonly<Record<string, string | undefined>>, name: string) => {
+    const value = layer[name]?.trim();
+    return value === undefined || value === "" ? null : value;
+  };
+  const fromEnv =
+    set(env, EMBEDDING_PRICE_MODEL_ENV) !== null || set(env, EMBEDDING_PRICE_RATE_ENV) !== null;
+  const [layer, modelName, rateName] = fromEnv
+    ? [env, EMBEDDING_PRICE_MODEL_ENV, EMBEDDING_PRICE_RATE_ENV]
+    : [config, EMBEDDING_PRICE_MODEL_KEY, EMBEDDING_PRICE_RATE_KEY];
+  const model = set(layer, modelName);
+  const rateRaw = set(layer, rateName);
+  if (model === null && rateRaw === null) return null;
+  if (model === null || rateRaw === null) {
+    const [present, missing] = model === null ? [rateName, modelName] : [modelName, rateName];
+    throw new SearchError(
+      "INVALID_INPUT",
+      `${present} is set but ${missing} is not: declare both or neither`,
+    );
+  }
+  const usdPerMtok = parseEmbeddingPriceRate(rateRaw, rateName);
+  return Object.freeze({ model, usdPerMtok });
 }
 
 /**
@@ -344,6 +429,12 @@ function rawSetting(
  */
 function parseFiniteFloat(raw: string | null, fallback: number, fieldName: string): number {
   if (raw === null) return fallback;
+  if (raw.trim() === "") {
+    throw new SearchError(
+      "INVALID_INPUT",
+      `${fieldName} must be a finite number, got empty string`,
+    );
+  }
   const n = Number(raw);
   if (!Number.isFinite(n)) {
     throw new SearchError("INVALID_INPUT", `${fieldName} must be a finite number, got '${raw}'`);
@@ -479,6 +570,40 @@ function resolveRegistryProvider(
   }
 }
 
+/**
+ * The names `search check` hands the credential-source report: the
+ * registered profile `embedding_provider` selects (by the same env-over-
+ * config rule and registry lookup {@link resolveSearchConfig} expands),
+ * the vault's registry and the env. Fail-soft like the expansion itself:
+ * `loadProviderRegistry` reads a missing or malformed registry as an empty
+ * one, so the report names exactly the profiles the resolver can see, and a
+ * name the registry does not hold is no profile.
+ */
+export function resolveCredentialContext(opts: {
+  vault: string;
+  configPath?: string;
+  env?: NodeJS.ProcessEnv;
+}): CredentialSourceContext {
+  const env = opts.env ?? process.env;
+  const config: Readonly<Record<string, string>> = opts.configPath
+    ? discoverConfig(opts.configPath).data
+    : {};
+  const rawProvider = envOrConfig(
+    env,
+    config,
+    "OPEN_SECOND_BRAIN_EMBEDDING_PROVIDER",
+    "embedding_provider",
+  );
+  const registry: ReadonlyArray<ProviderProfile> = loadProviderRegistry(opts.vault);
+  const activeProfile =
+    rawProvider !== null &&
+    !BUILTIN_PROVIDERS.has(rawProvider) &&
+    registry.some((p) => p.name === rawProvider)
+      ? rawProvider
+      : null;
+  return Object.freeze({ activeProfile, registry, env });
+}
+
 export function resolveSearchConfig(opts: {
   vault: string;
   configPath?: string;
@@ -567,12 +692,7 @@ export function resolveSearchConfig(opts: {
     "OPEN_SECOND_BRAIN_EMBEDDING_MODEL",
     "embedding_model",
   );
-  const explicitApiKey = envOrConfig(
-    env,
-    config,
-    "OPEN_SECOND_BRAIN_EMBEDDING_KEY",
-    "embedding_api_key",
-  );
+  const explicitApiKey = envOrConfig(env, config, EMBEDDING_KEY_ENV, EMBEDDING_KEY_CONFIG);
   // Explicit config/env always wins over the registry profile's fields.
   const baseUrl = explicitBaseUrl ?? registryExpansion?.baseUrl ?? null;
   // The plain-http opt-out binds to the URL the operator wrote down: the
@@ -658,6 +778,7 @@ export function resolveSearchConfig(opts: {
     DEFAULTS.costGateUsd,
     "embedding_cost_gate_usd",
   );
+  const priceOverride = resolveEmbeddingPriceOverride(env, config);
 
   // Instruction prefixes (memory-write-path-integrity B2). Resolved with raw
   // presence, not `envOrConfig`, because an explicit empty string must DISABLE
@@ -689,6 +810,7 @@ export function resolveSearchConfig(opts: {
     ...(batchTokens === null ? {} : { batchTokens }),
     maxRetries,
     costGateUsd,
+    ...(priceOverride === null ? {} : { priceOverride }),
     queryPrefix,
     passagePrefix,
   });

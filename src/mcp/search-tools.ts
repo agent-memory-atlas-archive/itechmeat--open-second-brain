@@ -105,6 +105,27 @@ import { emitGatedTelemetry } from "../core/brain/continuity/emit.ts";
 import { recordQueryDemand, recordRecallAdequacyDemand } from "../core/brain/query-demand.ts";
 
 const MCP_LIMIT_MAX = 50;
+
+/** The longest `query` a recall tool accepts, advertised and enforced from here. */
+export const MCP_QUERY_MAX_CHARS = 2000;
+
+/** The refusal text of a query over {@link MCP_QUERY_MAX_CHARS}, shared by every capped tool. */
+export const MCP_QUERY_CAP_MESSAGE = `argument 'query' exceeds ${MCP_QUERY_MAX_CHARS} characters`;
+
+/**
+ * Whether `query` is longer than {@link MCP_QUERY_MAX_CHARS}, counted in
+ * code points as the advertised JSON Schema `maxLength` counts them: a
+ * character outside the Basic Multilingual Plane is one character, not the
+ * two UTF-16 units `String.length` would see.
+ */
+export function exceedsMcpQueryCap(query: string): boolean {
+  if (query.length <= MCP_QUERY_MAX_CHARS) return false;
+  let count = 0;
+  for (const _ of query) {
+    if (++count > MCP_QUERY_MAX_CHARS) return true;
+  }
+  return false;
+}
 const MCP_CONTENT_MAX = 600;
 const SEARCH_TIMEOUT_MS = 10_000;
 /** Surfaced rows named as source refs on one recall-telemetry record. */
@@ -116,7 +137,7 @@ const SEARCH_INPUT_SCHEMA: Record<string, unknown> = {
     query: {
       type: "string",
       minLength: 1,
-      maxLength: 2000,
+      maxLength: MCP_QUERY_MAX_CHARS,
       description:
         "What to recall from the vault. Matched against the index by keyword, semantics, or both.",
     },
@@ -923,8 +944,8 @@ async function toolBrainSearch(
   if (typeof query !== "string" || query.trim() === "") {
     throw new MCPError(INVALID_PARAMS, "missing required argument: query");
   }
-  if (query.length > 2000) {
-    throw new MCPError(INVALID_PARAMS, "argument 'query' exceeds 2000 characters");
+  if (exceedsMcpQueryCap(query)) {
+    throw new MCPError(INVALID_PARAMS, MCP_QUERY_CAP_MESSAGE);
   }
 
   let limit = 10;
@@ -1422,7 +1443,7 @@ const RECALL_FEEDBACK_INPUT_SCHEMA: Record<string, unknown> = {
     query: {
       type: "string",
       minLength: 1,
-      maxLength: 2000,
+      maxLength: MCP_QUERY_MAX_CHARS,
       description: "The query that produced the judged result; re-run to recover its layer scores.",
     },
     result_path: {
@@ -1462,6 +1483,9 @@ async function toolBrainRecallFeedback(
   args: Record<string, unknown>,
 ): Promise<unknown> {
   const query = coerceStr(args, "query")!;
+  if (exceedsMcpQueryCap(query)) {
+    throw new MCPError(INVALID_PARAMS, MCP_QUERY_CAP_MESSAGE);
+  }
   const resultPath = coerceStr(args, "result_path")!;
   const verdict = coerceStr(args, "verdict")!;
   if (verdict !== "up" && verdict !== "down") {
@@ -2001,6 +2025,7 @@ export async function buildSearchStatusBlock(ctx: ServerContext): Promise<Record
     const {
       embedding_signature: _embeddingSignature,
       estimated_refresh_cost_usd: _estimatedRefreshCostUsd,
+      refresh_price_source: _refreshPriceSource,
       warnings,
       ...rest
     } = serializeIndexStatus(snap);

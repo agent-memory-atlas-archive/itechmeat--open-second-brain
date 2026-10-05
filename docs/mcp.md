@@ -2365,3 +2365,32 @@ format characters), when it contains NUL, or when it exceeds the cap.
   re-derives and archives only readable derived pages; and
   `brain_anticipatory_context` builds its bundle for the caller without
   reading or writing the shared cache, answering `cache_state: "miss"`.
+- Since v1.72.0 `brain_context_pack` accepts `query_mode: "semantic"`,
+  which orders the curated belief notes by the stored vectors of their
+  chunks against one embedding of `query` (it still requires `query`).
+  The response gains a `semantic` object: `model`, `price_source`,
+  `query_tokens`, `estimated_usd` (null when the price is unknown),
+  `scored` and `unembedded` (kept candidates with no usable vector, which
+  sort after the scored ones within the same tier, then by recency;
+  tier still decides first). The
+  counts are taken after the reach filter, so a withheld page appears in
+  neither. The mode refuses with a stable `error.data.code`: the semantic
+  capability codes (`EMBEDDING_DISABLED`, `EMBEDDING_KEY_MISSING`) for a
+  blocked tier, `VEC_EXTENSION_UNAVAILABLE`, and `BELIEF_VECTORS_MISSING`
+  when no kept candidate has a usable vector, naming
+  `o2b search vector-backfill --path Brain/preferences/ --path Brain/retired/ --apply`.
+  The query embed is one paid call per request, disclosed in the
+  response, and refused with `EMBEDDING_COST_UNPRICED` for a remote
+  caller when the model has no known price and `embedding_cost_gate_usd`
+  is positive. `query` is capped at 2000 characters in every query mode,
+  counted in Unicode code points as the schema's `maxLength` counts them,
+  and `brain_search` counts its 2000-character cap the same way.
+  `brain_recall_feedback`, which advertised the same cap without checking
+  it, now refuses a longer `query` with `INVALID_PARAMS` before it records
+  anything. The
+  `substring` and `ranked` modes are otherwise unchanged. The embedding spend
+  surfaces also change: `EMBEDDING_COST_UNPRICED` joins the stable error
+  codes (an embedding run refused under a positive cost gate because the
+  model has no known price), `brain_maintenance` spend receipts carry
+  `price_source` with a null `estimated_usd` for an unknown price. No new
+  tool.

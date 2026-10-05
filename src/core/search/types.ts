@@ -21,6 +21,7 @@ import type { StampMismatch } from "../integrity/stamp.ts";
 import type { ReconciliationOutcome, ReconciliationReport } from "../reconciliation-report.ts";
 import type { VaultPathRule, VaultScopeRules } from "../vault-scope/defaults.ts";
 import type { MaintenanceSpendReceipt } from "../brain/maintenance/journal.ts";
+import type { EmbeddingPriceOverride, EmbeddingPriceSource } from "./embeddings/pricing.ts";
 import type { DegreePredicate } from "./property-filter.ts";
 import type { TemporalIntent } from "./temporal-intent.ts";
 import type { FtsMatchMode } from "./fts-match-mode.ts";
@@ -237,6 +238,11 @@ export interface IndexStats {
   readonly deleted: number;
   readonly chunksTotal: number;
   readonly embeddingsComputed: number;
+  /**
+   * Stored vectors this run kept for chunks whose content did not change
+   * across an edit (vector carry-over), and therefore did not re-embed.
+   */
+  readonly embeddingsReused: number;
   readonly embeddingsRetries: number;
   readonly errors: ReadonlyArray<{
     readonly path: string;
@@ -376,10 +382,13 @@ export interface IndexStatusSnapshot {
   readonly embeddingSignature: string | null;
   /**
    * Best-effort USD estimate to (re-)embed the chunks that currently
-   * lack a current embedding, at the active model's rate. 0 for the
-   * local/unknown-price case.
+   * lack a current embedding, at the active model's quoted rate, from the
+   * shared spend plan. 0 for a known-free model, semantic search off or
+   * no index; null when nobody stated the model's price.
    */
-  readonly estimatedRefreshCostUsd: number;
+  readonly estimatedRefreshCostUsd: number | null;
+  /** Who stated the price of the refresh estimate; null when semantic search is off or there is no index. */
+  readonly refreshPriceSource: EmbeddingPriceSource | null;
   readonly vecExtension: VecExtensionState;
   readonly semanticEnabled: boolean;
   readonly embeddingKeyPresent: boolean;
@@ -598,6 +607,21 @@ export interface IndexCheckReport {
    * key so headless callers (Hermes cron, CI) can act on them.
    */
   readonly recommendations: ReadonlyArray<string>;
+  /**
+   * Where the resolver looked for an embedding credential, by name only
+   * (Honest Embedding Spend). Present only on a `credential-missing` tier
+   * and only when the caller handed the check a credential context, so a
+   * configured or disabled setup reports byte-identically.
+   */
+  readonly credentialSources?: CredentialSourceReport;
+}
+
+/** The names a `credential-missing` check consulted, and where a key does exist. */
+export interface CredentialSourceReport {
+  /** Credential sources consulted, in probe order. */
+  readonly consulted: ReadonlyArray<string>;
+  /** Other registered profiles whose env key is present, in registry order. */
+  readonly presentElsewhere: ReadonlyArray<string>;
 }
 
 /**
@@ -1238,6 +1262,13 @@ export interface ResolvedEmbeddingConfig {
    * run whose estimated cost exceeds this is refused unless forced.
    */
   readonly costGateUsd: number;
+  /**
+   * The operator's declared price for one named model (Honest Embedding
+   * Spend), from `embedding_price_model` + `embedding_price_usd_per_mtok`.
+   * Absent when neither key is set. Price is never part of the embedding
+   * identity, so declaring or editing it never triggers a reindex.
+   */
+  readonly priceOverride?: EmbeddingPriceOverride;
   /**
    * Active instruction prefix for a search query
    * (memory-write-path-integrity B2). Resolved from the preset default and
