@@ -9,6 +9,7 @@ import {
   parseBool as parseBoolShared,
   parseFloat01 as parseFloat01Shared,
   parseInteger as parseIntegerShared,
+  normalizeReservedName,
 } from "../validate.ts";
 import { resolveVaultScope } from "../vault-scope/index.ts";
 import { DEFAULT_HYBRID_DEADLINE_MS } from "./pipeline/request.ts";
@@ -29,7 +30,7 @@ import {
 } from "./embeddings/credential-report.ts";
 import { loadRerankRegistry, expandRegisteredRerankProvider } from "./rerank/registry.ts";
 import { decisionModelModeFor, resolveDecisionModelConfig } from "../decision-model/config.ts";
-import { resolveEmbeddingPrefixes } from "./embeddings/presets.ts";
+import { INPUT_WINDOW_TOKENS_KEY, resolveEmbeddingPrefixes } from "./embeddings/presets.ts";
 import {
   EMBEDDING_PRICE_MODEL_ENV,
   EMBEDDING_PRICE_MODEL_KEY,
@@ -402,6 +403,135 @@ function resolveEmbeddingPriceOverride(
   return Object.freeze({ model, usdPerMtok });
 }
 
+export const EXTRA_BODY_KEY = "embedding_extra_body";
+export const EXTRA_BODY_ENV = "OPEN_SECOND_BRAIN_EMBEDDING_EXTRA_BODY";
+const EMBEDDING_DIMENSION_KEY = "embedding_dimension";
+
+/**
+ * Request-body fields the OpenAI-compatible provider owns. An extra body
+ * may not name them in any spelling: the provider spreads the extra
+ * fields first so these win anyway, but a silently ignored field is a
+ * configuration the operator believes is in force when it is not.
+ */
+export const RESERVED_EMBEDDING_BODY_KEYS: ReadonlyArray<string> = Object.freeze([
+  "model",
+  "input",
+  "encoding_format",
+]);
+
+const RESERVED_BODY_KEYS_NORMALIZED: ReadonlySet<string> = new Set(
+  RESERVED_EMBEDDING_BODY_KEYS.map(normalizeReservedName),
+);
+
+/**
+ * The operator's extra request body: a JSON object in one flat key,
+ * because the config file cannot hold a nested map. Read with raw
+ * presence so a blank value is refused rather than folded into "unset".
+ * Every refusal names the source the value came from - the env variable
+ * when it is set, the config key otherwise. The cross-checks against the
+ * rest of the resolved config (the `dimensions` field, the provider)
+ * live in `validateExtraBody`, so a programmatic override meets them too.
+ * Null when neither source sets the key.
+ */
+function resolveEmbeddingExtraBody(
+  env: NodeJS.ProcessEnv,
+  config: Readonly<Record<string, string>>,
+): Readonly<Record<string, unknown>> | null {
+  const raw = rawSetting(env, config, EXTRA_BODY_ENV, EXTRA_BODY_KEY);
+  if (raw === null) return null;
+  const source = env[EXTRA_BODY_ENV] !== undefined ? EXTRA_BODY_ENV : EXTRA_BODY_KEY;
+  if (raw.trim() === "") {
+    throw new SearchError("INVALID_INPUT", `${source} must be a JSON object, got a blank value`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new SearchError("INVALID_INPUT", `${source} must be a JSON object, got invalid JSON`);
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new SearchError(
+      "INVALID_INPUT",
+      `${source} must be a JSON object, got ${describeJsonKind(parsed)}`,
+    );
+  }
+  const body = parsed as Record<string, unknown>;
+  refuseReservedBodyKeys(body, source);
+  return Object.freeze(body);
+}
+
+/** The kind of a parsed JSON value that is not an object, as a refusal names it. */
+function describeJsonKind(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  return typeof value;
+}
+
+/**
+ * Refuse every key that names an owned request field in any spelling,
+ * listing them all in one sentence that names `source`. Run at parse time
+ * to name the env variable or the key, and again in `validateExtraBody`
+ * so an override that never passed through the parser meets it too.
+ */
+function refuseReservedBodyKeys(body: Readonly<Record<string, unknown>>, source: string): void {
+  const reserved = Object.keys(body).filter((k) =>
+    RESERVED_BODY_KEYS_NORMALIZED.has(normalizeReservedName(k)),
+  );
+  if (reserved.length > 0) {
+    throw new SearchError(
+      "INVALID_INPUT",
+      `${source} may not set the owned request fields (${RESERVED_EMBEDDING_BODY_KEYS.join(", ")}): ` +
+        `refused ${reserved.map((k) => `'${k}'`).join(", ")}`,
+    );
+  }
+}
+
+/**
+ * Cross-check a resolved extra body against the config it rides in.
+ *
+ * A `dimensions` field, in any spelling, changes the width the provider
+ * answers with. With no configured `embedding_dimension` nothing pins the
+ * index to that width, so a mismatch with the stored index would surface
+ * as a raw vector-store error mid-search; with one configured, the two
+ * must agree. Only the OpenAI-compatible provider sends an extra body at
+ * all, so naming one for another backend is refused rather than left as a
+ * configuration the operator believes is in force; `disabled` sends
+ * nothing, so the body is inert there. All of it is refused here rather
+ * than at parse time so an override that never passed through the parser
+ * meets it too. Every refusal names `source`: the env variable when it
+ * supplied the body, the config key otherwise.
+ */
+function validateExtraBody(semantic: ResolvedEmbeddingConfig, source: string): void {
+  const body = semantic.extraBody;
+  if (body === undefined) return;
+  if (semantic.provider !== "openai-compat" && semantic.provider !== "disabled") {
+    throw new SearchError(
+      "INVALID_INPUT",
+      `${source} is only sent by the 'openai-compat' provider, ` +
+        `but embedding_provider is '${semantic.provider}': remove the key or switch providers`,
+    );
+  }
+  refuseReservedBodyKeys(body, source);
+  const target = normalizeReservedName("dimensions");
+  for (const key of Object.keys(body)) {
+    if (normalizeReservedName(key) !== target) continue;
+    const value = JSON.stringify(body[key]);
+    if (semantic.dimension === null) {
+      throw new SearchError(
+        "INVALID_INPUT",
+        `${source} sets '${key}' ${value} but ${EMBEDDING_DIMENSION_KEY} is not set: ` +
+          `declare ${EMBEDDING_DIMENSION_KEY} with the same width so the index is pinned to it`,
+      );
+    }
+    if (body[key] !== semantic.dimension) {
+      throw new SearchError(
+        "INVALID_INPUT",
+        `${source} sets '${key}' ${value} but ${EMBEDDING_DIMENSION_KEY} is ${semantic.dimension}`,
+      );
+    }
+  }
+}
+
 /**
  * Raw setting lookup that preserves an explicit empty string
  * (memory-write-path-integrity B2). Unlike `envOrConfig`, which folds `""`
@@ -471,7 +601,7 @@ function validateWeight(n: number, fieldName: string): void {
   }
 }
 
-function validateResolvedConfig(config: ResolvedSearchConfig): void {
+function validateResolvedConfig(config: ResolvedSearchConfig, extraBodySource: string): void {
   validateIntegerRange(config.chunkSize, "search_chunk_size", { min: 1 });
   validateIntegerRange(config.chunkOverlap, "search_chunk_overlap", { min: 0 });
   if (config.chunkOverlap >= config.chunkSize) {
@@ -496,7 +626,7 @@ function validateResolvedConfig(config: ResolvedSearchConfig): void {
     );
   }
   if (config.semantic.dimension !== null) {
-    validateIntegerRange(config.semantic.dimension, "embedding_dimension", {
+    validateIntegerRange(config.semantic.dimension, EMBEDDING_DIMENSION_KEY, {
       min: 1,
     });
   }
@@ -527,9 +657,26 @@ function validateResolvedConfig(config: ResolvedSearchConfig): void {
       min: 1,
     });
   }
+  // Optional and default-free, like the token budget: a window that holds
+  // nothing is a misconfiguration whatever its source. The offline local
+  // embedder hashes the whole text with no positional limit and never
+  // reads this key, so a declared window there would not be in force.
+  if (config.semantic.inputWindowTokens !== undefined) {
+    validateIntegerRange(config.semantic.inputWindowTokens, INPUT_WINDOW_TOKENS_KEY, {
+      min: 1,
+    });
+    if (config.semantic.provider === "local") {
+      throw new SearchError(
+        "INVALID_INPUT",
+        `${INPUT_WINDOW_TOKENS_KEY} is not read by the 'local' provider, ` +
+          `which has no input window: remove the key or switch providers`,
+      );
+    }
+  }
   validateIntegerRange(config.semantic.maxRetries, "embedding_max_retries", {
     min: 1,
   });
+  validateExtraBody(config.semantic, extraBodySource);
 }
 
 function parseProvider(raw: string | null): ResolvedEmbeddingConfig["provider"] {
@@ -716,9 +863,14 @@ export function resolveSearchConfig(opts: {
   const apiKeys: ReadonlyArray<string> = explicitApiKey
     ? [explicitApiKey]
     : (registryExpansion?.apiKeys ?? (apiKey ? [apiKey] : []));
-  const dimRaw = envOrConfig(env, config, "OPEN_SECOND_BRAIN_EMBEDDING_DIM", "embedding_dimension");
+  const dimRaw = envOrConfig(
+    env,
+    config,
+    "OPEN_SECOND_BRAIN_EMBEDDING_DIM",
+    EMBEDDING_DIMENSION_KEY,
+  );
   const dimension =
-    dimRaw === null ? null : parseInteger(dimRaw, 0, "embedding_dimension", { min: 1 });
+    dimRaw === null ? null : parseInteger(dimRaw, 0, EMBEDDING_DIMENSION_KEY, { min: 1 });
   const timeoutMs = parseInteger(
     envOrConfig(env, config, "OPEN_SECOND_BRAIN_EMBEDDING_TIMEOUT", "embedding_timeout_ms"),
     DEFAULTS.timeoutMs,
@@ -767,6 +919,19 @@ export function resolveSearchConfig(opts: {
     batchTokensRaw === null
       ? null
       : parseInteger(batchTokensRaw, 0, "embedding_batch_tokens", { min: 1 });
+  // The declared input window of an uncurated model. Read with raw
+  // presence, not `envOrConfig`, so a blank value is refused rather than
+  // folded into "unset": an operator who wrote the key meant a window.
+  const inputWindowTokensRaw = rawSetting(
+    env,
+    config,
+    "OPEN_SECOND_BRAIN_EMBEDDING_INPUT_WINDOW_TOKENS",
+    INPUT_WINDOW_TOKENS_KEY,
+  );
+  const inputWindowTokens =
+    inputWindowTokensRaw === null
+      ? null
+      : parseInteger(inputWindowTokensRaw, 0, INPUT_WINDOW_TOKENS_KEY, { min: 1 });
   const maxRetries = parseInteger(
     envOrConfig(env, config, "OPEN_SECOND_BRAIN_EMBEDDING_MAX_RETRIES", "embedding_max_retries"),
     DEFAULTS.maxRetries,
@@ -779,6 +944,7 @@ export function resolveSearchConfig(opts: {
     "embedding_cost_gate_usd",
   );
   const priceOverride = resolveEmbeddingPriceOverride(env, config);
+  const extraBody = resolveEmbeddingExtraBody(env, config);
 
   // Instruction prefixes (memory-write-path-integrity B2). Resolved with raw
   // presence, not `envOrConfig`, because an explicit empty string must DISABLE
@@ -808,11 +974,13 @@ export function resolveSearchConfig(opts: {
     concurrency,
     batchSize,
     ...(batchTokens === null ? {} : { batchTokens }),
+    ...(inputWindowTokens === null ? {} : { inputWindowTokens }),
     maxRetries,
     costGateUsd,
     ...(priceOverride === null ? {} : { priceOverride }),
     queryPrefix,
     passagePrefix,
+    ...(extraBody === null ? {} : { extraBody }),
   });
 
   // Cross-encoder rerank (retrieval-precision-quality-loop, card A). Off
@@ -1229,8 +1397,14 @@ export function resolveSearchConfig(opts: {
     ftsTokenize,
   });
 
+  // The env variable names an extra-body refusal only when its value is
+  // the one in force, by the same raw-presence rule the parser used.
+  const extraBodySource =
+    opts.overrides?.semantic?.extraBody === undefined && env[EXTRA_BODY_ENV] !== undefined
+      ? EXTRA_BODY_ENV
+      : EXTRA_BODY_KEY;
   if (!opts.overrides) {
-    validateResolvedConfig(base);
+    validateResolvedConfig(base, extraBodySource);
     return base;
   }
   const merged = Object.freeze({
@@ -1242,6 +1416,6 @@ export function resolveSearchConfig(opts: {
       ? Object.freeze({ ...opts.overrides.scopeRules })
       : base.scopeRules,
   });
-  validateResolvedConfig(merged);
+  validateResolvedConfig(merged, extraBodySource);
   return merged;
 }

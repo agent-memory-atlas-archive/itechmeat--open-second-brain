@@ -901,10 +901,16 @@ export interface SearchOptions {
    *
    * Absent resolves to {@link TRANSPORT_REACH.remote}, the narrowest: a
    * search whose caller nobody established anything about is not a search
-   * that proved local access. Every internal lane that must see the whole
-   * corpus - benchmarks, recall feedback, rerank fit - passes
-   * {@link TRANSPORT_REACH.local} explicitly, and so does the CLI, which
-   * runs in the operator's own shell.
+   * that proved local access. An internal lane that must see the whole
+   * corpus passes {@link TRANSPORT_REACH.local} explicitly, and so does
+   * the CLI, which runs in the operator's own shell. Recall feedback does
+   * not: it re-runs the search under the reach of the caller who sent the
+   * feedback.
+   *
+   * The semantic lane's query embed reads this too: a caller that is not
+   * local, under a positive `embedding_cost_gate_usd`, on a model nobody
+   * priced, is refused before the embed is sent
+   * (`embeddings/query-embed.ts`).
    *
    * NOT to be confused with {@link SearchOptions.disclosure}, which is
    * the result-DEPTH mode; this one decides which pages exist for this
@@ -1248,6 +1254,15 @@ export interface ResolvedEmbeddingConfig {
    */
   readonly batchTokens?: number;
   /**
+   * The operator's declared input window of the configured model, in the
+   * model's own tokens (`embedding_input_window_tokens`). Absent when the
+   * key is absent, which leaves the curated preset window (or no window at
+   * all) in charge; read it through `effectiveInputWindowTokens` in
+   * `embeddings/presets.ts`, never directly. No default: a window nobody
+   * declared is unknown, and an unknown window cuts nothing.
+   */
+  readonly inputWindowTokens?: number;
+  /**
    * Per-batch transient-retry budget (attempts, not extra retries) for
    * 429 / 5xx / network errors. Default 6, raised from the former hardcoded
    * 3 so an agent reindexing against a strict-RPM embedding account does not
@@ -1280,6 +1295,14 @@ export interface ResolvedEmbeddingConfig {
   readonly queryPrefix?: string;
   /** Active instruction prefix for an indexed passage; see {@link queryPrefix}. */
   readonly passagePrefix?: string;
+  /**
+   * Extra request-body fields for an OpenAI-compatible endpoint, from
+   * `embedding_extra_body` / `OPEN_SECOND_BRAIN_EMBEDDING_EXTRA_BODY` (a
+   * JSON object). Absent when the key is unset. Never carries a reserved
+   * owned field, and never part of the embedding identity, so declaring or
+   * editing it never triggers a reindex.
+   */
+  readonly extraBody?: Readonly<Record<string, unknown>>;
 }
 
 /**

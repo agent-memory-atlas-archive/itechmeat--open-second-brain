@@ -13,9 +13,16 @@ import {
 } from "./capability-tier.ts";
 import { classifyEmbeddingError } from "./embeddings/openai-compat.ts";
 import { makeProvider } from "./embeddings/provider.ts";
+import {
+  prepareQueryEmbed,
+  queryEmbedCutMessage,
+  queryEmbedEmptyFitMessage,
+  queryEmbedRefusalMessage,
+} from "./embeddings/query-embed.ts";
 import { RETRIEVAL_DEGRADATION, noteDegradation } from "./retrieval-trail.ts";
 import { Store } from "./store.ts";
 import { EMBEDDING_QUOTA_MESSAGE, SearchError } from "./types.ts";
+import type { TransportReach } from "../graph/transport-reach.ts";
 import type { RetrievalDegradationSink } from "./retrieval-trail.ts";
 import type { ResolvedSearchConfig, SearchOptions } from "./types.ts";
 
@@ -79,6 +86,12 @@ export async function runSemanticPhase(
      * signal's reason, so an abandoned lane never reaches the store.
      */
     signal?: AbortSignal;
+    /**
+     * How far the caller reached (`SearchOptions.transportReach`). The
+     * query-embed gateway reads it: absent resolves to remote, as
+     * everywhere else in the tree.
+     */
+    transportReach?: TransportReach;
   },
 ): Promise<SemanticPhaseOutcome> {
   const warnings: string[] = [];
@@ -130,11 +143,42 @@ export async function runSemanticPhase(
     return { attempted: false, hits: [], warnings, degraded };
   }
 
+  // The query-embed gateway (honest-query-embed-and-safe-upgrades): the
+  // one place that decides whether a query embed is sent at all and with
+  // what text. It runs before any provider exists, so a refusal sends
+  // nothing. The explicit arm throws, like every other condition above
+  // that stops a lane the caller asked for by name; the implicit arm
+  // degrades by code and the lane is not attempted.
+  const prepared = prepareQueryEmbed(config, query, opts.transportReach);
+  if (prepared.kind === "refused") {
+    const message = queryEmbedRefusalMessage(prepared);
+    if (opts.explicit) throw new SearchError(prepared.code, message);
+    warnings.push(message);
+    noteDegradation(degraded, RETRIEVAL_DEGRADATION.semanticCostUnpriced);
+    return { attempted: false, hits: [], warnings, degraded };
+  }
+  if (prepared.truncated) {
+    const detail = { windowTokens: prepared.windowTokens };
+    if (prepared.emptyFit) {
+      // The instruction prefix alone fills the window: there is no query
+      // left to embed, and embedding the prefix would search for nothing.
+      const message = queryEmbedEmptyFitMessage(prepared);
+      if (opts.explicit) throw new SearchError("INVALID_INPUT", message);
+      warnings.push(message);
+      noteDegradation(degraded, RETRIEVAL_DEGRADATION.semanticQueryEmptyFit, detail);
+      return { attempted: false, hits: [], warnings, degraded };
+    }
+    // A cut the server would otherwise make silently (or refuse), made
+    // here and disclosed. The lane still runs on the cut query.
+    warnings.push(queryEmbedCutMessage(prepared, query));
+    noteDegradation(degraded, RETRIEVAL_DEGRADATION.semanticQueryTruncated, detail);
+  }
+
   let queryVec: number[];
   try {
     const provider = makeProvider(config.semantic);
     const vectors = await provider.embed(
-      [query],
+      [prepared.text],
       "query",
       opts.signal !== undefined ? { signal: opts.signal } : undefined,
     );
