@@ -12,6 +12,15 @@ export const TRUTH_SCHEMA_VERSION = 1;
 
 export type ClaimValueKind = "text" | "quantity";
 
+/**
+ * How a claim entered the ledger. The only writer-side value this
+ * release emits is `agent_stated` (a grounded agent-stated claim,
+ * truth-correctable-time-aware task 4); reads tolerate any non-empty
+ * string under schema v1 so a future extractor survives an upgrade
+ * cycle untouched.
+ */
+export type ClaimExtractor = "agent_stated";
+
 /** Structured payload for the quantitative fact family (t_220c313e). */
 export interface ClaimQuantity {
   readonly value: number;
@@ -27,6 +36,16 @@ export interface ClaimQuantity {
  * (NFC, lowercase, collapsed whitespace) so slot addressing compares
  * like with like; `value` keeps its display casing and is normalized
  * only for identity comparison inside the fold.
+ *
+ * The optional validity fields carry the claim's real-world validity
+ * window, half-open `[validFrom, validUntil)` (see `validity.ts`).
+ * They are presence-gated under `TRUTH_SCHEMA_VERSION = 1`: absent
+ * keys mean windowless, and every windowless line serializes
+ * byte-identically to the pre-window ledger. Stored values are bare
+ * ISO dates or canonical UTC timestamps; comparisons run on the
+ * validity axis only when BOTH claims of a pair carry present windows
+ * (contract item 1) - a windowless or expired claim never suppresses
+ * assertion-time contestation on its own.
  */
 export interface ClaimEvent {
   readonly v: typeof TRUTH_SCHEMA_VERSION;
@@ -38,6 +57,16 @@ export interface ClaimEvent {
   readonly value: string;
   readonly valueKind: ClaimValueKind;
   readonly quantity?: ClaimQuantity;
+  /** Validity window start (bare ISO date or canonical UTC timestamp). */
+  readonly validFrom?: string;
+  /** Validity window end, exclusive (bare ISO date or canonical UTC timestamp). */
+  readonly validUntil?: string;
+  /**
+   * Presence-gated provenance tag (schema v1): how this claim entered
+   * the ledger. Annotation only - the tag never changes which pairs
+   * contest, never re-ranks conflict priority, and never resolves one.
+   */
+  readonly extractor?: ClaimExtractor;
   /** Provenance wikilink or vault-relative path. */
   readonly source: string;
 }
@@ -53,6 +82,14 @@ export interface ClaimVersion {
   readonly source: string;
   /** How many events asserted this value. */
   readonly assertCount: number;
+  /**
+   * Validity fields tolerated on state-file versions for schema
+   * forward-compatibility. The fold does not populate them (succession
+   * reads windows from the events themselves), so they stay absent in
+   * every state this binary writes.
+   */
+  readonly validFrom?: string;
+  readonly validUntil?: string;
 }
 
 /**
@@ -87,13 +124,38 @@ export interface TruthConflict {
   readonly detectedAt: string;
 }
 
-/** The derived fold over all retained claim events. */
+/**
+ * A superseded-by-windows transition (contract item 1): two distinct
+ * values for one slot whose claims all carry present, non-intersecting
+ * validity windows. Succession lives OUTSIDE the conflict vocabulary -
+ * it is never a {@link TruthConflict}, never `ask_user`, and never
+ * reaches hygiene findings or conflict priority. The predecessor is
+ * the claim whose window closes first; `detectedAt` is the successor's
+ * assertion timestamp.
+ */
+export interface ClaimSuccession {
+  readonly entity: string;
+  readonly aspect: string;
+  readonly predecessor: ClaimEvent;
+  readonly successor: ClaimEvent;
+  readonly detectedAt: string;
+}
+
+/**
+ * The derived fold over all retained claim events.
+ *
+ * `successions` is presence-gated: undefined (never an empty array)
+ * whenever no succession classifies, and serialized by conditional
+ * spread so windowless states stay byte-identical to the pre-window
+ * ledger.
+ */
 export interface TruthState {
   readonly version: typeof TRUTH_SCHEMA_VERSION;
   readonly events: number;
   readonly updatedAt: string | null;
   readonly slots: ReadonlyArray<ClaimSlot>;
   readonly conflicts: ReadonlyArray<TruthConflict>;
+  readonly successions?: ReadonlyArray<ClaimSuccession>;
 }
 
 export interface ClaimParseWarning {

@@ -375,9 +375,28 @@ export async function search(
     }
 
     // Typed-edge relational arm (t_09b7ccea): a fourth RRF arm, engaged
-    // only for a relationship-shaped query under rrf fusion.
+    // only for a relationship-shaped query under rrf fusion. The deepened
+    // traversal rides the same composite clock every other phase answers
+    // to - the walk abandons its frontier once the deadline has fired -
+    // and gates its ordered provenance paths at the caller's transport
+    // reach and owner scope (an absent reach resolves to the same remote
+    // default the row-level filters apply, so provenance never names a
+    // page those rows withhold). The
+    // width budgets need no threading: the arm resolves them itself from
+    // the same env and the config file this call's resolution read (the
+    // resolved config's path, threaded through). With the arm off this
+    // whole expression is `noRelationalArm()` exactly as before.
     const relational = isRelationalArmActive(effectiveConfig, opts)
-      ? runRelationalArm(store, effectiveConfig.vault, query)
+      ? runRelationalArm(store, effectiveConfig.vault, query, {
+          configPath: effectiveConfig.configPath,
+          ...(deadline !== null ? { isExpired: () => deadlineExpired(deadline) } : {}),
+          ...(opts.transportReach !== undefined ? { reach: opts.transportReach } : {}),
+          // The caller's owner scope gates the provenance path nodes the
+          // same way the row-level filters gate content rows: a
+          // reach-readable node another agent owns is omitted from the
+          // ordered path, never named and never counted in the trail.
+          ...(opts.agentScope !== undefined ? { agentScope: opts.agentScope } : {}),
+        })
       : noRelationalArm();
 
     // Hydrate.
@@ -573,6 +592,10 @@ export async function search(
           poolSize,
           degraded,
           corpus,
+          // The arm's reach-gated paths ride into the outcome builder so
+          // the retrieval trail renders them; empty (arm off) projects to
+          // no trail entry at all.
+          ...(relational.reachByChunk.size > 0 ? { relationalReach: relational.reachByChunk } : {}),
           ...(postRank.decisionModel?.answerable !== undefined
             ? { decisionModel: { answerable: postRank.decisionModel.answerable } }
             : {}),

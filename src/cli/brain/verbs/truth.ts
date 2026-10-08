@@ -1,9 +1,12 @@
 /**
  * `o2b brain truth <op>` (Entity Truth & Self-Improving Dream Suite):
- * operator surface over the claim ledger - `ingest` appends one claim,
- * `slots` and `conflicts` render the fold (with conflict detection),
- * `aggregate` sums exact-match quantities, `collisions` reports
- * cross-agent convergence, `sweep` bounds the ledger.
+ * operator surface over the claim ledger - `ingest` appends one claim
+ * (optionally validity-windowed), `slots` and `conflicts` render the
+ * fold (with conflict detection), `aggregate` sums exact-match
+ * quantities, `collisions` reports cross-agent convergence, `events`
+ * recalls a windowed slice of the ledger, `state` grounds one
+ * agent-stated claim with an anchoring verdict, `sweep` bounds the
+ * ledger.
  *
  * Exit codes: 0 on success, 1 on an operational failure, 2 on usage
  * errors.
@@ -12,27 +15,51 @@
 import { aggregateQuantities } from "../../../core/brain/truth/aggregate.ts";
 import { detectAgentCollisions } from "../../../core/brain/truth/collision.ts";
 import { computeTruthStateWithConflicts } from "../../../core/brain/truth/conflicts.ts";
+import { claimEventLimit } from "../../../core/brain/truth/events-window.ts";
 import {
   appendClaimEvent,
   CLAIM_EVENT_MAX_COUNT,
+  ClaimWindowRefusal,
   readClaimEvents,
   sweepClaimEvents,
 } from "../../../core/brain/truth/store.ts";
+import {
+  appendStatedClaims,
+  StatedClaimsRefusal,
+} from "../../../core/brain/truth/stated-claims.ts";
 import { normalizeEntityName } from "../../../core/brain/entities/canonical.ts";
 import { isoSecond } from "../../../core/brain/time.ts";
+import { SearchError } from "../../../core/search/types.ts";
+import { TRANSPORT_REACH } from "../../../core/graph/transport-reach.ts";
+import { resolveAgentName } from "../../../core/config.ts";
+import { claimEventsReport, statedClaimEntities } from "../../../mcp/brain/knowledge-tools.ts";
+import { parseTimeBounds } from "../../../mcp/brain/time-bounds.ts";
 import { brainVerbContext, fail, ok, okJson, parse, resolveBrainAgent } from "../helpers.ts";
 
-const OPS = ["ingest", "slots", "conflicts", "aggregate", "collisions", "sweep"] as const;
+const OPS = [
+  "ingest",
+  "slots",
+  "conflicts",
+  "aggregate",
+  "collisions",
+  "events",
+  "state",
+  "sweep",
+] as const;
 type TruthOp = (typeof OPS)[number];
 
 const USAGE =
-  "usage: o2b brain truth <ingest|slots|conflicts|aggregate|collisions|sweep>\n" +
+  "usage: o2b brain truth <ingest|slots|conflicts|aggregate|collisions|events|state|sweep>\n" +
   "  ingest     --entity E --aspect A --value V --source S [--agent N] [--ts ISO]\n" +
+  "             [--valid-from X --valid-until Y]\n" +
   "             [--quantity-value N --quantity-unit U --quantity-action W]\n" +
   "  slots      [--entity E]\n" +
   "  conflicts  [--window-days N]\n" +
   "  aggregate  --action W [--unit U] [--entity E]\n" +
   "  collisions [--window-days N]\n" +
+  "  events     [--entity E] [--since X] [--until Y] [--limit N]\n" +
+  "  state      --subject S --relation R --object O --text T --source S\n" +
+  "             [--agent N]\n" +
   "  sweep      [--max-events N]\n" +
   "  common     [--vault <path>] [--json]";
 
@@ -55,6 +82,15 @@ export async function cmdBrainTruth(argv: string[]): Promise<number> {
     source: { type: "string" },
     agent: { type: "string" },
     ts: { type: "string" },
+    "valid-from": { type: "string" },
+    "valid-until": { type: "string" },
+    subject: { type: "string" },
+    relation: { type: "string" },
+    object: { type: "string" },
+    text: { type: "string" },
+    since: { type: "string" },
+    until: { type: "string" },
+    limit: { type: "string" },
     "quantity-value": { type: "string" },
     "quantity-unit": { type: "string" },
     "quantity-action": { type: "string" },
@@ -97,22 +133,40 @@ export async function cmdBrainTruth(argv: string[]): Promise<number> {
             action: (flags["quantity-action"] as string | undefined) ?? null,
           };
         }
-        const result = appendClaimEvent(vault, {
-          ts: (flags["ts"] as string | undefined) ?? isoSecond(new Date()),
-          agent: resolveBrainAgent(flags, config),
-          entity: requireString(flags, "entity"),
-          aspect: requireString(flags, "aspect"),
-          value: requireString(flags, "value"),
-          valueKind,
-          ...(quantity !== undefined ? { quantity } : {}),
-          source: requireString(flags, "source"),
-        });
+        const validFrom = flags["valid-from"] as string | undefined;
+        const validUntil = flags["valid-until"] as string | undefined;
+        // Validity windows (contract item 1): presence-gated passthrough;
+        // the store refuses an unparseable or inverted window by name,
+        // mapped to the usage failure class - a mistyped window is the
+        // same kind of mistake as --since garbage or --limit 0.
+        let result;
+        try {
+          result = appendClaimEvent(vault, {
+            ts: (flags["ts"] as string | undefined) ?? isoSecond(new Date()),
+            agent: resolveBrainAgent(flags, config),
+            entity: requireString(flags, "entity"),
+            aspect: requireString(flags, "aspect"),
+            value: requireString(flags, "value"),
+            valueKind,
+            ...(quantity !== undefined ? { quantity } : {}),
+            ...(validFrom !== undefined ? { validFrom } : {}),
+            ...(validUntil !== undefined ? { validUntil } : {}),
+            source: requireString(flags, "source"),
+          });
+        } catch (exc) {
+          if (exc instanceof ClaimWindowRefusal) throw new UsageError((exc as Error).message);
+          throw exc;
+        }
         const body = {
           ok: true,
           entity: result.event.entity,
           aspect: result.event.aspect,
           value: result.event.value,
           path: result.path,
+          ...(result.event.validFrom !== undefined ? { valid_from: result.event.validFrom } : {}),
+          ...(result.event.validUntil !== undefined
+            ? { valid_until: result.event.validUntil }
+            : {}),
         };
         if (asJson) okJson(body);
         else ok(`claim recorded: ${body.entity} / ${body.aspect} = ${body.value}`);
@@ -195,6 +249,135 @@ export async function cmdBrainTruth(argv: string[]): Promise<number> {
           ok(`collisions: ${collisions.length}`);
           for (const c of collisions) {
             ok(`  ${c.entity}: ${c.agents.join(" + ")} (${c.claims} claim(s))`);
+          }
+        }
+        return 0;
+      }
+      case "events": {
+        // Bounds parse through the shared time-bounds wrapper - the same
+        // parser the MCP events operation refuses with - mapped to the
+        // INVALID_PARAMS-equivalent exit-2 usage error.
+        let sinceMs: number | null;
+        let untilMs: number | null;
+        try {
+          const bounds = parseTimeBounds(
+            flags["since"] as string | undefined,
+            flags["until"] as string | undefined,
+          );
+          sinceMs = bounds.sinceMs;
+          untilMs = bounds.untilMs;
+        } catch (exc) {
+          if (exc instanceof SearchError) throw new UsageError(exc.message);
+          throw exc;
+        }
+        const limitRaw = flags["limit"] as string | undefined;
+        // A non-numeric --limit reaches the shared limit guard as NaN,
+        // and that guard's refusal would stringify the NaN as "null" -
+        // naming nothing the operator typed. Validate the flag is finite
+        // here, before that message is composed, and name the raw value.
+        if (limitRaw !== undefined && !Number.isFinite(Number(limitRaw))) {
+          throw new UsageError(
+            `--limit must be a positive integer, got ${JSON.stringify(limitRaw)}`,
+          );
+        }
+        let limit: number;
+        try {
+          limit = claimEventLimit(limitRaw === undefined ? undefined : Number(limitRaw));
+        } catch (exc) {
+          throw new UsageError((exc as Error).message);
+        }
+        // The CLI runs at local reach (stdio child of the caller); the
+        // owner-scope gate still binds the server-resolved identity. The
+        // body is the shared claimEventsReport, so this surface answers
+        // byte-identically to the MCP operation at the same query.
+        const body = claimEventsReport(vault, resolveAgentName(config), TRANSPORT_REACH.local, {
+          entity: flags["entity"] as string | undefined,
+          sinceMs,
+          untilMs,
+          limit,
+        });
+        if (asJson) {
+          okJson(body);
+        } else {
+          const rows = body.events as ReadonlyArray<{
+            ts: string;
+            entity: string;
+            aspect: string;
+            value: string;
+            source: string;
+          }>;
+          ok(
+            `events: ${body.total} matched, ${rows.length} shown` +
+              `${body.truncated ? ", truncated" : ""}`,
+          );
+          for (const e of rows) {
+            ok(`  ${e.ts}  ${e.entity} / ${e.aspect} = ${e.value}  ${e.source}`);
+          }
+        }
+        return 0;
+      }
+      case "state": {
+        // One agent-stated claim per invocation, through the same
+        // grounded-claim core the MCP state operation calls: the payload
+        // boundary refuses whole (unknown relation, missing text or
+        // source) as the INVALID_PARAMS-equivalent usage error, and the
+        // anchoring verdict - committed event or reported-back reasons -
+        // is the answer.
+        const body = (() => {
+          try {
+            const outcome = appendStatedClaims(
+              vault,
+              {
+                claims: [
+                  {
+                    subject: requireString(flags, "subject"),
+                    relation: requireString(flags, "relation"),
+                    object: requireString(flags, "object"),
+                  },
+                ],
+                text: requireString(flags, "text"),
+                agent: resolveBrainAgent(flags, config),
+                ts: isoSecond(new Date()),
+                source: requireString(flags, "source"),
+              },
+              { entities: statedClaimEntities(vault), configPath: config },
+            );
+            return {
+              ok: true,
+              operation: "state" as const,
+              committed: outcome.committed.map((result) => ({ ...result.event })),
+              ungrounded: outcome.ungrounded.map(({ claim, reasons }) => ({
+                subject: claim.subject,
+                relation: claim.relation,
+                object: claim.object,
+                reasons,
+              })),
+            };
+          } catch (exc) {
+            // Both refusal channels are mistyped-input refusals, so both
+            // answer as the usage failure class - the same mapping the
+            // ingest case applies, so the state verb never answers a
+            // window the SOURCE record carries as an operational failure.
+            if (exc instanceof StatedClaimsRefusal || exc instanceof ClaimWindowRefusal) {
+              throw new UsageError((exc as Error).message);
+            }
+            throw exc;
+          }
+        })();
+        if (asJson) {
+          okJson(body);
+        } else {
+          if (body.committed.length > 0) {
+            for (const row of body.committed) {
+              const r = row as { entity: string; aspect: string; value: string };
+              ok(`anchored claim recorded: ${r.entity} / ${r.aspect} = ${r.value}`);
+            }
+          }
+          for (const u of body.ungrounded) {
+            ok(
+              `ungrounded claim reported back: ${u.subject} / ${u.relation} / ${u.object}` +
+                ` (${u.reasons.join(", ")})`,
+            );
           }
         }
         return 0;

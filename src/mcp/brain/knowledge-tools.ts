@@ -45,13 +45,28 @@ import { normaliseWikilinkTarget } from "../../core/brain/wikilink.ts";
 import { isoSecond } from "../../core/brain/time.ts";
 import { normalizeAgentArgument } from "../../core/agent-identity.ts";
 import { normalizeEntityName } from "../../core/brain/entities/canonical.ts";
+import { listEntities } from "../../core/brain/entities/registry.ts";
+import {
+  ENTITY_STATUS_SCOPE,
+  entityStatusInScope,
+} from "../../core/brain/entities/status-scope.ts";
+import {
+  appendStatedClaims,
+  StatedClaimsRefusal,
+  type StatedClaim,
+} from "../../core/brain/truth/stated-claims.ts";
 import { listDeadEnds, recordDeadEnd } from "../../core/brain/dead-ends.ts";
 import { buildCodegraphReport } from "../../core/partner/codegraph-report.ts";
 import { buildForesight, FORESIGHT_HORIZON_DAYS } from "../../core/brain/temporal/foresight.ts";
 import { aggregateQuantities } from "../../core/brain/truth/aggregate.ts";
 import { detectAgentCollisions } from "../../core/brain/truth/collision.ts";
 import { computeTruthStateWithConflicts } from "../../core/brain/truth/conflicts.ts";
-import { appendClaimEvent, readClaimEvents } from "../../core/brain/truth/store.ts";
+import {
+  appendClaimEvent,
+  ClaimWindowRefusal,
+  readClaimEvents,
+} from "../../core/brain/truth/store.ts";
+import { claimEventLimit, matchClaimEvents } from "../../core/brain/truth/events-window.ts";
 import {
   allClaims,
   buildClaimGraph,
@@ -66,6 +81,7 @@ import {
 } from "../../core/brain/claim-graph.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
 import { contextReach } from "../tool-contract.ts";
+import type { TransportReach } from "../../core/graph/transport-reach.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { vaultPathField } from "../vault-path-field.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
@@ -78,6 +94,7 @@ import {
 } from "../coerce.ts";
 import { coercePositiveInteger, toolSafeguard, vaultRelativeSafe } from "./shared.ts";
 import { readableAtContextReach, readableAtContextReachOrUndefined } from "./reach-readable.ts";
+import { resolveTimeBounds } from "./time-bounds.ts";
 
 /**
  * Vault-relative locations these two handlers read BY PATH, rather than
@@ -583,8 +600,10 @@ function toolBrainIdeaDiscovery(
 /**
  * Operator/agent surface over the entity claim ledger: ingest one
  * claim, render slots/conflicts from the fold, aggregate exact-match
- * quantities, report cross-agent collisions. Read ops are pure folds
- * over the append-only ledger.
+ * quantities, report cross-agent collisions, recall a windowed slice of
+ * the ledger via the events operation, and commit grounded agent-stated
+ * claims via the state operation with per-claim anchoring verdicts. The
+ * read ops are pure folds over the append-only ledger.
  */
 function toolBrainTruth(
   ctx: ServerContext,
@@ -596,16 +615,29 @@ function toolBrainTruth(
     op !== "slots" &&
     op !== "conflicts" &&
     op !== "aggregate" &&
-    op !== "collisions"
+    op !== "collisions" &&
+    op !== "events" &&
+    op !== "state"
   ) {
     throw unknownOperationError(
-      "brain_truth: operation must be ingest|slots|conflicts|aggregate|collisions",
+      "brain_truth: operation must be ingest|slots|conflicts|aggregate|collisions|events|state",
     );
   }
   const requireStr = (name: string): string => {
     const value = args[name];
     if (typeof value !== "string" || value.trim() === "") {
       throw new MCPError(INVALID_PARAMS, `brain_truth ${op}: ${name} must be a non-empty string`);
+    }
+    return value;
+  };
+  // An optional string parameter is either a string or absent; any other
+  // type is refused rather than silently ignored - a mistyped bound that
+  // read as "no filter" would widen what the caller sees.
+  const optionalStr = (name: string): string | undefined => {
+    const value = args[name];
+    if (value === undefined) return undefined;
+    if (typeof value !== "string") {
+      throw new MCPError(INVALID_PARAMS, `brain_truth ${op}: ${name} must be a string`);
     }
     return value;
   };
@@ -637,21 +669,163 @@ function toolBrainTruth(
     const agent =
       normalizeAgentArgument(typeof agentArg === "string" ? agentArg : null) ??
       resolveAgentName(ctx.configPath ?? undefined);
-    const result = appendClaimEvent(ctx.vault, {
-      ts: isoSecond(new Date()),
-      agent,
-      entity: requireStr("entity"),
-      aspect: requireStr("aspect"),
-      value: requireStr("value"),
-      ...(quantity !== undefined ? { valueKind: "quantity" as const, quantity } : {}),
-      source: requireStr("source"),
-    });
+    // Declared optional validity fields (design decision 3): explicit
+    // input wins outright, bound by bound, over what ingest resolves
+    // from the source record's frontmatter; absent fields leave every
+    // line byte-identical to the pre-window ledger.
+    const validFrom = optionalStr("valid_from");
+    const validUntil = optionalStr("valid_until");
+    // The source's window resolves at the CALLER's reach: a source page
+    // the caller cannot read is treated exactly like an absent one -
+    // windowless claim, no validity keys in the response, no signal
+    // distinguishing withheld from absent. Without this gate the ingest
+    // response would read a withheld page's validity frontmatter back
+    // and triple as an existence oracle. (The CLI verb runs at operator
+    // reach and passes no gate.)
+    const readable = readableAtContextReachOrUndefined(ctx);
+    // The store's window refusal is strict by design; here it is a
+    // mistyped parameter, so it answers as the same failure class as the
+    // sibling mistyped inputs (entity, since/until, limit) - typed
+    // INVALID_PARAMS, never an internal error.
+    let result;
+    try {
+      result = appendClaimEvent(
+        ctx.vault,
+        {
+          ts: isoSecond(new Date()),
+          agent,
+          entity: requireStr("entity"),
+          aspect: requireStr("aspect"),
+          value: requireStr("value"),
+          ...(quantity !== undefined ? { valueKind: "quantity" as const, quantity } : {}),
+          ...(validFrom !== undefined ? { validFrom } : {}),
+          ...(validUntil !== undefined ? { validUntil } : {}),
+          source: requireStr("source"),
+        },
+        readable !== undefined ? { readableSource: readable } : {},
+      );
+    } catch (exc) {
+      if (exc instanceof ClaimWindowRefusal) {
+        throw new MCPError(INVALID_PARAMS, `brain_truth ingest: ${(exc as Error).message}`);
+      }
+      throw exc;
+    }
     return {
       ok: true,
       entity: result.event.entity,
       aspect: result.event.aspect,
       path: result.path,
+      ...(result.event.validFrom !== undefined ? { valid_from: result.event.validFrom } : {}),
+      ...(result.event.validUntil !== undefined ? { valid_until: result.event.validUntil } : {}),
     };
+  }
+
+  // Windowed recall over the ledger (truth-correctable-time-aware,
+  // Task 8): the response body is the shared claimEventsReport, so the
+  // CLI subcommand answers byte-identically at the same query.
+  if (op === "events") {
+    const bounds = resolveTimeBounds(optionalStr("since"), optionalStr("until"));
+    let limit: number;
+    try {
+      limit = claimEventLimit(args["limit"]);
+    } catch (exc) {
+      throw new MCPError(INVALID_PARAMS, `brain_truth events: ${(exc as Error).message}`);
+    }
+    return claimEventsReport(ctx.vault, ctx.agentName, contextReach(ctx), {
+      entity: optionalStr("entity"),
+      sinceMs: bounds.sinceMs,
+      untilMs: bounds.untilMs,
+      limit,
+    });
+  }
+
+  // Grounded agent-stated claims (truth-correctable-time-aware, Task 8),
+  // through lane 1's grounded-claim core: the payload boundary refuses
+  // WHOLE calls (unknown relation, missing text, missing source, empty
+  // agent, malformed ts) before ANY write, and anchoring verdicts are
+  // per claim - the one
+  // partial-commit lane in this subsystem, safe because each event is an
+  // independent append in an append-only ledger and the response reports
+  // exactly what landed.
+  if (op === "state") {
+    const claims = args["claims"];
+    if (!Array.isArray(claims) || claims.length === 0) {
+      throw new MCPError(INVALID_PARAMS, "brain_truth state: claims must be a non-empty array");
+    }
+    const stated = claims.map((raw, index): StatedClaim => {
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new MCPError(INVALID_PARAMS, `brain_truth state: claims[${index}] must be an object`);
+      }
+      const claim = raw as Record<string, unknown>;
+      // Type-shaped fields only; an empty subject or object is not a
+      // refusal here but a per-claim ungrounded verdict downstream.
+      const readField = (name: string): string => {
+        const value = claim[name];
+        if (typeof value !== "string") {
+          throw new MCPError(
+            INVALID_PARAMS,
+            `brain_truth state: claims[${index}].${name} must be a string`,
+          );
+        }
+        return value;
+      };
+      return {
+        subject: readField("subject"),
+        relation: readField("relation"),
+        object: readField("object"),
+      };
+    });
+    const agentArg = args["agent"];
+    if (agentArg !== undefined && typeof agentArg !== "string") {
+      throw new MCPError(INVALID_PARAMS, "brain_truth state: agent must be a string");
+    }
+    const agent =
+      normalizeAgentArgument(typeof agentArg === "string" ? agentArg : null) ??
+      resolveAgentName(ctx.configPath ?? undefined);
+    // The source's frontmatter window resolves at the CALLER's reach,
+    // exactly as ingest gates it: a withheld source freezes a windowless
+    // event and the committed rows carry no validity keys, so the state
+    // response reads a withheld page's frontmatter no more than an
+    // absent one's.
+    const readable = readableAtContextReachOrUndefined(ctx);
+    try {
+      const outcome = appendStatedClaims(
+        ctx.vault,
+        {
+          claims: stated,
+          text: requireStr("text"),
+          agent,
+          ts: isoSecond(new Date()),
+          source: requireStr("source"),
+        },
+        {
+          entities: statedClaimEntities(ctx.vault),
+          ...(ctx.configPath !== null ? { configPath: ctx.configPath } : {}),
+          ...(readable !== undefined ? { readableSource: readable } : {}),
+        },
+      );
+      return {
+        ok: true,
+        operation: "state",
+        committed: outcome.committed.map((result) => ({ ...result.event })),
+        ungrounded: outcome.ungrounded.map(({ claim, reasons }) => ({
+          subject: claim.subject,
+          relation: claim.relation,
+          object: claim.object,
+          reasons,
+        })),
+      };
+    } catch (exc) {
+      // Both refusal channels are mistyped-input refusals - the payload
+      // boundary's, and the store's when the stated claim's window
+      // resolves from the source record's frontmatter and inverts there
+      // - so both answer as the same failure class the ingest operation
+      // maps, never an internal error.
+      if (exc instanceof StatedClaimsRefusal || exc instanceof ClaimWindowRefusal) {
+        throw new MCPError(INVALID_PARAMS, `brain_truth state: ${exc.message}`);
+      }
+      throw exc;
+    }
   }
 
   const events = readClaimEvents(ctx.vault).events;
@@ -854,6 +1028,73 @@ function toolBrainClaims(
 }
 
 // ----- brain_truth (Entity Truth & Self-Improving Dream Suite) ---------------
+
+/**
+ * The registry slice the stated-claims anchoring consumes: canonical-
+ * scope entities only (the anchoring kernel's status discipline,
+ * applied where the registry is read), narrowed to AtomicEntityLike.
+ * Shared by the MCP `state` operation and the CLI `brain truth state`
+ * subcommand so the two surfaces anchor identically.
+ */
+export function statedClaimEntities(vault: string): ReadonlyArray<{
+  readonly id: string;
+  readonly name: string;
+  readonly aliases: ReadonlyArray<string>;
+  readonly status: string;
+}> {
+  return listEntities(vault)
+    .filter((entity) => entityStatusInScope(entity.status, ENTITY_STATUS_SCOPE.canonical))
+    .map(({ id, name, aliases, status }) => ({ id, name, aliases, status }));
+}
+
+/**
+ * One windowed events query, shared by the MCP `events` operation and
+ * the CLI `brain truth events` subcommand so the two surfaces cannot
+ * drift on shape, ordering, gating or paging. Bounds arrive already
+ * resolved (unix-ms); the page size must already be validated.
+ *
+ * Windowed recall (truth-correctable-time-aware, Tasks 8-9):
+ * `sinceMs`/`untilMs` filter ASSERTION `ts` only; the per-claim
+ * validity windows ride on the rows verbatim and are never consulted
+ * here (contract item 1 keeps the two temporal vocabularies separate).
+ * Every matched row passes the same per-row owner/reach gate
+ * `brain_claims` asks, and the account covers ONLY the rows that pass
+ * it: a withheld row is dropped and nothing counts it (the views'
+ * identical-to-absent convention - a dropped-but-counted row would tell
+ * the caller that a claim it may not see exists, and per entity or
+ * window would let it measure the hidden population). A filtered answer
+ * is therefore byte-identical to the answer over a vault that never
+ * held the withheld rows.
+ */
+export function claimEventsReport(
+  vault: string,
+  agentName: string | undefined,
+  reach: TransportReach,
+  query: {
+    readonly entity?: string;
+    readonly sinceMs: number | null;
+    readonly untilMs: number | null;
+    readonly limit: number;
+  },
+): Record<string, unknown> {
+  const entityFilter =
+    query.entity !== undefined && query.entity.trim() !== "" ? query.entity : undefined;
+  const view = everyArtifactRefView(gatedOwnerScopeView(vault, agentName), reachView(vault, reach));
+  const matched = matchClaimEvents(readClaimEvents(vault).events, {
+    ...(entityFilter !== undefined ? { entity: entityFilter } : {}),
+    sinceMs: query.sinceMs,
+    untilMs: query.untilMs,
+  });
+  const gated = view.filtersNothing ? matched : matched.filter((event) => view.row(event.source));
+  return {
+    ok: true,
+    operation: "events",
+    entity: entityFilter === undefined ? null : normalizeEntityName(entityFilter),
+    events: gated.slice(0, query.limit),
+    total: gated.length,
+    truncated: gated.length > query.limit,
+  };
+}
 
 export const KNOWLEDGE_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
@@ -1062,28 +1303,77 @@ export const KNOWLEDGE_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: "brain_truth",
     description:
-      "Entity claim ledger: ingest a claim, render current-truth slots with superseded history, list contested conflicts (ask_user), aggregate exact-match quantities, report cross-agent collisions.",
+      "Entity claim ledger: ingest a claim, render current-truth slots, list conflicts, aggregate quantities, report collisions, window recall via the events operation, or commit grounded agent-stated claims via the state operation with per-claim anchoring verdicts.",
     inputSchema: {
       type: "object",
       properties: {
         operation: {
           type: "string",
-          enum: ["ingest", "slots", "conflicts", "aggregate", "collisions"],
+          enum: ["ingest", "slots", "conflicts", "aggregate", "collisions", "events", "state"],
           description: "Tool operation.",
         },
         entity: {
           type: "string",
-          description: "Entity name (ingest, slots filter, aggregate filter).",
+          description: "Entity name (ingest, slots filter, aggregate filter, events filter).",
         },
         aspect: { type: "string", description: "Aspect slot for ingest." },
         value: { type: "string", description: "Claim value for ingest." },
-        source: { type: "string", description: "Provenance wikilink/path for ingest." },
-        agent: { type: "string", description: "Agent identity override for ingest." },
+        source: { type: "string", description: "Provenance wikilink/path for ingest and state." },
+        agent: { type: "string", description: "Agent identity override for ingest and state." },
         quantity_value: { type: "number", description: "Numeric value for quantity claims." },
         quantity_unit: { type: "string", description: "Unit token for quantity claims." },
         quantity_action: { type: "string", description: "Measured action for quantity claims." },
+        valid_from: {
+          type: "string",
+          description:
+            "ingest: validity window start (bare ISO date or canonical UTC timestamp); wins over the source frontmatter's valid_from.",
+        },
+        valid_until: {
+          type: "string",
+          description:
+            "ingest: exclusive validity window end (bare ISO date or canonical UTC timestamp); wins over the source frontmatter's valid_until.",
+        },
         action: { type: "string", description: "Measured action for aggregate." },
         unit: { type: "string", description: "Unit token for aggregate (omit for unitless)." },
+        since: {
+          type: "string",
+          description:
+            "events: inclusive lower bound on the events' assertion ts (ISO date/datetime, today/yesterday, last week/month, <n>h/<n>d/<n>w). Never a validity filter.",
+        },
+        until: {
+          type: "string",
+          description:
+            "events: inclusive upper bound on the events' assertion ts, same grammar as since. Never a validity filter.",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "events: page size (default 200, capped at 1000); rows are ascending assertion ts, so tail-following paginates by advancing since.",
+        },
+        claims: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              subject: { type: "string", description: "Entity the claim is about." },
+              relation: {
+                type: "string",
+                description:
+                  "Relation-vocabulary token between subject and object (related, extends, depends_on, refines, contradicts, superseded_by).",
+              },
+              object: { type: "string", description: "Entity the claim points at." },
+            },
+            required: ["subject", "relation", "object"],
+            additionalProperties: false,
+          },
+          description:
+            "state: the agent-stated claims to ground; each commits only when its subject and object anchor in text.",
+        },
+        text: {
+          type: "string",
+          description: "state: the assertion text every claim is anchored against.",
+        },
       },
       required: ["operation"],
       additionalProperties: false,

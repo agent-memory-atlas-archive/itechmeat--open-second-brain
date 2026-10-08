@@ -47,7 +47,7 @@ Brain verbs (observing memory):
   dream            Deterministic dreaming pass; stage/validate/apply/retriage bundles
   apply-evidence   Log a real-work application of a preference
   note             Append a one-line narrative milestone to Brain/log/today
-  lifecycle        Tombstone/supersede a memory, resolve chain tips, curator slices
+  lifecycle        Tombstone/supersede a memory, correct one record, resolve chain tips, curator slices
   expire           Set, change or clear a signal's or preference's expiration date
   note-lifecycle   Note FILES: rename/move/archive/delete one, rewriting inbound links
   scaffold-stub    Unresolved wikilink targets: list them, or materialise a stub
@@ -94,7 +94,7 @@ Brain verbs (observing memory):
   health-baseline     Acknowledge-before watermark for advisories (set <date>|now / get / clear)
   history             Render a preference's edit-history timeline
   activation          Activation event store: status and sweep
-  truth               Claim ledger: ingest, slots, conflicts, aggregate, collisions, sweep
+  truth               Claim ledger: ingest, slots, conflicts, aggregate, collisions, events, state, sweep
   facts               Decompose text into atomic assertions (--ingest to ledger)
   dead-end            Negative-knowledge registry: record and list failed approaches
   foresight           Forward projection: routines coming due, open commitments and questions
@@ -235,16 +235,20 @@ export const VERB_HELP: Record<string, string> = {
     "event kind. CLI mirror of the MCP `brain_note` tool — same on-disk contract.\n" +
     "Use from cron jobs and shell scripts. Multi-line text collapses to one line.\n",
   lifecycle:
-    "usage: o2b brain lifecycle <tombstone|supersede|temporal-replace|tip|curator> [...] [--vault <path>] [--json]\n" +
-    "Cross-type tombstone + supersede lifecycle. tombstone <path> --reason <r>\n" +
+    "usage: o2b brain lifecycle <tombstone|supersede|temporal-replace|tip|curator|correct> [...] [--vault <path>] [--json]\n" +
+    "Cross-type tombstone + supersede + correct lifecycle. tombstone <path> --reason <r>\n" +
     "[--superseded-by <id>] marks a memory _status: tombstoned in place (no delete);\n" +
     "supersede <predecessor> <successor> tombstones the predecessor and records the\n" +
     "replacement pointer; temporal-replace <predecessor> <successor> --at <T> closes the\n" +
     "predecessor (valid_until = T) and opens the successor (valid_from = T) at one shared\n" +
     "instant; tip <id> walks a supersede chain to its live tip; curator\n" +
     "[--high-use-min <n>] lists injected-never-used, contradicted, and high-used\n" +
-    "memories from observed-use verdicts. Tombstoned entries stay on disk for audit\n" +
-    "but are excluded from recall, inject, and active.md.\n",
+    "memories from observed-use verdicts; correct <target> [--value <v>]\n" +
+    "[--successor <id>] [--flatly-wrong] [--window-end <T>] [--reason <r>] sweeps one\n" +
+    "record's correction - blast-radius report by default, --apply retires the target\n" +
+    "(validity close, or tombstone when --flatly-wrong), retargets mentions, appends\n" +
+    "ledger correction events and bundle-correlated receipts. Tombstoned entries stay\n" +
+    "on disk for audit but are excluded from recall, inject, and active.md.\n",
   expire:
     "usage: o2b brain expire <id> --expires <YYYY-MM-DD|ISO-8601|none>\n" +
     "  [--agent <name>] [--vault <path>] [--json]\n" +
@@ -500,13 +504,17 @@ export const VERB_HELP: Record<string, string> = {
     "events outside the retention window or beyond the newest-N cap and refolds\n" +
     "(--max-events 0 clears every retained event).\n",
   truth:
-    "usage: o2b brain truth <ingest|slots|conflicts|aggregate|collisions|sweep> [--vault <path>] [--json]\n" +
+    "usage: o2b brain truth <ingest|slots|conflicts|aggregate|collisions|events|state|sweep> [--vault <path>] [--json]\n" +
     "Operator surface over the entity claim ledger (Brain/truth/). ingest appends one\n" +
     "claim (--entity --aspect --value --source, optional --quantity-value/--quantity-unit/\n" +
-    "--quantity-action); slots renders current values with superseded history; conflicts\n" +
-    "lists contested slots (two values within the window from independent sources,\n" +
-    "resolution always ask_user); aggregate sums exact (entity, action, unit) quantity\n" +
-    "matches; collisions reports cross-agent convergence; sweep keeps the newest N events.\n",
+    "--quantity-action, optional --valid-from/--valid-until validity window); slots\n" +
+    "renders current values with superseded history; conflicts lists contested slots\n" +
+    "(two values within the window from independent sources, resolution always ask_user);\n" +
+    "aggregate sums exact (entity, action, unit) quantity matches; collisions reports\n" +
+    "cross-agent convergence; events recalls a windowed slice of the ledger (--entity,\n" +
+    "--since, --until, --limit); state grounds one agent-stated claim with an anchoring\n" +
+    "verdict (--subject --relation --object --text --source); sweep keeps the newest N\n" +
+    "events.\n",
   facts:
     "usage: o2b brain facts decompose (--file <path> | --text <text>) [--ingest --entity E] [--vault <path>] [--json]\n" +
     "Deterministically decompose text into atomic assertions via markdown structure\n" +
