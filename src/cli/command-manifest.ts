@@ -813,6 +813,8 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           flag("concurrency", "string"),
           flag("verbose", "boolean"),
           flag("progress", "boolean"),
+          flag("freshen", "string"),
+          flag("freshen-state", "string"),
         ]),
         command("reindex", "Rebuild the search index", [
           flag("vault", "string"),

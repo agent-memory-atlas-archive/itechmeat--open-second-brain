@@ -104,6 +104,7 @@ import {
   EMBEDDING_PREFIX_PASSAGE_STATE_KEY,
   LAST_FULL_INDEX_AT_STATE_KEY,
   LAST_INDEXED_AT_STATE_KEY,
+  LINK_RESOLUTION_PENDING_STATE_KEY,
 } from "./store.ts";
 import { LATEST_SCHEMA_VERSION } from "./schema.ts";
 import { chunkWindowDiagnosticCode, SearchError } from "./types.ts";
@@ -187,6 +188,7 @@ interface MutableStats {
   relationViolations: IndexStats["relationViolations"];
   tierDrift: IndexStats["tierDrift"];
   aliasResolved: number;
+  linkResolutionSkipped: boolean;
   eventAnchorsPending: number;
   backend: IndexStats["backend"];
   deferredReason: IndexStats["deferredReason"];
@@ -216,6 +218,7 @@ function newStats(): MutableStats {
     relationViolations: [],
     tierDrift: [],
     aliasResolved: 0,
+    linkResolutionSkipped: false,
     // Counted at the end of the run, once every changed document has
     // been upserted: what is left is what this run did not reach.
     eventAnchorsPending: 0,
@@ -257,6 +260,7 @@ function freezeStats(s: MutableStats, durationMs: number): IndexStats {
     relationViolations: Object.freeze([...s.relationViolations]),
     tierDrift: Object.freeze([...s.tierDrift]),
     aliasResolved: s.aliasResolved,
+    linkResolutionSkipped: s.linkResolutionSkipped,
     eventAnchorsPending: s.eventAnchorsPending,
     backend: s.backend,
     deferredReason: s.deferredReason,
@@ -455,6 +459,12 @@ async function indexIntoRun(
   const ownsStore = !storeOverride;
   const store = storeOverride ?? (await Store.open(config, { mode: "write" }));
   const stats = newStats();
+  let linkResolutionMarked = false;
+  const markLinkResolutionPending = (): void => {
+    if (linkResolutionMarked) return;
+    linkResolutionMarked = true;
+    store.setState(LINK_RESOLUTION_PENDING_STATE_KEY, "1");
+  };
 
   try {
     const existing = store.listDocuments();
@@ -518,6 +528,7 @@ async function indexIntoRun(
           continue;
         }
 
+        markLinkResolutionPending();
         const filenameBase = basename(file.relPath, ".md");
         const chunkResult = chunkMarkdown(content, filenameBase, {
           maxTokens: config.chunkSize,
@@ -610,8 +621,8 @@ async function indexIntoRun(
           tokenCount: c.tokenCount,
           headingPath: c.headingPath,
         }));
-        // An unchanged chunk keeps its stored vector (vector carry-over),
-        // so the embedding phase below never re-pays for it.
+        // An unchanged chunk is kept in place, and a moved one carries its
+        // stored vector, so the embedding phase below never re-pays for it.
         const replaced = store.replaceDocumentChunks(docId, chunkInputs);
         const chunkIds = replaced.chunkIds;
         stats.embeddingsReused += replaced.embeddingsReused;
@@ -630,8 +641,11 @@ async function indexIntoRun(
             });
           }
           // Entity-boosted retrieval (v0.13.0): persist the chunk's
-          // deterministic entity set alongside its links.
-          store.replaceEntities(cid, extractEntities(content));
+          // deterministic entity set alongside its links. A chunk kept in
+          // place has the entities of the content it still holds - so a
+          // release that changes `extractEntities` must bump CHUNKER_VERSION,
+          // which rebuilds every chunk, or kept rows keep the old entities.
+          if (!replaced.keptChunkIds.has(cid)) store.replaceEntities(cid, extractEntities(content));
         }
         // Typed graph semantics (v3): frontmatter relation fields
         // (related / extends / contradicts / superseded_by) become typed
@@ -666,16 +680,35 @@ async function indexIntoRun(
 
     for (const [path] of existing) {
       if (!seen.has(path)) {
+        markLinkResolutionPending();
         store.deleteDocument(path);
         stats.deleted++;
         opts?.onFile?.({ path, kind: "deleted" });
       }
     }
 
-    store.resolveLinkTargets();
-    // Alias post-pass (v7): exact path matches above always win; this
-    // only fills still-unresolved slash-free targets from doc_aliases.
-    stats.aliasResolved = store.resolveAliasTargets();
+    // Link and alias resolution are a pure function of the documents and
+    // their links. A run that changed no document (and was not forced)
+    // would only rewrite every link row to the value it already holds -
+    // the alias pass resets and re-sets each alias-resolved link - which
+    // is what made a no-change run write to disk. Skipped then; the
+    // constraint and tier passes below still run.
+    // A run killed between its document writes and this point leaves the
+    // pending marker set, and the next run resolves even if it changes
+    // nothing itself.
+    if (
+      stats.added + stats.updated + stats.deleted === 0 &&
+      opts?.force !== true &&
+      store.getState(LINK_RESOLUTION_PENDING_STATE_KEY) !== "1"
+    ) {
+      stats.linkResolutionSkipped = true;
+    } else {
+      store.resolveLinkTargets();
+      // Alias post-pass (v7): exact path matches above always win; this
+      // only fills still-unresolved slash-free targets from doc_aliases.
+      stats.aliasResolved = store.resolveAliasTargets();
+      store.setState(LINK_RESOLUTION_PENDING_STATE_KEY, "0");
+    }
 
     // Link-constraint materialization post-pass
     // (write-time-integrity-governance): recompute every typed edge's

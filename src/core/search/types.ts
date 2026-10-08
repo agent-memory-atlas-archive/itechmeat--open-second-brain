@@ -314,6 +314,12 @@ export interface IndexStats {
    */
   readonly aliasResolved: number;
   /**
+   * True when the run added, updated and deleted no document and was not
+   * forced, so the link and alias resolution passes - a pure function of
+   * the documents and their links - were skipped (index-freshness).
+   */
+  readonly linkResolutionSkipped: boolean;
+  /**
    * Backend that processed this run, resolved lazily after content
    * detection (offline code-only extraction, t_85252236). `"offline"`
    * when only the deterministic lexical pipeline ran and no provider
@@ -1047,6 +1053,12 @@ export interface SearchOptions {
    */
   readonly selfHeal?: boolean;
   /**
+   * Test seam for freshen-on-read: replaces the detached spawn of the
+   * background index run a stale index starts. Production callers leave
+   * it unset.
+   */
+  readonly freshenSpawn?: (argv: string[]) => void;
+  /**
    * Skip rerank kind `decision-model` for this call. Set by the hook
    * surfaces (recall inject), whose time budget is shorter than a decision
    * request, until a hook-specific decision use exists. The skipped call
@@ -1542,6 +1554,16 @@ export interface ResolvedRecallConfig {
   readonly metadataBoostGateEnabled?: boolean;
 }
 
+/** What freshen-on-read does; see `src/core/search/freshen.ts`. */
+export interface ResolvedFreshenConfig {
+  /** Seconds the index may age before a read refreshes it; 0 turns it off. */
+  readonly intervalSeconds: number;
+  /** Whether the background run also computes embeddings (paid). */
+  readonly embeddings: boolean;
+  /** The config file the background run must resolve, or null for the default. */
+  readonly configPath: string | null;
+}
+
 export interface ResolvedSearchConfig {
   readonly vault: string;
   readonly dbPath: string;
@@ -1627,4 +1649,10 @@ export interface ResolvedSearchConfig {
    * shadow index is untouched by this clause.
    */
   readonly ftsTokenize: string;
+  /**
+   * Freshen-on-read (index-freshness): how old the index may get before a
+   * read starts one background incremental run, and what that run does.
+   * Absent on a hand-built config, which reads as off.
+   */
+  readonly freshen?: ResolvedFreshenConfig;
 }

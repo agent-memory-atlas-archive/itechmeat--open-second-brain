@@ -8,9 +8,10 @@
  * all of them are conditions only a walk of the tree can see.
  */
 
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { ensureInsideVault, realpathInsideVault, vaultRelative } from "../../path-safety.ts";
+import { readFreshenState } from "../../search/freshen.ts";
 import { BRAIN_LOG_AUDIT_DIRS } from "../audit-dirs.ts";
 import { continuityLogDir } from "../continuity/store.ts";
 import { scanDanglingWorkruns } from "../dream-workrun.ts";
@@ -36,13 +37,14 @@ import {
 /**
  * Tier guard (write-time-integrity-governance): staged identity
  * hand-edits the index post-pass detected. Fail-soft index read - a
- * missing index or pre-v6 schema simply skips the check.
+ * missing index or pre-v6 schema simply skips the check. Counted over
+ * the pages the caller may read, like every check handed `readable`.
  */
 export const tierDriftCheck: DoctorCheck = {
   failSoft: false,
-  run({ dbPath }, { issues }) {
+  run({ dbPath, readable }, { issues }) {
     if (dbPath === undefined) return;
-    const driftCount = readTierDriftCount(dbPath);
+    const driftCount = readTierDriftCount(dbPath, readable);
     if (driftCount > 0) {
       issues.push({
         severity: "warning",
@@ -53,14 +55,38 @@ export const tierDriftCheck: DoctorCheck = {
   },
 };
 
+/**
+ * Freshen on read (index-freshness): background index runs started by
+ * stale reads that keep failing. Three in a row is a broken index, not a
+ * hiccup - every search meanwhile answers from an ageing index.
+ */
+export const freshenFailureCheck: DoctorCheck = {
+  failSoft: false,
+  run({ dbPath }, { issues }) {
+    if (dbPath === undefined) return;
+    const state = readFreshenState(dirname(dbPath));
+    if (state.lastOutcome !== "failed" || state.failures < FRESHEN_FAILURE_WARN_AT) return;
+    issues.push({
+      severity: "warning",
+      code: FRESHEN_FAILING_CODE,
+      message:
+        `background index refresh failed ${state.failures} times in a row ` +
+        `(last: ${state.lastError ?? "unknown error"}); the index is not being kept current`,
+    });
+  },
+};
+
+/** Failures in a row from which {@link freshenFailureCheck} warns. */
+export const FRESHEN_FAILURE_WARN_AT = 3;
+
+/** The code of the {@link freshenFailureCheck} warning. */
+export const FRESHEN_FAILING_CODE = "freshen-failing";
+
 /** The code of the {@link tierDriftCheck} warning. */
 export const TIER_DRIFT_CODE = "tier-drift";
 
-/**
- * The {@link tierDriftCheck} warning text for `count` staged drift rows,
- * shared with a surface that recounts the rows a caller may read.
- */
-export function tierDriftMessage(count: number): string {
+/** The {@link tierDriftCheck} warning text for `count` staged drift rows. */
+function tierDriftMessage(count: number): string {
   return `${count} identity-field hand-edit(s) staged - review with: o2b brain tiers check`;
 }
 
