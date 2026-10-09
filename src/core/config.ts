@@ -15,6 +15,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import lockfile from "proper-lockfile";
 
 import { atomicWriteFileSync, sleepSync } from "./fs-atomic.ts";
+import { isSecretReferenceValue, SecretReferenceError } from "./secret-ref.ts";
 import { APP_DIR_NAME, configBaseDir } from "./platform-dirs.ts";
 import { resolveActiveProfileVault } from "./brain/portability/profiles.ts";
 import { resolvePointerVault } from "./brain/portability/pointer.ts";
@@ -25,6 +26,52 @@ import {
 } from "./brain/link-graph/format-wikilink.ts";
 import type { LinkOutputFormat } from "./brain/wikilink.ts";
 import type { ConfigDiscovery } from "./types.ts";
+
+/**
+ * The named-secret resolver port (trust-surface-hardening, t_e5807974).
+ *
+ * A `$secret:` reference in a config value resolves through the vault's
+ * custody store, whose own import neighbourhood reaches back into THIS
+ * module (store -> audit -> ledger-shards -> config), so a static import
+ * of the resolver here closed the six-module cycle config ->
+ * secret-resolver -> custody store -> audit -> ledger-shards -> config,
+ * whose initialisation order is undefined. Config is the base layer and
+ * carries only the PORT; the resolver plane is the adapter and fills it
+ * through {@link installNamedSecretResolver} when `secret-resolver.ts`
+ * loads - which every production entry (the CLI's `main.ts`, the MCP
+ * server, the OpenClaw bridge) does statically at startup, before any
+ * command dispatch.
+ */
+export interface NamedSecretResolver {
+  /** Resolve one `$secret:` reference against `vault`'s custody store. */
+  resolveNamedSecret(vault: string, value: string): string;
+}
+
+let namedSecretResolver: NamedSecretResolver | undefined;
+
+/** Fill the {@link NamedSecretResolver} port; see its docblock for the wiring. */
+export function installNamedSecretResolver(resolver: NamedSecretResolver): void {
+  namedSecretResolver = resolver;
+}
+
+/**
+ * Resolve one reference through the installed resolver. The refusal is
+ * unreachable in a wired process (see the port's docblock); failing
+ * closed by name keeps an unwired one from ever treating a stored
+ * reference as literal text - for the installation secret that mistake
+ * would self-heal a fresh key right over the reference.
+ */
+function resolveThroughNamedSecretResolver(vault: string, reference: string): string {
+  const resolver = namedSecretResolver;
+  if (resolver === undefined) {
+    throw new SecretReferenceError(
+      "no named-secret resolver is installed in this process; the $secret: reference " +
+        "cannot be resolved against the vault's custody store",
+      reference,
+    );
+  }
+  return resolver.resolveNamedSecret(vault, reference);
+}
 
 const CONFIG_VALUE_REJECTED_CHARS = ['"', "\\", "\n", "\r"] as const;
 
@@ -549,7 +596,7 @@ export function isValidInstallationSecret(value: string): boolean {
   return INSTALLATION_SECRET_RE.test(value);
 }
 
-export function resolveInstallationSecret(configPath?: string): string {
+export function resolveInstallationSecret(configPath?: string, secretsVault?: string): string {
   // Env override exists for deterministic tests only, and is accepted solely
   // as a full 32-hex key so it can never make the secret empty or guessable.
   const env = process.env[INSTALLATION_SECRET_ENV_KEY];
@@ -557,8 +604,40 @@ export function resolveInstallationSecret(configPath?: string): string {
   const resolved = configPath ?? defaultConfigPath();
 
   const read = (): string | null => {
-    const value = discoverConfig(resolved).data[INSTALLATION_SECRET_CONFIG_KEY];
-    return value && isValidInstallationSecret(value) ? value : null;
+    const raw = discoverConfig(resolved).data[INSTALLATION_SECRET_CONFIG_KEY];
+    // A persisted value written as a `$secret:NAME` reference NEVER
+    // self-heals. The reference is the operator's stored intent, and the
+    // self-heal below would mint a fresh key over it - silently
+    // destroying the reference AND rotating the HMAC key, which changes
+    // every `vault://` reference agents correlate by, with no error
+    // naming anything. So every reference outcome is either the resolved
+    // key or a named refusal: unresolvable (the store and the
+    // environment cannot answer), locked (the store refuses), resolves
+    // but not a 32-hex key (the stored value is not an installation
+    // secret), or no vault passed to resolve against. Self-heal only
+    // ever mints when NO reference exists - a missing or plain corrupt
+    // value, exactly as before.
+    if (isSecretReferenceValue(raw)) {
+      const reference = String(raw).trim();
+      if (secretsVault === undefined) {
+        throw new SecretReferenceError(
+          "installation_secret is a $secret: reference but no vault was passed to resolve " +
+            "it against; pass the vault (or set O2B_INSTALLATION_SECRET to a 32-hex key)",
+          reference,
+        );
+      }
+      const resolvedValue = resolveThroughNamedSecretResolver(secretsVault, reference);
+      if (!isValidInstallationSecret(resolvedValue)) {
+        throw new SecretReferenceError(
+          "installation_secret is a $secret: reference that resolves to a value which is " +
+            "not a 32-hex installation key; fix the stored value - the reference in the " +
+            "device config is never overwritten",
+          reference,
+        );
+      }
+      return resolvedValue;
+    }
+    return raw && isValidInstallationSecret(raw) ? raw : null;
   };
 
   const existing = read();
@@ -613,7 +692,9 @@ const VAULT_STORE_REF_HEX_LEN = 32;
  *   `vaultPathField` in `src/mcp/tools.ts`.
  */
 export function vaultStoreReference(vaultPath: string, configPath?: string): string {
-  const key = resolveInstallationSecret(configPath);
+  // The referenced vault's custody store backs a `$secret:` reference in
+  // the persisted key; a plain key resolves exactly as before.
+  const key = resolveInstallationSecret(configPath, vaultPath);
   const digest = createHmac("sha256", key)
     .update(resolve(vaultPath))
     .digest("hex")
@@ -1494,15 +1575,23 @@ export function resolveSessionCaptureRoles(configPath?: string): SessionCaptureR
 /**
  * Inbound Telegram capture bot token (Knowledge intake suite, t_f8f5ef6a).
  * Order: `TELEGRAM_BOT_TOKEN` env -> `telegram_bot_token` config -> null.
- * The key contains "token", so `redactConfigMapping` (src/core/egress)
- * redacts it from any config snapshot. `null` (the default) means the
- * capture runner exits with a typed error rather than starting; nothing
- * runs without an explicit token.
+ * A value written as a `$secret:NAME` reference resolves through the passed
+ * vault's custody store. The key contains "token", so `redactConfigMapping`
+ * (src/core/egress) redacts it from any config snapshot. `null` (the
+ * default) means the capture runner exits with a typed error rather than
+ * starting; nothing runs without an explicit token.
  */
-export function resolveTelegramBotToken(configPath?: string): string | null {
+export function resolveTelegramBotToken(configPath?: string, secretsVault?: string): string | null {
   const env = process.env["TELEGRAM_BOT_TOKEN"]?.trim();
   const raw = env || discoverConfig(configPath).data["telegram_bot_token"]?.trim();
-  return raw !== undefined && raw.length > 0 ? raw : null;
+  if (raw === undefined || raw.length === 0) return null;
+  // A token written as a `$secret:NAME` reference resolves through the
+  // vault's custody store (read-only); without the vault the value is
+  // taken as-is, exactly as before the resolver routing existed.
+  if (secretsVault !== undefined && isSecretReferenceValue(raw)) {
+    return resolveThroughNamedSecretResolver(secretsVault, raw);
+  }
+  return raw;
 }
 
 /**

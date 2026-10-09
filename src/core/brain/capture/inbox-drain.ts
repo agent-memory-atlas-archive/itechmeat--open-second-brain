@@ -46,7 +46,13 @@ import {
   stageHubSelection,
   type HubPagePool,
 } from "../link-graph/hub-candidates.ts";
-import { archiveCapture, listStagedCaptures, type CaptureNote } from "./capture-note.ts";
+import {
+  archiveCapture,
+  CaptureContractError,
+  listStagedCaptures,
+  requireDeclaredCaptureKind,
+  type CaptureNote,
+} from "./capture-note.ts";
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
 
 /** Explicit leading token that classifies a capture as an obligation. */
@@ -186,7 +192,19 @@ function planSource(vault: string, url: string, opts: DrainOptions): RoutePlan {
   };
 }
 
-function planIdea(vault: string, body: string, opts: DrainOptions): RoutePlan {
+function planIdea(vault: string, body: string, opts: DrainOptions): RoutePlan | UnroutableCapture {
+  // Pack vocabulary gate (t_151a564c), consulted at PLAN time so a dry run is
+  // a faithful preview: the idea route stamps `captured-idea`, so a vault
+  // that declares page_types without it is unroutable in BOTH modes with the
+  // same named refusal - the capture stays staged and a rerun after the
+  // operator declares the kind converges. Same gate, same refusal text, as
+  // the staging contract's own writer.
+  try {
+    requireDeclaredCaptureKind(vault, CAPTURED_IDEA_KIND);
+  } catch (err) {
+    if (!(err instanceof CaptureContractError)) throw err;
+    return new UnroutableCapture(err.message);
+  }
   const slug = slugify(body);
   const relPath = `${CAPTURED_NOTES_DIR_REL}/${slug}.md`;
   const abs = ensureInsideVault(join(vault, relPath), vault);
@@ -196,13 +214,22 @@ function planIdea(vault: string, body: string, opts: DrainOptions): RoutePlan {
     action: "note",
     reason: merge ? "atomic idea (merge into existing note)" : "atomic idea (create note)",
     execute: () => {
-      writeIdeaNote(abs, body, opts, merge);
+      writeIdeaNote(vault, abs, body, opts, merge);
       return relPath;
     },
   };
 }
 
-function writeIdeaNote(abs: string, body: string, opts: DrainOptions, merge: boolean): void {
+function writeIdeaNote(
+  vault: string,
+  abs: string,
+  body: string,
+  opts: DrainOptions,
+  merge: boolean,
+): void {
+  // The declared-vocabulary gate lives in `planIdea`, the classifier, so the
+  // dry-run plan and the apply see the same refusal (t_151a564c); by execute
+  // time the route is known declared, and nothing here writes before it.
   const stamp = isoSecond(opts.now);
   // `ensureInsideVault` hands back a native path, so the parent comes from
   // `dirname`: a hand-rolled split on "/" found no separator in a Windows

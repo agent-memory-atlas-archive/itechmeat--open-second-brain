@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import { atomicWriteFileSync } from "../fs-atomic.ts";
+import { digestVerifies, sealWithDigest } from "../integrity/digest.ts";
 import { appendLogEvent } from "./log.ts";
 import { BRAIN_LOG_EVENT_KIND, BRAIN_SNAPSHOT_REASON } from "./types.ts";
 import { createSnapshot } from "./snapshot.ts";
@@ -11,11 +12,12 @@ import { DEFAULT_BRAIN_CONFIG } from "./policy/defaults.ts";
 import { resolveAgentName } from "../config.ts";
 import { loadManifest, saveManifest } from "./claude-memory-manifest.ts";
 import { planAction, type PlannedFile } from "./claude-memory-plan.ts";
-import { assertSafeMemoryPath } from "./claude-memory-paths.ts";
+import { assertSafeMemoryPath, homeRelativePath } from "./claude-memory-paths.ts";
 import { claudeMemoryBackend } from "./agent-backend/claude.ts";
 import type { MemorySourceBackend } from "./agent-backend/types.ts";
 import { BRAIN_PREFERENCES_REL, preferencePath } from "./paths.ts";
 import { resolvedOwnerFor } from "./preference.ts";
+import { TagSyntaxError } from "./tag-syntax.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 
 export interface ImportClaudeMemoryOpts {
@@ -24,6 +26,15 @@ export interface ImportClaudeMemoryOpts {
   readonly mode: "dry-run" | "apply";
   readonly allowArbitraryMemoryPath?: boolean;
   readonly now?: Date;
+  /**
+   * The plan digest a dry run computed and an operator approved (the CLI
+   * plumbing is `--approval-digest`). Absent, apply behaves exactly as
+   * it did before approval digests existed - the interactive path's
+   * escape hatch. Present, it is checked against the freshly computed
+   * plan BEFORE the snapshot or any write, and a mismatch is an
+   * {@link ApprovalDigestError} that leaves the vault untouched.
+   */
+  readonly approvalDigest?: string;
   /**
    * Memory-format adapter (t_53f9f67f). Defaults to the Claude Code
    * backend - byte-identical to the pre-seam behavior. Resolve via
@@ -41,6 +52,59 @@ export interface ImportClaudeMemoryResult {
   readonly skippedUnchanged: ReadonlyArray<PlannedFile>;
   readonly snapshotRunId: string | null;
   readonly localDate: string;
+  /**
+   * The seal of the adoption plan (t_18fda844): sha256 of the plans,
+   * skips, conflicts and unchanged rows, via the integrity module's
+   * `sealWithDigest`. Wall-clock fields (`localDate`, the import
+   * timestamps) are deliberately OUTSIDE the sealed body, so a dry run
+   * and a later apply of the same content seal identically and an
+   * approval binds the plan, never the moment it was printed.
+   */
+  readonly digest: string;
+}
+
+/**
+ * The body an approval covers: what will land, what will not, and what
+ * refuses. The one spelling of "the plan", shared by the dry run that
+ * seals it and the apply that re-checks it.
+ */
+function planApprovalBody(parts: {
+  plans: ReadonlyArray<PlannedFile>;
+  skipped: ReadonlyArray<{ basename: string; reason: string }>;
+  conflicts: ReadonlyArray<PlannedFile>;
+  skippedUnchanged: ReadonlyArray<PlannedFile>;
+}): Record<string, unknown> {
+  return {
+    conflicts: parts.conflicts,
+    plans: parts.plans,
+    skipped: parts.skipped,
+    skipped_unchanged: parts.skippedUnchanged,
+  };
+}
+
+/**
+ * The apply-time refusal when the plan an operator approved no longer
+ * matches the plan this run computed. Nothing has been written and no
+ * snapshot has been taken; the remedy is a fresh dry run, whose digest
+ * is what the next apply must carry.
+ */
+export class ApprovalDigestError extends Error {
+  /** The digest the caller asked to apply against. */
+  readonly approvalDigest: string;
+  /** The digest of the plan this run just computed. */
+  readonly planDigest: string;
+
+  constructor(approvalDigest: string, planDigest: string) {
+    super(
+      `approval digest mismatch: the plan changed since the approved dry run ` +
+        `(approved ${approvalDigest}, current plan ${planDigest}); nothing was written and ` +
+        "no snapshot was taken. Re-run `o2b brain import-claude-memory --dry-run` to review " +
+        "the current plan, then apply with its digest.",
+    );
+    this.name = "ApprovalDigestError";
+    this.approvalDigest = approvalDigest;
+    this.planDigest = planDigest;
+  }
 }
 
 /**
@@ -90,7 +154,10 @@ export function importClaudeMemory(opts: ImportClaudeMemoryOpts): ImportClaudeMe
   const backend = opts.backend ?? claudeMemoryBackend;
   assertSafeMemoryPath(opts.memoryDir, opts.allowArbitraryMemoryPath ?? false);
   if (!existsSync(opts.memoryDir)) {
-    throw new Error(`memory directory not found: ${opts.memoryDir}`);
+    throw new Error(
+      `memory directory not found: ${homeRelativePath(opts.memoryDir)} ` +
+        `(pass --memory with an existing directory, or create it)`,
+    );
   }
   const now = opts.now ?? new Date();
   const importedAt = isoSecond(now);
@@ -152,9 +219,43 @@ export function importClaudeMemory(opts: ImportClaudeMemoryOpts): ImportClaudeMe
         });
         return;
       }
-      seenPrefIds.set(prefId, entryKey);
       // preferencePath adds pref- prefix itself, so pass just the slug
       const prefFile = preferencePath(opts.vault, slug);
+      // Render BEFORE any plan row exists. A render that refuses THIS entry -
+      // a name whose slug fails the one shared tag rule, e.g. a purely
+      // numeric memory name (t_11ee559f) - is a per-entry data problem like a
+      // skip parse or a duplicate id: it lands a named skip row (file and
+      // rule both named) and the import continues. Rendering first keeps the
+      // refusal out of `plans`, so the sealed approval body never offers a
+      // file that would not land, and one legacy MEMORY file cannot abort the
+      // whole run with a message that names only the field.
+      let body: string;
+      try {
+        // This module renders its own frontmatter and writes it with
+        // `atomicWriteFileSync`, so it never reaches `writePreference`
+        // and never got the ownership stamp every other preference
+        // writer applies (a-label-is-not-a-boundary, U3). Asking the
+        // shared resolver is the fix; rendering a second copy of the
+        // rule here is how the next writer would get it wrong again.
+        // `prefFile` is passed so an UPDATE carries the existing owner
+        // forward instead of re-owning the page, exactly as a rewrite
+        // through `writePreference` does.
+        body = backend.renderPreference({
+          name: parsed.name,
+          description: parsed.description,
+          body: parsed.body,
+          memoryPath: join(baseDir, name),
+          importedAt,
+          unconfirmedUntil,
+          bodySha256: parsed.bodySha256,
+          owner: resolvedOwnerFor(opts.vault, prefFile, undefined, undefined),
+        });
+      } catch (err) {
+        if (!(err instanceof TagSyntaxError)) throw err;
+        skipped.push({ basename: entryKey, reason: err.message });
+        return;
+      }
+      seenPrefIds.set(prefId, entryKey);
       const manifestEntry = manifest.imports[entryKey];
       const plan = planAction({
         basename: entryKey,
@@ -165,25 +266,6 @@ export function importClaudeMemory(opts: ImportClaudeMemoryOpts): ImportClaudeMe
       });
       plans.push(plan);
       if (plan.action === "CREATE" || plan.action === "RECREATE" || plan.action === "UPDATE") {
-        // This module renders its own frontmatter and writes it with
-        // `atomicWriteFileSync`, so it never reaches `writePreference`
-        // and never got the ownership stamp every other preference
-        // writer applies (a-label-is-not-a-boundary, U3). Asking the
-        // shared resolver is the fix; rendering a second copy of the
-        // rule here is how the next writer would get it wrong again.
-        // `prefFile` is passed so an UPDATE carries the existing owner
-        // forward instead of re-owning the page, exactly as a rewrite
-        // through `writePreference` does.
-        const body = backend.renderPreference({
-          name: parsed.name,
-          description: parsed.description,
-          body: parsed.body,
-          memoryPath: join(baseDir, name),
-          importedAt,
-          unconfirmedUntil,
-          bodySha256: parsed.bodySha256,
-          owner: resolvedOwnerFor(opts.vault, prefFile, undefined, undefined),
-        });
         filesToWrite.push({ plan, body, sha256: parsed.bodySha256, slug });
       }
     });
@@ -191,6 +273,12 @@ export function importClaudeMemory(opts: ImportClaudeMemoryOpts): ImportClaudeMe
 
   const conflicts = plans.filter((p) => p.action === "CONFLICT");
   const skippedUnchanged = plans.filter((p) => p.action === "SKIP_UNCHANGED");
+
+  // Seal the adoption plan (t_18fda844). The apply below re-checks the
+  // operator's approval against THIS seal before the snapshot or any
+  // write, so what lands is what was approved or nothing is.
+  const approvalBody = planApprovalBody({ plans, skipped, conflicts, skippedUnchanged });
+  const planDigest = sealWithDigest(approvalBody).digest;
 
   if (opts.mode === "dry-run") {
     return {
@@ -202,7 +290,16 @@ export function importClaudeMemory(opts: ImportClaudeMemoryOpts): ImportClaudeMe
       skippedUnchanged,
       snapshotRunId: null,
       localDate,
+      digest: planDigest,
     };
+  }
+
+  // The approved plan is checked against the one just computed BEFORE
+  // the snapshot/write loop. Drift between dry run and apply is the
+  // case this exists for: a vault or memory source that moved in
+  // between must be re-reviewed, never written over.
+  if (opts.approvalDigest !== undefined && !digestVerifies(approvalBody, opts.approvalDigest)) {
+    throw new ApprovalDigestError(opts.approvalDigest, planDigest);
   }
 
   // §E design: process the non-conflict files first; throw `ConflictsError`
@@ -292,6 +389,7 @@ export function importClaudeMemory(opts: ImportClaudeMemoryOpts): ImportClaudeMe
     skippedUnchanged,
     snapshotRunId,
     localDate,
+    digest: planDigest,
   };
 }
 

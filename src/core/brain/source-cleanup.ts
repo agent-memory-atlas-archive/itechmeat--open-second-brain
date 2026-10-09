@@ -774,10 +774,18 @@ export function deleteBySource(
       }
 
       if (manifestKey !== null && existsSync(manifestPath(vault))) {
-        const entries = { ...readManifest(vault).entries };
+        const manifest = readManifest(vault);
+        const entries = { ...manifest.entries };
         if (entries[manifestKey] !== undefined) {
           delete entries[manifestKey];
-          manifestEntryRemoved = writeManifestAtomic(vault, entries);
+          // Round-trip the contract the manifest was read with (t_586d5d8b):
+          // a cleanup that only removes an entry must not re-stamp the
+          // extraction contract the remaining entries were recorded under -
+          // and a v1 read (contract `null`) round-trips as v1, because its
+          // survivors were never reprocessed under any fingerprint. Upgrading
+          // them here would classify them `unchanged` forever and silently
+          // forfeit the owed one-time reprocess.
+          manifestEntryRemoved = writeManifestAtomic(vault, entries, manifest.contract);
         }
       }
     } catch (err) {

@@ -24,6 +24,13 @@ import { brainDirsForWrite } from "../paths.ts";
 import { isoSecond } from "../time.ts";
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
 import { decryptValue, encryptValue, loadOrCreateKey, type EncryptedValue } from "./crypto.ts";
+import {
+  clearHeldKey,
+  isEnvelopeFile,
+  SecretStoreKeyfileMissingError,
+  unlockKeyfile as unlockKeyfileAtPath,
+  wrapKeyfile as wrapKeyfileAtPath,
+} from "./envelope.ts";
 import { restrictToOwner } from "./owner-acl.ts";
 
 export const SECRETS_SCHEMA_VERSION = 1;
@@ -78,17 +85,45 @@ function storePath(vault: string): string {
   return join(secretsDir(vault), "secrets.json");
 }
 
-function keyPath(vault: string): string {
+/** The keyfile path - exported for `./bundle.ts`'s wrap and import paths. */
+export function keyPath(vault: string): string {
   return join(secretsDir(vault), "keyfile");
+}
+
+/** The name rule `set` enforces, shared with the bundle importer. */
+export function isValidSecretName(name: string): boolean {
+  return NAME_RE.test(name);
+}
+
+/** The env-var rule `set` enforces, shared with the bundle importer. */
+export function isValidSecretEnvVar(envVar: string): boolean {
+  return ENV_VAR_RE.test(envVar);
+}
+
+/**
+ * The allow-pattern rule `set` enforces: every pattern trims, and an
+ * empty one refuses. Shared with the bundle importer, so an imported
+ * entry can never carry an allowlist the store's own writer would have
+ * refused - a crafted bundle cannot broaden exec capability into a state
+ * `secret set` cannot have produced.
+ */
+export function normalizeAllowPatterns(patterns: ReadonlyArray<string>): string[] {
+  return patterns.map((pattern) => {
+    const trimmed = pattern.trim();
+    if (trimmed.length === 0) throw new Error("allow pattern must not be empty");
+    return trimmed;
+  });
 }
 
 /**
  * Serialise every read-modify-write of `secrets.json` across
  * processes (CLI + MCP). proper-lockfile with retries, matching the
  * search store's writer-lock discipline; the keyfile creation also
- * creates the directory the lock anchors on.
+ * creates the directory the lock anchors on. Exported for
+ * `./bundle.ts`, whose import path holds the same lock around its own
+ * read-collision-write sequence.
  */
-function withSecretsLock<T>(vault: string, fn: () => T): T {
+export function withSecretsLock<T>(vault: string, fn: () => T): T {
   loadOrCreateKey(keyPath(vault));
   // The sync lockfile API has no retry option; spin briefly the same
   // way the search store's writer lock does.
@@ -134,11 +169,7 @@ export function setSecret(vault: string, input: SetSecretInput): SecretMetadata 
   if (!ENV_VAR_RE.test(envVar)) {
     throw new Error(`secret env var must match ${ENV_VAR_RE}: ${JSON.stringify(envVar)}`);
   }
-  const allow = (input.allow ?? []).map((pattern) => {
-    const trimmed = pattern.trim();
-    if (trimmed.length === 0) throw new Error("allow pattern must not be empty");
-    return trimmed;
-  });
+  const allow = normalizeAllowPatterns(input.allow ?? []);
 
   const key = loadOrCreateKey(keyPath(vault));
   // Custody is a precondition, not a stderr line: on Windows, a keyfile
@@ -253,6 +284,103 @@ export function resolveSecretForExec(
 }
 
 /**
+ * Decrypt one secret WITHOUT the exec path's write half: no `last_used_at`
+ * stamp, no custody audit record, no vault-identity guard (it writes
+ * nothing). The read-only resolve the config-side secret resolver composes
+ * with (t_e5807974): a config read must not take the write path, and it
+ * must not look like an exec. Same shape as the exec resolve's answer, so
+ * a consumer sees one secret record either way.
+ *
+ * A name the store holds under a locked envelope surfaces the named
+ * locked-store refusal, and a store whose keyfile is MISSING while entries
+ * survive surfaces the named missing-keyfile refusal - never a silent
+ * fallback in either case, which would hide the store's real state from
+ * the caller. The missing-keyfile refusal is also what keeps this resolve
+ * read-only in fact and not just in name: `loadOrCreateKey` would mint a
+ * fresh key over the surviving ciphertext, silently orphaning every
+ * stored value. An unknown name fails with the same no-enumeration error
+ * the exec resolve uses.
+ */
+export function resolveSecretReadOnly(vault: string, name: string): ResolvedSecret {
+  const file = readStore(vault);
+  const normalized = name.trim().toLowerCase();
+  const stored = file.secrets[normalized];
+  if (stored === undefined) {
+    // Same discipline as {@link resolveSecretForExec}: `list` is the
+    // discovery surface, so a wrong name learns nothing.
+    throw new Error(`unknown secret "${normalized}"`);
+  }
+  const kp = keyPath(vault);
+  if (!existsSync(kp)) throw new SecretStoreKeyfileMissingError(kp);
+  const key = loadOrCreateKey(kp);
+  return {
+    name: normalized,
+    env_var: stored.env_var,
+    allow: stored.allow,
+    value: decryptValue(key, stored),
+  };
+}
+
+/**
+ * Unlock the store's wrapped keyfile for THIS PROCESS: verify the
+ * passphrase, hold the DEK in the envelope module's memory-only holder,
+ * and land the no-values custody record. On a store whose keyfile is
+ * still raw, this IS the opt-in: the raw 32 bytes are wrapped under the
+ * passphrase on first unlock, so unlocking is what creates the envelope.
+ *
+ * The passphrase is never persisted, logged, or audited, and a lost
+ * passphrase is unrecoverable - the verb's help says so in plain terms.
+ */
+export function unlockSecretKeyfile(
+  vault: string,
+  passphrase: string,
+  ctx: SecretAuditContext,
+): void {
+  // Guard ahead of the first byte: the wrap below replaces the keyfile.
+  assertVaultIdentityForWrite(vault);
+  const kp = keyPath(vault);
+  const wrapped = isEnvelopeFile(kp);
+  if (wrapped) {
+    unlockKeyfileAtPath(kp, passphrase);
+  } else {
+    // The wrap replaces the only copy of the DEK, so it serialises
+    // through the same writer lock every other read-modify-write of the
+    // custody directory takes: two concurrent first-unlocks must not
+    // interleave on the tmp path the swap writes. The shape check runs
+    // again UNDER the lock, so the loser of the race finds the envelope
+    // the winner just wrote and takes the unlock path instead of minting
+    // over it.
+    withSecretsLock(vault, () => {
+      if (!isEnvelopeFile(kp)) wrapKeyfileAtPath(kp, passphrase, loadOrCreateKey(kp));
+    });
+    // The wrap wrote the envelope but held nothing: verify-and-hold the
+    // key here, so the first unlock leaves THIS process unlocked - an
+    // unlock that left the process locked would fail the very remedy the
+    // locked-store refusal names.
+    unlockKeyfileAtPath(kp, passphrase);
+  }
+  audit(vault, ctx, "secret_unlocked", "keyfile", { keyfile_was_wrapped: wrapped });
+}
+
+/**
+ * Lock: clear this process's held key and land the no-values custody
+ * record. Strictly process-local - there is no daemon, so every other
+ * CLI invocation and the MCP server were already locked. A store whose
+ * keyfile was never wrapped has nothing to lock, and saying `secret
+ * locked` there would record a protection that does not exist, so it
+ * refuses by name.
+ */
+export function lockSecretKeyfile(vault: string, ctx: SecretAuditContext): void {
+  assertVaultIdentityForWrite(vault);
+  const kp = keyPath(vault);
+  if (!isEnvelopeFile(kp)) {
+    throw new Error(`secret lock: the keyfile is not passphrase-wrapped, nothing to lock: ${kp}`);
+  }
+  clearHeldKey(kp);
+  audit(vault, ctx, "secret_locked", "keyfile", {});
+}
+
+/**
  * The paths whose owner-only protection `set` requires before it stores
  * material: the directory and the keyfile, which `loadOrCreateKey` has
  * just ensured exist, and the ciphertext store ONLY when it already
@@ -284,7 +412,7 @@ function toMetadata(name: string, stored: StoredSecret): SecretMetadata {
   };
 }
 
-function readStore(vault: string): SecretsFile {
+export function readStore(vault: string): SecretsFile {
   const path = storePath(vault);
   if (!existsSync(path)) return { version: SECRETS_SCHEMA_VERSION, secrets: {} };
   // Windows: a store that came in with a copied vault may carry an ACL
@@ -321,7 +449,7 @@ function readStore(vault: string): SecretsFile {
   };
 }
 
-function writeStore(vault: string, file: SecretsFile): void {
+export function writeStore(vault: string, file: SecretsFile): void {
   // Key creation also creates the 0700 directory.
   loadOrCreateKey(keyPath(vault));
   const path = storePath(vault);

@@ -22,6 +22,7 @@ import {
 import { BrainConfigError } from "../core/brain/policy/errors.ts";
 import { EGRESS_OUTCOME, redactForEgress } from "../core/egress/guard.ts";
 import { listSecretReferences } from "../core/secret-ref.ts";
+import { listNamedSecretAvailability, namedSecretAvailable } from "../core/secret-resolver.ts";
 import { BRAIN_INDEX_REL } from "../core/brain/paths.ts";
 import { ensureVaultCurrent } from "../core/maintenance/ensure-current.ts";
 import { checkSelfHealUpgrade } from "../core/maintenance/self-heal-upgrade-state.ts";
@@ -52,6 +53,7 @@ import { installMcpFaultGuard } from "./mcp-fault-guard.ts";
 import { handleVaultSubcommand } from "./vault.ts";
 import {
   NoVaultConfiguredError,
+  normalizeFlagString,
   requireVault,
   resolveSemanticConfigState,
   sortedReplacer,
@@ -610,7 +612,13 @@ async function cmdExportConfig(argv: string[]): Promise<number> {
 
 async function cmdSecrets(argv: string[]): Promise<number> {
   if (argv.length === 0 || argv[0] === "-h" || argv[0] === "--help") {
-    process.stdout.write("usage: o2b secrets list|status [args...]\n");
+    // The one clarification the two surfaces cannot state inline: without
+    // --vault the fallback reads the reference name itself, so a store
+    // name and its env-var spelling can disagree without either lying.
+    process.stdout.write(
+      "usage: o2b secrets list|status [args...]\n" +
+        "Without --vault, the env fallback reads the reference name verbatim, case-sensitively.\n",
+    );
     return argv.length === 0 ? 2 : 0;
   }
   const verb = argv[0]!;
@@ -630,6 +638,7 @@ function cmdSecretsList(argv: string[]): number {
   const { flags, positional } = parseFlags(argv, {
     config: { type: "string" },
     json: { type: "boolean" },
+    vault: { type: "string" },
   });
   if (positional.length > 0) {
     process.stderr.write(
@@ -638,7 +647,14 @@ function cmdSecretsList(argv: string[]): number {
     return 2;
   }
   const discovery = discoverConfig(flags["config"] as string | undefined);
-  const refs = listSecretReferences(discovery.data, process.env);
+  // With `--vault`, availability joins the vault's custody store (metadata
+  // only - a locked envelope still counts); without it, the env-only
+  // lookup exactly as before.
+  const vault = normalizeFlagString(flags["vault"]);
+  const refs =
+    vault !== null
+      ? listNamedSecretAvailability(vault, discovery.data)
+      : listSecretReferences(discovery.data, process.env);
   if (flags["json"]) {
     process.stdout.write(
       JSON.stringify(
@@ -649,6 +665,10 @@ function cmdSecretsList(argv: string[]): number {
             config_key: ref.configKey,
             name: ref.name,
             available: ref.available,
+            // Present only on a reference the grammar cannot spell - a
+            // value that refuses at use time no matter what the store or
+            // the environment holds (additive-only row shape).
+            ...(ref.invalid === true ? { invalid: true } : {}),
           })),
         },
         null,
@@ -658,9 +678,9 @@ function cmdSecretsList(argv: string[]): number {
     return 0;
   }
   for (const ref of refs) {
-    process.stdout.write(
-      `${ref.configKey}: ${ref.name} (${ref.available ? "available" : "missing"})\n`,
-    );
+    const state =
+      ref.invalid === true ? "invalid reference" : ref.available ? "available" : "missing";
+    process.stdout.write(`${ref.configKey}: ${ref.name} (${state})\n`);
   }
   return 0;
 }
@@ -669,6 +689,7 @@ function cmdSecretsStatus(argv: string[]): number {
   const { flags, positional } = parseFlags(argv, {
     config: { type: "string" },
     json: { type: "boolean" },
+    vault: { type: "string" },
   });
   if (positional.length !== 1) {
     process.stderr.write("error: secrets status requires exactly one secret name\n");
@@ -676,7 +697,12 @@ function cmdSecretsStatus(argv: string[]): number {
   }
   void flags["config"];
   const name = positional[0]!;
-  const available = Boolean(process.env[name]);
+  // With `--vault`, a store-held name counts as available from metadata
+  // alone (a locked envelope still counts, no decrypt); without it, the
+  // env-only lookup exactly as before. The exit-code contract is
+  // unchanged: available exits 0, missing exits 1.
+  const vault = normalizeFlagString(flags["vault"]);
+  const available = vault !== null ? namedSecretAvailable(vault, name) : Boolean(process.env[name]);
   if (flags["json"]) {
     process.stdout.write(JSON.stringify({ name, available }, null, 2) + "\n");
   } else {
@@ -1217,7 +1243,10 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
     (rest[0] === "-h" || rest[0] === "--help") &&
     command !== "aider" &&
     command !== "brain" &&
-    command !== "vault"
+    command !== "vault" &&
+    // `secrets` has its own two-line help (the env fallback's name read
+    // is spelled there), so the generic URL stub would only bury it.
+    command !== "secrets"
   ) {
     process.stdout.write(`${command}: see https://github.com/itechmeat/open-second-brain\n`);
     if (command === "uninstall") {

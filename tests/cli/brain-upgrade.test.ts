@@ -89,6 +89,12 @@ describe("brain upgrade", () => {
     expect(r.returncode).toBe(0);
     expect(r.stdout).toMatch(/run_id: upgrade-/);
     expect(r.stdout).toContain("Brain/_BRAIN.md");
+    // The snapshot line names the artifact vault-relative: the absolute
+    // location is machine-derived (state the vault never supplied), and
+    // the run id printed directly above already pins the file name.
+    const runId = /run_id: (upgrade-\S+)/.exec(r.stdout)![1]!;
+    expect(r.stdout).toContain(`snapshot: Brain/.snapshots/${runId}.tar.zst`);
+    expect(r.stdout).not.toContain(tmp);
     // Post-apply: the file is now the canonical template body, not
     // the stale copy.
     const body = readFileSync(join(vault, "Brain", "_BRAIN.md"), "utf8");
@@ -165,6 +171,22 @@ describe("brain upgrade", () => {
     expect(payload.files.some((f) => f.path === "Brain/_BRAIN.md" && f.status === "update")).toBe(
       true,
     );
+  });
+
+  test("--json --dry-run carries the plan digest (t_18fda844)", async () => {
+    await bootstrap();
+    writeFileSync(join(vault, "Brain", "_BRAIN.md"), "stale\n");
+    const first = await runCli(["brain", "upgrade", "--vault", vault, "--dry-run", "--json"], {
+      env: { OPEN_SECOND_BRAIN_CONFIG: config },
+    });
+    expect(first.returncode).toBe(0);
+    const payload = JSON.parse(first.stdout) as { digest: string };
+    expect(payload.digest).toMatch(/^[0-9a-f]{64}$/);
+    // The seal binds the plan, not the moment it was rendered.
+    const second = await runCli(["brain", "upgrade", "--vault", vault, "--dry-run", "--json"], {
+      env: { OPEN_SECOND_BRAIN_CONFIG: config },
+    });
+    expect((JSON.parse(second.stdout) as { digest: string }).digest).toBe(payload.digest);
   });
 
   test("a missing _BRAIN.md renders as an update from absent (text and JSON)", async () => {

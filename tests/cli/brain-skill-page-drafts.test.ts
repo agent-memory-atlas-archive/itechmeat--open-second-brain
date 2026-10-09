@@ -12,7 +12,7 @@
  *     skills root.
  */
 
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -109,8 +109,40 @@ test("page-draft --json stages a pending proposal inside the vault", async () =>
   expect(r.returncode).toBe(0);
   const payload = JSON.parse(r.stdout) as { outcome: string; slug: string; path: string };
   expect(payload.outcome).toBe("created");
-  expect(payload.path.startsWith(join(vault, "Brain"))).toBe(true);
-  expect(existsSync(join(skillsRoot, DRAFT.name, "SKILL.md"))).toBe(false);
+  // Vault-relative, like the distill and MCP surfaces: the absolute host
+  // path is the vault prefix (operator-supplied) composed with a
+  // machine-derived subtree, and output that lands in model context
+  // carries neither.
+  expect(payload.path.startsWith("Brain/skill-proposals/pending/")).toBe(true);
+  expect(existsSync(join(vault, payload.path))).toBe(true);
+});
+
+test("a blank required payload field refuses with the stable prefix and no stack trace", async () => {
+  // S17: a core refusal on the commit path escaped uncaught, and the
+  // runner dumped a raw stack trace with machine-derived source paths -
+  // no stable prefix, no refusal an agent could match on.
+  const r = await run([
+    "page-draft",
+    PAGE,
+    "--payload",
+    JSON.stringify({ ...DRAFT, description: "" }),
+  ]);
+  expect(r.returncode).toBe(1);
+  expect(r.stderr).toContain("brain skill-proposals page-draft:");
+  expect(r.stderr).toContain("$.description");
+  expect(r.stderr).toContain("must be a non-empty string");
+  expect(r.stderr).not.toContain("\n    at ");
+  expect(r.stderr).not.toContain("response-shape.ts");
+});
+
+test("a page that does not exist refuses with the stable prefix and no stack trace", async () => {
+  const r = await run(["page-draft", "notes/absent-page.md", "--payload", JSON.stringify(DRAFT)]);
+  expect(r.returncode).toBe(1);
+  expect(r.stderr).toContain(
+    "brain skill-proposals page-draft: no such vault page: notes/absent-page.md",
+  );
+  expect(r.stderr).not.toContain("\n    at ");
+  expect(r.stderr).not.toContain("skill-page-drafts.ts");
 });
 
 test("page-draft without a payload is a usage error", async () => {
@@ -143,4 +175,52 @@ test("the MCP tool plans, drafts, and accepts into the configured skills root", 
   const skillFile = join(skillsRoot, DRAFT.name, "SKILL.md");
   expect(accepted.skillPath).toBe(skillFile);
   expect(readFileSync(skillFile, "utf8")).toContain(`name: ${DRAFT.name}`);
+});
+
+describe("page-draft think-block strip (t_dac8bf7e)", () => {
+  test("a <think>-prefixed payload succeeds, names the strip, and stages the same draft", async () => {
+    const r = await run([
+      "page-draft",
+      PAGE,
+      "--payload",
+      `<think>shaping the draft</think>${JSON.stringify(DRAFT)}`,
+      "--json",
+    ]);
+    expect(r.returncode).toBe(0);
+    const payload = JSON.parse(r.stdout) as { outcome: string; slug: string; note?: string };
+    expect(payload.outcome).toBe("created");
+    expect(payload.note).toContain("<think>");
+    // Staged inside the vault only - the SKILL.md is still not materialized.
+    expect(existsSync(join(skillsRoot, DRAFT.name, "SKILL.md"))).toBe(false);
+  });
+
+  test("text mode names the strip too - never a silent strip", async () => {
+    const r = await run([
+      "page-draft",
+      PAGE,
+      "--payload",
+      `<think>shaping the draft</think>${JSON.stringify(DRAFT)}`,
+    ]);
+    expect(r.returncode).toBe(0);
+    expect(r.stdout).toContain("<think>");
+  });
+
+  test("garbage still refuses with the plain message", async () => {
+    const r = await run(["page-draft", PAGE, "--payload", "not json", "--json"]);
+    expect(r.returncode).not.toBe(0);
+    expect(r.stderr).toContain("brain skill-proposals page-draft: payload must be valid JSON");
+  });
+
+  test("a payload that still does not parse after the strip names the attempt", async () => {
+    const r = await run(["page-draft", PAGE, "--payload", "<think>r</think>not json", "--json"]);
+    expect(r.returncode).not.toBe(0);
+    expect(r.stderr).toContain("<think>");
+  });
+
+  test("a clean payload's --json output carries no note key", async () => {
+    const r = await run(["page-draft", PAGE, "--payload", JSON.stringify(DRAFT), "--json"]);
+    expect(r.returncode).toBe(0);
+    const payload = JSON.parse(r.stdout) as Record<string, unknown>;
+    expect("note" in payload).toBe(false);
+  });
 });

@@ -122,9 +122,13 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
       [
         command("list", "List $secret:NAME references found in the config", [
           flag("config", "string"),
+          flag("vault", "string"),
+          flag("json", "boolean"),
         ]),
         command("status", "Report whether each referenced secret resolves", [
           flag("config", "string"),
+          flag("vault", "string"),
+          flag("json", "boolean"),
         ]),
       ],
     ),
@@ -303,7 +307,10 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
         command("label", "Assign, remove, show or suggest controlled-vocabulary labels"),
         command("attr", "Assign, remove, or show typed-page attribute fields"),
         command("tiers", "Check, restore, or accept identity-field drift"),
-        command("secret", "Capability-gated secret custody: set, list, rm, run"),
+        command(
+          "secret",
+          "Capability-gated secret custody: set, list, rm, run, lock, unlock, export, import",
+        ),
         command(
           "maintenance",
           "Quiet-window, lease-guarded heavy maintenance lane",

@@ -39,6 +39,12 @@ import {
   type EmbeddingPriceOverride,
 } from "./embeddings/pricing.ts";
 import { SearchError } from "./types.ts";
+import { isSecretReferenceValue, resolveNamedSecret } from "../secret-resolver.ts";
+import { SecretReferenceError } from "../secret-ref.ts";
+import {
+  SecretStoreKeyfileMissingError,
+  SecretStoreLockedError,
+} from "../brain/secrets/envelope.ts";
 import type {
   ResolvedEmbeddingConfig,
   ResolvedFreshenConfig,
@@ -729,10 +735,43 @@ function resolveRegistryProvider(
 ): ExpandedProvider | null {
   if (rawProvider === null || BUILTIN_PROVIDERS.has(rawProvider)) return null;
   try {
-    return expandRegisteredProvider(rawProvider, loadProviderRegistry(vault), env);
-  } catch {
+    // The vault's custody store joins the probe (store first, reference-
+    // shaped probe entries resolved) so a registered provider's key can
+    // live in the store; without it the probe reads env exactly as before.
+    return expandRegisteredProvider(rawProvider, loadProviderRegistry(vault), env, {
+      secretsVault: vault,
+    });
+  } catch (err) {
+    // The resolver's named refusals are ANSWERS, not expansion misses: a
+    // locked store, a missing keyfile, or a malformed reference in a probe
+    // entry surfaces by name, because swallowing it here returned null and
+    // made `parseProvider` claim "not a registered provider" for a name that
+    // IS registered - with the implied remedy (fix the name) wrong. Only
+    // a genuinely broken registry file stays fail-soft.
+    if (
+      err instanceof SecretStoreLockedError ||
+      err instanceof SecretStoreKeyfileMissingError ||
+      err instanceof SecretReferenceError
+    ) {
+      throw err;
+    }
     return null;
   }
+}
+
+/**
+ * Resolve one credential VALUE read from env or config for `vault`: a
+ * `$secret:NAME` reference resolves through the custody store (store
+ * first, env fallback), surfacing the same named locked/reference
+ * refusals the registry probe beside it raises; any other value passes
+ * through untouched, byte-identical to the pre-routing read. This is the
+ * routing the explicit `embedding_api_key` read and the cross-encoder
+ * rerank env-key read go through, so every key inside one resolved
+ * config resolves by one rule.
+ */
+function resolveCredentialValue(vault: string, value: string | null): string | null {
+  if (value === null || !isSecretReferenceValue(value)) return value;
+  return resolveNamedSecret(vault, value.trim());
 }
 
 /**
@@ -857,7 +896,10 @@ export function resolveSearchConfig(opts: {
     "OPEN_SECOND_BRAIN_EMBEDDING_MODEL",
     "embedding_model",
   );
-  const explicitApiKey = envOrConfig(env, config, EMBEDDING_KEY_ENV, EMBEDDING_KEY_CONFIG);
+  const explicitApiKey = resolveCredentialValue(
+    opts.vault,
+    envOrConfig(env, config, EMBEDDING_KEY_ENV, EMBEDDING_KEY_CONFIG),
+  );
   // Explicit config/env always wins over the registry profile's fields.
   const baseUrl = explicitBaseUrl ?? registryExpansion?.baseUrl ?? null;
   // The plain-http opt-out binds to the URL the operator wrote down: the
@@ -1048,7 +1090,13 @@ export function resolveSearchConfig(opts: {
     envOrConfig(env, config, "OPEN_SECOND_BRAIN_SEARCH_RERANK_ENV_KEY", "search_rerank_env_key") ??
     rerankProfile?.envKey ??
     null;
-  const rerankApiKey = rerankEnvKey !== null ? (env[rerankEnvKey] ?? null) : null;
+  // Routed through the same value resolver as the explicit embedding key:
+  // a reference-shaped env value resolves through the custody store, a
+  // plain value passes byte-identically.
+  const rerankApiKey = resolveCredentialValue(
+    opts.vault,
+    rerankEnvKey !== null ? (env[rerankEnvKey] ?? null) : null,
+  );
   const rerankTopK = parseInteger(
     envOrConfig(env, config, "OPEN_SECOND_BRAIN_SEARCH_RERANK_TOP_K", "search_rerank_top_k"),
     DEFAULTS.rerankTopK,
