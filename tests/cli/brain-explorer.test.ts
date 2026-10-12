@@ -282,14 +282,15 @@ describe("o2b brain explorer (live)", () => {
 
   test("port in use exits 1 with a friendly message", async () => {
     await bootstrap();
-    const port = pickPort();
-    // Hold the port from inside the test process so the CLI hits
-    // EADDRINUSE.
+    // Hold a port the OS picked from inside the test process so the CLI
+    // hits EADDRINUSE; a random pick can collide with a port another
+    // process already holds, and then the blocker itself fails to bind.
     const blocker = Bun.serve({
       hostname: "127.0.0.1",
-      port,
+      port: 0,
       fetch: () => new Response("blocker"),
     });
+    const port = blocker.port;
     try {
       const r = await runCli(["brain", "explorer", "--vault", vault, "--port", String(port)], {
         env: { OPEN_SECOND_BRAIN_CONFIG: config },

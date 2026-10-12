@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.81.1] - 2026-10-12
+
+### Fixed
+
+- **The snapshot exclusion no longer depends on the shape of a directory entry.** `createSnapshot` lists the top-level `Brain/` entries with `readdirSync(dir, { encoding: "buffer" })` and drops `.snapshots` and `.artifacts` by name. The name was read with `toString()`, which is right for a `Buffer` but renders a bare `Uint8Array` as comma-joined byte values (`"46,100,..."`); on a runtime that returns that shape nothing matched, `.snapshots` was packed into every archive, and each dream snapshot carried its predecessors until a run outgrew its timeout. Entries now decode through `Buffer.from`, which reads either shape, and tests pin both the archive members and the bare `Uint8Array` decode. Bun 1.4.0 and 1.4.2 on Linux return `Buffer` entries, so vaults there were not affected. Reported and fixed by @Iversondwx in #243.
+- **The explorer's port-in-use test no longer collides on busy runners.** It held a random port and failed when another process already owned it; it now holds a port the OS assigns.
+
+### Changed
+
+- **Dependencies:** `oxfmt` 0.72.0, `oxlint` 1.87.0, `@types/node` 22.20.5 and `@node-rs/jieba` 2.0.4; CI actions `actions/upload-artifact` 7.0.2 and `hashgraph-online/ai-plugin-scanner-action` 1.2.772.
+
 ## [1.81.0] - 2026-10-11
 
 Open Second Brain 1.81.0 is the answer-trust release: it narrows the gap between what an agent was given and what its answer can be believed on. A Stop-hook step now checks the quotations in the assistant's own answer against the note cited for them or the evidence the injection ledger actually delivered, a stated claim can name the context-pack sample it drew on and read the receipt and outcome provenance back, trusted local-file ingest keeps the source's bytes in a durable content-addressed archive instead of trusting a file to stay where it was, and a record with no session is read as no-session everywhere instead of pooling into one phantom bucket. A repair lane closes the outstanding review findings: attribute narrowing in search no longer silently excludes documents whose indexed snapshot has gone stale, and the wave's own review hardened the annotation channel, the provenance reach and the archive's write path.
@@ -8449,6 +8460,7 @@ plugin config (vault field)`, and exits with a clear
 - Sandbox vault and plugin manifest fixtures for tests.
 - GitHub release workflow for tag-based and manually dispatched releases.
 
+[1.81.1]: https://github.com/itechmeat/open-second-brain/compare/v1.81.0...v1.81.1
 [1.81.0]: https://github.com/itechmeat/open-second-brain/compare/v1.80.0...v1.81.0
 [1.80.0]: https://github.com/itechmeat/open-second-brain/compare/v1.79.0...v1.80.0
 [1.79.0]: https://github.com/itechmeat/open-second-brain/compare/v1.78.0...v1.79.0

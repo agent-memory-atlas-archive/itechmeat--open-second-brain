@@ -33,7 +33,9 @@ import { bootstrapBrain } from "../../../src/core/brain/init.ts";
 import { brainDirs } from "../../../src/core/brain/paths.ts";
 import {
   BrainSnapshotError,
+  bufferEntryName,
   createSnapshot,
+  isSnapshotExcludedEntry,
   sortedMembers,
 } from "../../../src/core/brain/snapshot.ts";
 import { system32Tool } from "../../../src/core/brain/secrets/owner-acl.ts";
@@ -168,4 +170,57 @@ describe("sortedMembers", () => {
       }
     },
   );
+});
+
+describe("the entries the snapshot family never touches", () => {
+  /**
+   * `.snapshots` and `.artifacts` are documented as never archived: the first
+   * because archiving the archive home makes every snapshot carry its
+   * predecessors and grow without bound, the second because it is ephemeral
+   * cache nobody wants restored.
+   */
+  test("the archive carries neither .snapshots nor .artifacts", () => {
+    const dirs = brainDirs(vault);
+    const snapshots = join(dirs.brain, ".snapshots");
+    const artifacts = join(dirs.brain, ".artifacts");
+    mkdirSync(snapshots, { recursive: true });
+    writeFileSync(join(snapshots, "dream-prior.tar.zst"), "a prior archive");
+    mkdirSync(artifacts, { recursive: true });
+    writeFileSync(join(artifacts, "cache.json"), "{}");
+    writeFileSync(join(dirs.brain, "kept.md"), "kept");
+
+    const res = createSnapshot(vault, "dream-excluded", { reason: DREAM });
+    const members = listSnapshotArchive(res.path)
+      .split(/\r?\n/)
+      .map((l) => l.replace(/\/$/, ""))
+      .filter(Boolean);
+
+    expect(members).toContain("Brain/kept.md");
+    expect(members.filter((m) => m.includes(".snapshots"))).toEqual([]);
+    expect(members.filter((m) => m.includes(".artifacts"))).toEqual([]);
+  });
+
+  /**
+   * Bun and Node hand back `Buffer` entries, so the archive test above
+   * never sees a bare `Uint8Array`, and reverting the decoder to
+   * `e.toString()` would leave it green. These two feed a bare `Uint8Array`
+   * straight to the decoders so that shape is pinned rather than assumed.
+   */
+  test("a bare Uint8Array entry decodes to its name, not to byte values", () => {
+    const excluded = new Uint8Array(new TextEncoder().encode(".snapshots"));
+    expect(Buffer.isBuffer(excluded)).toBe(false);
+    expect(bufferEntryName(excluded)).toBe(".snapshots");
+    expect(isSnapshotExcludedEntry(bufferEntryName(excluded))).toBe(true);
+
+    const kept = new Uint8Array(new TextEncoder().encode("kept.md"));
+    expect(bufferEntryName(kept)).toBe("kept.md");
+    expect(isSnapshotExcludedEntry(bufferEntryName(kept))).toBe(false);
+  });
+
+  test("a bare Uint8Array holding multibyte UTF-8 decodes whole", () => {
+    const name = "笔记-2026.md";
+    const arr = new Uint8Array(new TextEncoder().encode(name));
+    expect(bufferEntryName(arr)).toBe(name);
+    expect(isSnapshotExcludedEntry(bufferEntryName(arr))).toBe(false);
+  });
 });

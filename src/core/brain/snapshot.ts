@@ -776,7 +776,7 @@ export function createSnapshot(
   let topEntries: Buffer[];
   try {
     topEntries = readdirSync(dirs.brain, { encoding: "buffer" }).filter(
-      (e) => !isSnapshotExcludedEntry(e.toString()),
+      (e) => !isSnapshotExcludedEntry(bufferEntryName(e)),
     );
   } catch (err) {
     discardStoreArchive(derivedStore, vault, runId);
@@ -903,8 +903,24 @@ function logSnapshotEvent(
   }
 }
 
+/**
+ * Decode one `readdirSync(..., { encoding: "buffer" })` entry to its UTF-8
+ * name.
+ *
+ * The exclusion below is a string comparison, so it holds only while the
+ * entry decodes to its name. Bun and Node document `Buffer` entries, whose
+ * `toString()` is the name, but a runtime that hands back a bare
+ * `Uint8Array` renders comma-joined byte values (`"46,100,..."`) instead:
+ * nothing matches, and `.snapshots` - the archive home - is packed into
+ * every archive, so each one carries its predecessors. `Buffer.from`
+ * decodes either shape.
+ */
+export function bufferEntryName(e: Uint8Array | Buffer): string {
+  return Buffer.from(e).toString("utf8");
+}
+
 /** True for a top-level `Brain/` entry the snapshot family never touches. */
-function isSnapshotExcludedEntry(name: string): boolean {
+export function isSnapshotExcludedEntry(name: string): boolean {
   return BRAIN_SNAPSHOT_EXCLUDED_ENTRIES.includes(name);
 }
 
