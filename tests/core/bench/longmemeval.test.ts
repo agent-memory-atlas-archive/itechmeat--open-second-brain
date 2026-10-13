@@ -23,6 +23,7 @@ import {
   parseLongMemEvalDataset,
   scoreLongMemEvalRecall,
 } from "../../../src/core/bench/longmemeval.ts";
+import { sampleLongMemEvalEntries } from "../../../src/core/bench/longmemeval-sample.ts";
 import { benchSearchConfig, runMemoryBench } from "../../../src/core/bench/phases.ts";
 import { BENCH_REPORT_SCHEMA, type BenchPinnedKnobs } from "../../../src/core/bench/types.ts";
 
@@ -508,10 +509,10 @@ describe("scoreLongMemEvalRecall", () => {
 });
 
 describe("the longmemeval suite", () => {
-  test("is registered with the embeddings capability", () => {
+  test("is registered with the embeddings and sampling capabilities", () => {
     const registration = benchSuite("longmemeval");
     expect(registration).toBeDefined();
-    expect(registration!.capabilities).toEqual({ embeddings: true });
+    expect(registration!.capabilities).toEqual({ embeddings: true, sampling: true });
     expect(typeof registration!.loader).toBe("function");
   });
 
@@ -752,5 +753,138 @@ describe("the longmemeval suite", () => {
     expect("question" in first).toBe(false);
     expect("answer" in first).toBe(false);
     expect("gold" in first).toBe(false);
+  }, 20_000);
+});
+
+/**
+ * Seeded sampling through the loader (wiring-shipped-seams wave,
+ * t_4501c662): sampling happens PRE-conversion on the parsed entries,
+ * the receipt carries the sample beside the abstention count, and the
+ * no-options path stays byte-identical to the shipped loader.
+ */
+describe("seeded sampling", () => {
+  /**
+   * A synthetic dataset: six questions across six types plus one
+   * abstention, all sharing the minimal valid entry's haystack shape.
+   */
+  function writeSyntheticDataset(): string {
+    const dir = mkdtempSync(join(tmpdir(), "o2b-longmemeval-dataset-"));
+    dirs.push(dir);
+    const path = join(dir, "synthetic.json");
+    const entries = [
+      entry({}),
+      entry({ q_id: "q2", question_type: "multi-hop" }),
+      entry({ q_id: "q3", question_type: "temporal-reasoning" }),
+      entry({ q_id: "q4", question_type: "knowledge-update" }),
+      entry({ q_id: "q5", question_type: "single-session-user" }),
+      entry({ q_id: "q6", question_type: "multi-session" }),
+      entry({ q_id: "abs-1", question_type: "abstention", answer_session_ids: [] }),
+    ];
+    writeFileSync(path, `${JSON.stringify(entries)}\n`, "utf8");
+    return path;
+  }
+
+  test("the no-options loader path returns the shipped conversion", () => {
+    const plain = loadLongMemEvalFixture(SAMPLE);
+    expect(loadLongMemEvalFixture(SAMPLE, {})).toEqual(plain);
+    expect(loadLongMemEvalFixture(SAMPLE, undefined)).toEqual(plain);
+    // The receipt carries no sample fields on the off path.
+    expect(plain.receipt).toEqual({ abstention_excluded: 1 });
+  });
+
+  test("with sample options the sampler runs pre-conversion and the receipt carries the sample", () => {
+    const datasetPath = writeSyntheticDataset();
+    const options = { sample: { seed: "seed-1", cap: 3 } as const };
+    const conversion = loadLongMemEvalFixture(datasetPath, options);
+    // Sampling provably happened BEFORE conversion: the converted
+    // fixture's question count is the sampled count, not the dataset's.
+    const dataset = parseLongMemEvalDataset(JSON.parse(readFileSync(datasetPath, "utf8")));
+    const direct = sampleLongMemEvalEntries(dataset.entries, options.sample);
+    expect(conversion.fixture.questions).toHaveLength(direct.receipt.selected);
+    expect(conversion.fixture.questions.map((q) => q.id)).toEqual(
+      direct.entries.map((e) => e.q_id),
+    );
+    // The receipt mirrors the abstention precedent and adds the sample
+    // beside it. The abstention count is the SAMPLER's - the exclusion
+    // happened before selection, so the conversion's own count is 0.
+    expect(conversion.receipt).toEqual({
+      abstention_excluded: 1,
+      sample_population: direct.receipt.population,
+      sample_selected: direct.receipt.selected,
+      sample_strata: direct.receipt.strata,
+    });
+    expect(conversion.receipt.sample_population).toBe(6);
+    expect(conversion.receipt.sample_selected).toBe(3);
+    // Same options, same subset - the loader adds no nondeterminism.
+    expect(loadLongMemEvalFixture(datasetPath, options).fixture).toEqual(conversion.fixture);
+  });
+
+  test("a sampled run reports the sampled count through the longmemeval family", async () => {
+    const datasetPath = writeSyntheticDataset();
+    const { fixture, receipt } = loadLongMemEvalFixture(datasetPath, {
+      sample: { seed: "seed-1", cap: 3 },
+    });
+    const runsDir = mkdtempSync(join(tmpdir(), "o2b-longmemeval-runs-"));
+    dirs.push(runsDir);
+    const report = await runMemoryBench({
+      fixture,
+      runsDir,
+      suite: "longmemeval",
+      suiteReceipt: receipt,
+    });
+    expect(report.quality.total).toBe(3);
+    // The sampled bookkeeping - selected count, population and the
+    // per-stratum breakdown - rides the named family, so the report
+    // shows what the run's numbers cover. Frozen worked example: six
+    // one-per-type survivors at cap 3 give every stratum quota 0.5, and
+    // the three surplus seats go to the lexicographically first strata.
+    expect(report.longmemeval).toEqual({
+      recall_all_at_5: 1,
+      abstention_excluded: 1,
+      sample_population: 6,
+      sample_selected: 3,
+      sample_strata: [
+        { question_type: "knowledge-update", population: 1, selected: 1 },
+        { question_type: "multi-hop", population: 1, selected: 1 },
+        { question_type: "multi-session", population: 1, selected: 1 },
+        { question_type: "single-hop", population: 1, selected: 0 },
+        { question_type: "single-session-user", population: 1, selected: 0 },
+        { question_type: "temporal-reasoning", population: 1, selected: 0 },
+      ],
+    });
+    // And the family in the persisted report.json carries the same
+    // fields - the receipt is visible where an operator actually reads it.
+    const persisted = JSON.parse(
+      readFileSync(join(runsDir, report.run_id, "report.json"), "utf8"),
+    ) as { longmemeval: Record<string, unknown> };
+    const persistedFamily = persisted.longmemeval!;
+    expect(Object.keys(persistedFamily).toSorted()).toEqual([
+      "abstention_excluded",
+      "recall_all_at_5",
+      "sample_population",
+      "sample_selected",
+      "sample_strata",
+    ]);
+    expect(persistedFamily["sample_population"]).toBe(6);
+    expect(persistedFamily["sample_selected"]).toBe(3);
+    expect(persistedFamily["sample_strata"]).toEqual(report.longmemeval!.sample_strata);
+  }, 20_000);
+
+  test("a whole-dataset run's family carries no sample fields", async () => {
+    const datasetPath = writeSyntheticDataset();
+    const { fixture, receipt } = loadLongMemEvalFixture(datasetPath);
+    const runsDir = mkdtempSync(join(tmpdir(), "o2b-longmemeval-runs-"));
+    dirs.push(runsDir);
+    const report = await runMemoryBench({
+      fixture,
+      runsDir,
+      suite: "longmemeval",
+      suiteReceipt: receipt,
+    });
+    // Spread-omission, not manufactured zeros: the unsampled report's
+    // family names exactly the strict fields and nothing else. The key
+    // set is the pin, not the score.
+    expect(Object.keys(report.longmemeval!)).toEqual(["recall_all_at_5", "abstention_excluded"]);
+    expect(report.longmemeval!.abstention_excluded).toBe(1);
   }, 20_000);
 });

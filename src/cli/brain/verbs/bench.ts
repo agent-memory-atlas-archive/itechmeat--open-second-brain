@@ -20,6 +20,7 @@ import { loadReplayBenchFixture } from "../../../core/bench/replay.ts";
 import { runMemoryBench } from "../../../core/bench/phases.ts";
 import type {
   BenchPinnedKnobs,
+  BenchSampleRequest,
   BenchSuiteLoad,
   BenchSuiteRegistration,
 } from "../../../core/bench/types.ts";
@@ -28,7 +29,8 @@ import { CliError, fail, parse } from "../helpers.ts";
 
 const USAGE =
   "usage: o2b brain bench memory --fixture <name|path> [--suite <name>] [--pin <json>] " +
-  "[--recall-floor <n>] [--resume <run-id>] [--runs-dir <dir>] [--json]";
+  "[--recall-floor <n>] [--sample-seed <value>] [--sample-cap <n>] " +
+  "[--resume <run-id>] [--runs-dir <dir>] [--json]";
 
 const DEFAULT_RUNS_DIR = join(".open-second-brain", "bench-runs");
 const REPO_FIXTURE_DIR = join("tests", "fixtures", "bench");
@@ -66,7 +68,7 @@ const BENCH_SUITES = new Map<string, BenchSuiteRegistration>([
     LONGMEMEVAL_SUITE_NAME,
     Object.freeze({
       loader: loadLongMemEvalFixture,
-      capabilities: Object.freeze({ embeddings: true }),
+      capabilities: Object.freeze({ embeddings: true, sampling: true }),
     }),
   ],
   [
@@ -196,6 +198,7 @@ const BENCH_PIN_NESTED_KEYS: Readonly<Record<string, ReadonlyArray<string>>> = {
     "iterativeRecallEnabled",
     "iterativeRecallMaxRounds",
     "poolMultiplier",
+    "poolMaxPerSession",
     "selfTuningEnabled",
     "chainStopEnabled",
     "chainStopScore",
@@ -287,6 +290,40 @@ export function parseRecallFloorFlag(raw: string | undefined): number | undefine
   return value;
 }
 
+/**
+ * Parse the `--sample-seed` value: absent keeps the whole-dataset load;
+ * present it must be a non-empty string and pairs with `--sample-cap`.
+ * The seed is opaque - the sampler hashes it, so any string works and
+ * none is ever interpolated into a run id. The value is passed through
+ * UNTRIMMED on purpose: the sampler trims the seed in one place before
+ * hashing, so the CLI and the API path hash the same value for the same
+ * input. This surface only refuses a blank value by name, before any
+ * run state is created.
+ */
+export function parseSampleSeedFlag(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  if (raw.trim() === "") {
+    throw new CliError(
+      `brain bench memory: --sample-seed must be a non-empty string, got '${raw}'`,
+    );
+  }
+  return raw;
+}
+
+/**
+ * Parse the `--sample-cap` value: absent keeps the whole-dataset load;
+ * present it must be a positive integer - the bound on selected
+ * questions - and pairs with `--sample-seed`.
+ */
+export function parseSampleCapFlag(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (raw.trim() === "" || !Number.isInteger(value) || value <= 0) {
+    throw new CliError(`brain bench memory: --sample-cap must be a positive integer, got '${raw}'`);
+  }
+  return value;
+}
+
 export async function cmdBrainBench(argv: string[]): Promise<number> {
   if (argv[0] !== "memory") return fail(USAGE);
   const { flags } = parse(argv.slice(1), {
@@ -294,6 +331,8 @@ export async function cmdBrainBench(argv: string[]): Promise<number> {
     suite: { type: "string" },
     pin: { type: "string" },
     "recall-floor": { type: "string" },
+    "sample-seed": { type: "string" },
+    "sample-cap": { type: "string" },
     resume: { type: "string" },
     "runs-dir": { type: "string" },
     json: { type: "boolean" },
@@ -318,10 +357,39 @@ export async function cmdBrainBench(argv: string[]): Promise<number> {
     );
   }
 
+  // Sampling flags are LOADER options: validated (pair, values,
+  // capability) before the registry dispatch, so a refused request never
+  // reaches a loader and a sampling-capable loader receives
+  // `BenchSuiteLoadOptions { sample }`.
+  const sampleSeed = parseSampleSeedFlag(
+    typeof flags["sample-seed"] === "string" ? flags["sample-seed"] : undefined,
+  );
+  const sampleCap = parseSampleCapFlag(
+    typeof flags["sample-cap"] === "string" ? flags["sample-cap"] : undefined,
+  );
+  if ((sampleSeed === undefined) !== (sampleCap === undefined)) {
+    const loneFlag = sampleSeed !== undefined ? "--sample-seed" : "--sample-cap";
+    return fail(
+      "brain bench memory: --sample-seed and --sample-cap must be given together " +
+        `(sampling takes a seed and a cap; got only ${loneFlag})`,
+    );
+  }
+  const sample: BenchSampleRequest | undefined =
+    sampleSeed !== undefined && sampleCap !== undefined
+      ? { seed: sampleSeed, cap: sampleCap }
+      : undefined;
+  if (sample !== undefined && registration.capabilities.sampling !== true) {
+    return fail(
+      "brain bench memory: --sample-seed/--sample-cap need a suite that declares the " +
+        "sampling capability; " +
+        (suite === "" ? "no --suite was given" : `suite '${suite}' does not declare it`),
+    );
+  }
+
   // One dispatch for every suite: the registry entry owns loading and
   // declares what the suite may do; the capabilities and the loader's
   // conversion receipt ride BenchRunOptions.
-  const loaded = registration.loader(fixturePath);
+  const loaded = registration.loader(fixturePath, sample === undefined ? {} : { sample });
   const fixture = loaded.fixture;
   const runsDir = resolve(
     typeof flags["runs-dir"] === "string" && flags["runs-dir"].trim() !== ""
@@ -346,6 +414,7 @@ export async function cmdBrainBench(argv: string[]): Promise<number> {
     capabilities: registration.capabilities,
     ...(pinnedKnobs !== null ? { pinnedKnobs } : {}),
     ...(recallFloor !== undefined ? { recallFloor } : {}),
+    ...(sample !== undefined ? { sample } : {}),
     ...(loaded.receipt !== undefined ? { suiteReceipt: loaded.receipt } : {}),
     ...(resume !== undefined && resume !== "" ? { resume } : {}),
     ...(judgeCmd !== undefined ? { judgeCmd } : {}),
@@ -371,7 +440,16 @@ export async function cmdBrainBench(argv: string[]): Promise<number> {
   if (report.longmemeval !== undefined) {
     process.stdout.write(
       `longmemeval: recall_all@5 ${report.longmemeval.recall_all_at_5} ` +
-        `abstention_excluded ${report.longmemeval.abstention_excluded}\n`,
+        `abstention_excluded ${report.longmemeval.abstention_excluded}` +
+        // Present only on a sampled run, so the whole-dataset line is
+        // byte-identical to before. The population rides beside the
+        // selected count, so the line shows the share of the dataset
+        // the run covers (both fields are written together by the one
+        // spread site that emits the sampled family).
+        (report.longmemeval.sample_selected !== undefined
+          ? ` sample_population ${report.longmemeval.sample_population} sample_selected ${report.longmemeval.sample_selected}`
+          : "") +
+        "\n",
     );
   }
   process.stdout.write(`judge: ${report.judge.status}\n`);

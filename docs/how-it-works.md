@@ -1231,7 +1231,21 @@ semantic_weight·cosine + link_boost + recency_boost + entity_boost)`
   documents scored `parent·hop_decay^hop` (bounded by `search_max_hops`
   / `search_max_expansion_per_hit`); then MMR reranks the pool with a
   deterministic token-set similarity so near-duplicates do not crowd
-  the top (`search_mmr_lambda`, `1` disables). Header-anchored chunking
+  the top (`search_mmr_lambda`, `1` disables). An opt-in cap on the
+  pool keeps one group from filling the window the caller draws from
+  (`search_pool_max_per_session`, default `0` - off; since v1.83.0): a
+  row's group is its source import session (`session_ref` on imported
+  signal notes, `session_id` on handoff notes) or, when a note names
+  neither, its own path - all chunks of one note form one group, so
+  bench session notes and multi-chunk notes are capped too. The cap runs
+  after the caller's own filters, so only filter-passing rows consume a
+  group's quota and the cap never surfaces a row those filters would
+  withhold; it widens the pool rather than truncating it; a value at or
+  above the query's resolved pool width behaves as off; and when its
+  drops leave the window under-filled, one wider assemble pass re-runs
+  so the window refills from the groups the cap did not exhaust. A vault
+  whose notes each fit in one chunk is byte-identical with the knob on
+  or off. Header-anchored chunking
   indexes each chunk's heading breadcrumb in a dedicated FTS column
   (weighted below content) so a mid-document chunk keeps its topical
   anchor. Entity and heading layers populate on the next reindex.

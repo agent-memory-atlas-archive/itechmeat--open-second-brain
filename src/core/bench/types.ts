@@ -26,6 +26,7 @@ import type {
   ResolvedSearchConfig,
 } from "../search/types.ts";
 import type { VaultScopeRules } from "../vault-scope/defaults.ts";
+import type { LongMemEvalSampleStratum } from "./longmemeval-sample.ts";
 
 export const BENCH_REPORT_SCHEMA = "o2b.bench.v2";
 
@@ -166,6 +167,36 @@ export interface BenchSuiteCapabilities {
    * semantic lane.
    */
   readonly embeddings: boolean;
+  /**
+   * Whether the suite's loader accepts a seeded sampling request
+   * ({@link BenchSuiteLoadOptions.sample}). Absent means false: the
+   * sampling flags are refused for such a suite, naming it. Declared
+   * here, honored by the loader - a capability declaration alone is
+   * inert, exactly like {@link BenchSuiteCapabilities.embeddings}.
+   */
+  readonly sampling?: boolean;
+}
+
+/**
+ * A seeded sampling request for one suite load: select a deterministic,
+ * question-type-proportional subset of the dataset instead of running
+ * it whole. The seed is an opaque string (hashed, never interpolated
+ * into run ids); the cap is a positive integer bounding the selected
+ * questions. Part of the run identity: a resumed run whose sampling
+ * options changed fails the identity guard.
+ */
+export interface BenchSampleRequest {
+  readonly seed: string;
+  readonly cap: number;
+}
+
+/**
+ * Options the bench verb passes to a suite loader as its second,
+ * OPTIONAL parameter - a suite registered before an option existed
+ * keeps its one-parameter loader and simply never sees the request.
+ */
+export interface BenchSuiteLoadOptions {
+  readonly sample?: BenchSampleRequest;
 }
 
 /**
@@ -182,6 +213,16 @@ export interface BenchSuiteLoad {
 export interface BenchSuiteReceipt {
   /** LongMemEval-style abstention questions dropped at conversion time. */
   readonly abstention_excluded?: number;
+  /**
+   * Seeded-sampling bookkeeping, present only when the loader sampled:
+   * the population it chose from, the questions it selected, and the
+   * per-stratum breakdown. Mirrors the abstention precedent - a
+   * whole-dataset run carries no sample fields rather than a
+   * manufactured 0.
+   */
+  readonly sample_population?: number;
+  readonly sample_selected?: number;
+  readonly sample_strata?: ReadonlyArray<LongMemEvalSampleStratum>;
 }
 
 /**
@@ -191,7 +232,7 @@ export interface BenchSuiteReceipt {
  * a hard-coded branch chain.
  */
 export interface BenchSuiteRegistration {
-  readonly loader: (fixturePath: string) => BenchSuiteLoad;
+  readonly loader: (fixturePath: string, options?: BenchSuiteLoadOptions) => BenchSuiteLoad;
   readonly capabilities: BenchSuiteCapabilities;
 }
 
@@ -279,6 +320,26 @@ export interface BenchLongMemEvalFamily {
    * receipt - the count is then unknown, never a manufactured 0.
    */
   readonly abstention_excluded: number | null;
+  /**
+   * Questions the run's seeded sampler selected, taken from the run's
+   * conversion receipt. Present only when the run sampled, so a
+   * whole-dataset (or receipt-less) report serializes byte-identically
+   * to before.
+   */
+  readonly sample_selected?: number;
+  /**
+   * Population the run's seeded sampler chose from, taken from the
+   * run's conversion receipt. Present only when the run sampled, under
+   * the same spread-omission as `sample_selected`.
+   */
+  readonly sample_population?: number;
+  /**
+   * Per-stratum population/selected breakdown of the run's seeded
+   * sample, taken from the run's conversion receipt. Present only when
+   * the run sampled, under the same spread-omission as
+   * `sample_selected`.
+   */
+  readonly sample_strata?: ReadonlyArray<LongMemEvalSampleStratum>;
 }
 
 export interface BenchQuestionResult {
@@ -369,6 +430,14 @@ export interface BenchCheckpoint {
    */
   readonly pinned_knobs?: BenchPinnedKnobs;
   readonly knobs_hash?: string;
+  /**
+   * The seeded sampling request this run was created under, present only
+   * on a sampled run. The run-identity hash covers it, so a resumed run
+   * under different sampling options fails the guard; the field itself
+   * is spread-omitted on unsampled runs, keeping those checkpoints
+   * byte-identical to before.
+   */
+  readonly sample?: BenchSampleRequest;
   readonly created_at: string;
   readonly completed_phases: ReadonlyArray<BenchPhase>;
 }

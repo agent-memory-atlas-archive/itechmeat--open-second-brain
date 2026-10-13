@@ -923,6 +923,17 @@ export interface SearchOptions {
    */
   readonly maxHops?: number;
   /**
+   * Per-query per-source-session pool cap override (t_bb6ce095). Absent
+   * uses the resolved config default; `0` is the documented off value and
+   * forces the cap off for this query. Validated like the config key: a
+   * fractional, negative or non-finite override is refused by name
+   * (INVALID_INPUT) before the pipeline runs. A value at or above the
+   * pool width the query resolves cannot drop a row and behaves as off,
+   * while still keying the query cache - crossing that boundary can
+   * never serve a stale cached row.
+   */
+  readonly poolMaxPerSession?: number;
+  /**
    * Requested content-visibility scope (v3 / typed graph semantics).
    * Pages with no `visibility:` frontmatter are always returned;
    * a page that declares visibility values is returned only when this
@@ -1721,6 +1732,25 @@ export interface ResolvedRecallConfig {
    * construct this shape literally) reads as false.
    */
   readonly metadataBoostGateEnabled?: boolean;
+  /**
+   * Per-source-session pool cap (t_bb6ce095), resolved from
+   * `search_pool_max_per_session`. The maximum rows ONE group may
+   * contribute to the filtered candidate pool the caller's window is cut
+   * from. A row's group is its source import session (`session_ref`,
+   * else `session_id` frontmatter) or, when the note names neither, its
+   * own path - all chunks of one note form one group, which is what
+   * makes frontmatter-less bench session notes capable. The cap runs
+   * after the caller's own filters, so only filter-passing rows consume
+   * a quota, and it is removal-only: it never surfaces a row those
+   * filters would withhold. 0 is off: the phase never runs and no
+   * frontmatter reads are added, so results are byte-identical. A value
+   * at or above the pool width the query resolves cannot drop a row and
+   * is treated as off, while still folding into the search fingerprint -
+   * crossing that boundary can never serve a stale cached row. Absent
+   * (configs written before the knob construct this shape literally)
+   * reads as 0.
+   */
+  readonly poolMaxPerSession?: number;
 }
 
 /** What freshen-on-read does; see `src/core/search/freshen.ts`. */

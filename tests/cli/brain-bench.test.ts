@@ -10,14 +10,18 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { VERB_HELP } from "../../src/cli/brain/help-text.ts";
 import {
   benchSuite,
   benchSuiteNames,
   parseBenchPinnedKnobs,
   parseRecallFloorFlag,
+  parseSampleCapFlag,
+  parseSampleSeedFlag,
   registerBenchSuite,
 } from "../../src/cli/brain/verbs/bench.ts";
 import { parseBenchFixture } from "../../src/core/bench/fixture.ts";
+import type { BenchSuiteLoadOptions } from "../../src/core/bench/types.ts";
 import { runCli } from "../helpers/run-cli.ts";
 
 let tmp: string;
@@ -442,5 +446,299 @@ describe("bench knob pin and recall floor", () => {
     expect(parseRecallFloorFlag("0.35")).toBe(0.35);
     expect(() => parseRecallFloorFlag("")).toThrow(/got ''/);
     expect(() => parseRecallFloorFlag("-1")).toThrow(/got '-1'/);
+  });
+});
+
+/**
+ * The seeded sampling flags (wiring-shipped-seams wave, t_4501c662):
+ * `--sample-seed` and `--sample-cap` are a PAIR - refused singly and on
+ * any suite that does not declare the sampling capability - and
+ * together they reach the suite loader as
+ * `BenchSuiteLoadOptions { sample }`. Omitting both leaves today's CLI
+ * behavior byte-identical.
+ */
+describe("bench sampling flags", () => {
+  const SAMPLING_SUITE = "sampling-stub";
+  const SAMPLING_FIXTURE = parseBenchFixture({
+    name: "sampling-stub",
+    notes: [{ path: "Brain/notes/a.md", body: "alpha note" }],
+    questions: [
+      { id: "q1", category: "single_hop", query: "alpha", expected_paths: ["Brain/notes/a.md"] },
+    ],
+  });
+  /** Every loader invocation with the options object it received. */
+  const samplingLoaderCalls: Array<{ path: string; options: BenchSuiteLoadOptions }> = [];
+
+  registerBenchSuite(SAMPLING_SUITE, {
+    // The second parameter is OPTIONAL by contract: a suite registered
+    // before an option existed keeps its one-parameter loader and never
+    // sees the request. This stub declares it to record what arrives.
+    loader: (fixturePath: string, options?: BenchSuiteLoadOptions) => {
+      samplingLoaderCalls.push({ path: fixturePath, options: options ?? {} });
+      return { fixture: SAMPLING_FIXTURE };
+    },
+    capabilities: { embeddings: false, sampling: true },
+  });
+
+  beforeEach(() => {
+    samplingLoaderCalls.length = 0;
+  });
+
+  test("the sampling flag validators refuse garbage by name", () => {
+    expect(parseSampleSeedFlag(undefined)).toBeUndefined();
+    expect(parseSampleSeedFlag("run-42")).toBe("run-42");
+    // pr-251 L2: the parser validates but does not transform - the
+    // sampler trims the seed in one place before hashing, so the CLI and
+    // the API path hash the same value for the same input, and a padded
+    // seed reaches the loader verbatim.
+    expect(parseSampleSeedFlag("  seed-1  ")).toBe("  seed-1  ");
+    expect(() => parseSampleSeedFlag("   ")).toThrow(/--sample-seed/);
+    expect(parseSampleCapFlag(undefined)).toBeUndefined();
+    expect(parseSampleCapFlag("12")).toBe(12);
+    expect(() => parseSampleCapFlag("0")).toThrow(/got '0'/);
+    expect(() => parseSampleCapFlag("-2")).toThrow(/got '-2'/);
+    expect(() => parseSampleCapFlag("1.5")).toThrow(/got '1.5'/);
+    expect(() => parseSampleCapFlag("abc")).toThrow(/got 'abc'/);
+  });
+
+  test("--sample-seed alone is refused by name", async () => {
+    const out = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        "core-recall",
+        "--runs-dir",
+        runsDir,
+        "--sample-seed",
+        "seed-1",
+      ],
+      {},
+    );
+    expect(out.returncode).not.toBe(0);
+    expect(out.stderr).toContain("--sample-seed and --sample-cap must be given together");
+  });
+
+  test("--sample-cap alone is refused by name", async () => {
+    const out = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        "core-recall",
+        "--runs-dir",
+        runsDir,
+        "--sample-cap",
+        "4",
+      ],
+      {},
+    );
+    expect(out.returncode).not.toBe(0);
+    expect(out.stderr).toContain("--sample-seed and --sample-cap must be given together");
+  });
+
+  test("a non-positive or non-integer cap is refused naming the value", async () => {
+    for (const cap of ["0", "-2", "1.5", "abc"]) {
+      const out = await runCli(
+        [
+          "brain",
+          "bench",
+          "memory",
+          "--fixture",
+          "core-recall",
+          "--sample-seed",
+          "seed-1",
+          "--sample-cap",
+          cap,
+        ],
+        {},
+      );
+      expect(out.returncode).not.toBe(0);
+      expect(out.stderr).toContain(`--sample-cap must be a positive integer, got '${cap}'`);
+    }
+  });
+
+  test("an empty seed is refused naming the flag", async () => {
+    const out = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        "core-recall",
+        "--sample-seed",
+        "   ",
+        "--sample-cap",
+        "4",
+      ],
+      {},
+    );
+    expect(out.returncode).not.toBe(0);
+    expect(out.stderr).toContain("--sample-seed must be a non-empty string");
+  });
+
+  test("both flags without a sampling-capable suite are refused naming the suite", async () => {
+    for (const suite of ["locomo", "surfacing-replay"]) {
+      const out = await runCli(
+        [
+          "brain",
+          "bench",
+          "memory",
+          "--fixture",
+          "core-recall",
+          "--suite",
+          suite,
+          "--sample-seed",
+          "seed-1",
+          "--sample-cap",
+          "4",
+        ],
+        {},
+      );
+      expect(out.returncode).not.toBe(0);
+      expect(out.stderr).toContain(`suite '${suite}' does not declare it`);
+    }
+    // The no-suite default path has no sampling capability either.
+    const noSuite = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        "core-recall",
+        "--sample-seed",
+        "seed-1",
+        "--sample-cap",
+        "4",
+      ],
+      {},
+    );
+    expect(noSuite.returncode).not.toBe(0);
+    expect(noSuite.stderr).toContain("no --suite was given");
+  });
+
+  test("both flags with a sampling-capable suite reach the loader as a sample request", async () => {
+    const out = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        "core-recall",
+        "--suite",
+        SAMPLING_SUITE,
+        "--sample-seed",
+        "seed-1",
+        "--sample-cap",
+        "3",
+        "--runs-dir",
+        runsDir,
+        "--json",
+      ],
+      {},
+    );
+    expect(out.returncode).toBe(0);
+    expect(samplingLoaderCalls).toEqual([
+      {
+        path: join("tests", "fixtures", "bench", "core-recall.json"),
+        options: { sample: { seed: "seed-1", cap: 3 } },
+      },
+    ]);
+    const report = JSON.parse(out.stdout) as { fixture: string };
+    expect(report.fixture).toBe("sampling-stub");
+  }, 60_000);
+
+  test("omitting the flags passes empty load options - the off path is unchanged", async () => {
+    const out = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        "core-recall",
+        "--suite",
+        SAMPLING_SUITE,
+        "--runs-dir",
+        runsDir,
+        "--json",
+      ],
+      {},
+    );
+    expect(out.returncode).toBe(0);
+    expect(samplingLoaderCalls).toEqual([
+      { path: join("tests", "fixtures", "bench", "core-recall.json"), options: {} },
+    ]);
+  }, 60_000);
+
+  test("the longmemeval suite samples through the flags and pins the run identity", async () => {
+    // The committed sample carries 3 eligible questions across 3 types;
+    // a cap of 2 selects 2, the CLI line reports the sampled count, and
+    // the run checkpoint carries the sampling request - so a resumed run
+    // under different sampling options fails the identity guard.
+    const out = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        "longmemeval-sample",
+        "--suite",
+        "longmemeval",
+        "--sample-seed",
+        "seed-1",
+        "--sample-cap",
+        "2",
+        "--runs-dir",
+        runsDir,
+      ],
+      {},
+    );
+    expect(out.returncode).toBe(0);
+    expect(out.stdout).toContain("longmemeval: recall_all@5");
+    // The sampled text line shows the covered share: the population the
+    // sampler chose from beside the selected count (pr-251 L3). The
+    // whole-dataset line carries neither field.
+    expect(out.stdout).toContain("sample_population 3 sample_selected 2");
+    const runId = /^bench \S+ run (\S+)$/m.exec(out.stdout)?.[1];
+    expect(runId).toBeDefined();
+    const checkpoint = JSON.parse(
+      readFileSync(join(runsDir, runId!, "checkpoint.json"), "utf8"),
+    ) as { sample?: unknown };
+    expect(checkpoint.sample).toEqual({ seed: "seed-1", cap: 2 });
+  }, 60_000);
+});
+
+/**
+ * The help prose's usage block (CodeRabbit, pr-251): it mirrors the
+ * verb's USAGE constant - the usage line plus its 7-space continuation
+ * lines - so a flag the verb accepts is listed there too, and the line
+ * cannot drift back to a subset of the accepted flags.
+ */
+describe("bench help text", () => {
+  test("the usage block lists every flag the verb accepts", () => {
+    const usageBlock = (VERB_HELP["bench"] ?? "")
+      .split("\n")
+      .filter((line) => line.startsWith("usage:") || line.startsWith("       "))
+      .join("\n");
+    for (const flag of [
+      "--fixture",
+      "--suite",
+      "--pin",
+      "--recall-floor",
+      "--sample-seed",
+      "--sample-cap",
+      "--resume",
+      "--runs-dir",
+      "--json",
+    ]) {
+      expect(usageBlock).toContain(flag);
+    }
+    // The sample flags sit in the usage block itself, not only in the
+    // prose below it; the block wraps, so adjacency is checked over the
+    // continuation lines flattened back into one line.
+    const flattened = usageBlock.replaceAll("\n       ", " ");
+    expect(flattened).toContain("[--sample-seed <value>] [--sample-cap <n>]");
   });
 });

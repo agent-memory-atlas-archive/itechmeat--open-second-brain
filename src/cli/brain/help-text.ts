@@ -1431,10 +1431,17 @@ export const VERB_HELP: Record<string, string> = {
     "mine [--repo K]  surface decision-shaped commits as draft ADR\n" +
     "candidate notes under Brain/decisions/candidates/ (skip-existing).",
   bench:
-    "usage: o2b brain bench memory --fixture <name|path> [--resume <run-id>] [--runs-dir <dir>] [--json]\n" +
+    "usage: o2b brain bench memory --fixture <name|path> [--suite <name>]\n" +
+    "       [--pin <json>] [--recall-floor <n>] [--sample-seed <value>]\n" +
+    "       [--sample-cap <n>] [--resume <run-id>] [--runs-dir <dir>] [--json]\n" +
     "Memory quality benchmark over a disposable fixture vault under the\n" +
     "runs directory (never the configured vault). Reports quality,\n" +
     "latency, and context cost separately; checkpoint/resume by run id;\n" +
     "bench_judge_cmd arms the optional external judge. Exit 1 on any\n" +
-    "failed question.\n",
+    "failed question.\n" +
+    "--sample-seed V --sample-cap N  with a sampling-capable suite\n" +
+    "(longmemeval): run a seeded, question-type-proportional subset of\n" +
+    "the dataset instead of the whole fixture. Both flags are required\n" +
+    "together and fold into the run identity, so a resumed run whose\n" +
+    "sampling options changed fails the identity guard.\n",
 };
