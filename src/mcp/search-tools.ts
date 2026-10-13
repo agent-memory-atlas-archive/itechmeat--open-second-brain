@@ -23,6 +23,8 @@ import {
   serializeSearchCard,
   serializeIndexStatus,
 } from "../core/search/index.ts";
+import { evaluateGradedSurfacing } from "../core/search/surfacing-gate.ts";
+import { SURFACING_TIERS } from "../core/search/surfacing-key.ts";
 import { normalizeSessionFocus, parseStructuredRecallQueryDocument } from "../core/search/index.ts";
 import type { BrainSearchResult, SearchOutcome } from "../core/search/index.ts";
 import { parseDegreePredicate, type DegreePredicate } from "../core/search/property-filter.ts";
@@ -329,6 +331,22 @@ const SEARCH_INPUT_SCHEMA: Record<string, unknown> = {
       description:
         "Optional project-scope filter; pages with no project always match, project-tagged pages only this project. Absent = no project filtering.",
     },
+    iterative: {
+      type: "boolean",
+      description:
+        "Opt in to the bounded iterative recall loop (default off). Surviving gaps pause with a plan; resume via iterative_payload. Inert unless the knob is on.",
+    },
+    iterative_token: {
+      type: "string",
+      maxLength: 128,
+      description:
+        "The round token from a plan-phase response, submitted beside iterative_payload. Requires iterative: true; single use - a replayed token is refused by name.",
+    },
+    iterative_payload: {
+      type: "object",
+      description:
+        "Decider payload answering a plan-phase envelope: { evidence: [chunkId, ...], subQueries: [...] }, validated before any pull runs. Requires iterative_token.",
+    },
   },
   required: ["query"],
   additionalProperties: false,
@@ -477,6 +495,24 @@ const SEARCH_OUTPUT_SCHEMA: NonNullable<ToolDefinition["outputSchema"]> = {
       },
     },
     warnings: { type: "array", items: { type: "string" } },
+    // Iterative recall round-trip marker (recall-quality wave). Present
+    // only on an opt-in iterative call: the plan phase (needs-llm-step)
+    // or the commit call's final marker. Declared deliberately for the
+    // same reason every envelope here is declared.
+    iterative: {
+      type: "object",
+      required: ["phase"],
+      properties: {
+        phase: { type: "string" },
+        round: { type: "integer" },
+        token: { type: "string" },
+        llm_step: { type: "object" },
+        pool_ids: { type: "array", items: { type: "integer" } },
+        gaps: { type: "array", items: { type: "string" } },
+        rounds: { type: "array", items: { type: "object" } },
+        stop_reason: { type: "string" },
+      },
+    },
     // The ranked pool the `limit` sliced these rows from (task F) - how
     // many candidates were ranked, not how many came back. The descriptor
     // grammar carries no prose, so the meaning is documented here, in
@@ -671,10 +707,24 @@ export const RECALL_GATE_NEGATIVE_STATES: ReadonlyArray<NegativeRecallState> = O
 
 const RECALL_GATE_OUTPUT_SCHEMA: NonNullable<ToolDefinition["outputSchema"]> = {
   type: "object",
-  required: ["retrieve", "reason"],
+  required: ["retrieve", "admit", "reason"],
   properties: {
     retrieve: { type: "boolean" },
+    // The admission the verdict stands on, always present: with a
+    // measurement it IS the graded admission (so `retrieve` can never
+    // contradict `tier`); without one it names the structural fail-open.
+    admit: { type: "boolean" },
     reason: { type: "string" },
+    // Graded surfacing key (t_107a3249): present only when the caller
+    // supplied the scores/match_quality pair. `key` is the measured
+    // match quality, null exactly where nothing was measurable (a
+    // structurally suppressed prompt); `tier` is the closed admission
+    // vocabulary. Absent - never implied - without a measurement. The
+    // entry is permissive because the descriptor language declares ONE
+    // `type` per node: `number|null` is not expressible here, so `{}` is
+    // a statement about the language, not an omission.
+    key: {},
+    tier: { type: "string", enum: [...SURFACING_TIERS] },
     adequacy: {
       type: "object",
       required: [
@@ -1040,6 +1090,37 @@ async function toolBrainSearch(
           pathPrefix: focusPathPrefix ?? null,
         })
       : undefined;
+  // Iterative round-trip args (recall-quality wave). The flag is the
+  // per-query opt-in; token and payload are the commit leg's fields. Any
+  // present value of the wrong shape is refused with a named argument
+  // error rather than silently ignored - the kernel cannot tell an
+  // intended commit from a typo'd one.
+  const iterative = coerceBoolOptional(args, "iterative") ?? false;
+  const iterativeToken = coerceStringOptional(args, "iterative_token", 128);
+  const iterativePayload = args["iterative_payload"];
+  if (
+    iterativePayload !== undefined &&
+    (typeof iterativePayload !== "object" ||
+      iterativePayload === null ||
+      Array.isArray(iterativePayload))
+  ) {
+    throw new MCPError(INVALID_PARAMS, "argument 'iterative_payload' must be an object");
+  }
+  // The iterative round-trip is a single-vault loop: a cross-vault
+  // union cannot carry the pause across origins (each leg mints its own
+  // token, and a commit would mark one spent while the others rebuild
+  // the pause and fail token_mismatch). The combination is refused by
+  // name at the argument layer, so no iterative field ever reaches the
+  // federated legs.
+  if (
+    globalSearch &&
+    (iterative || iterativeToken !== undefined || iterativePayload !== undefined)
+  ) {
+    throw new MCPError(
+      INVALID_PARAMS,
+      "iterative recall arguments are not supported with global: true; the loop runs on the single-vault path",
+    );
+  }
   const focusSession = coerceStringOptional(args, "focus_session", 128);
   const properties = parsePropertiesArgument(args["properties"]);
   const degreeFilters = parseDegreeArgument(args["degree"]);
@@ -1110,6 +1191,9 @@ async function toolBrainSearch(
     // surface opts in by default; record_access=false suppresses it,
     // and cross-vault union never records (results span foreign vaults).
     ...(recordAccess && !globalSearch ? { recordAccess: true } : {}),
+    ...(iterative ? { iterative: true } : {}),
+    ...(iterativeToken !== undefined ? { iterativeToken } : {}),
+    ...(iterativePayload !== undefined ? { iterativePayload } : {}),
   };
   try {
     // Cross-vault union (t_72a22658): explicit per-call opt-in.
@@ -1242,6 +1326,33 @@ async function toolBrainSearch(
       trustGateEnabled: config.recall.retrievalTrustGateEnabled,
     }),
     ...(telemetryRecord ? { telemetry_id: telemetryRecord.id } : {}),
+    // Iterative round-trip marker: the plan phase carries the decider
+    // envelope and its token; a committed call carries the final marker.
+    // Absent - never null - on every other response, so the default
+    // shape stays byte-identical.
+    ...(outcome.iterative === undefined
+      ? {}
+      : {
+          iterative:
+            outcome.iterative.phase === "needs-llm-step"
+              ? {
+                  phase: outcome.iterative.phase,
+                  round: outcome.iterative.round,
+                  token: outcome.iterative.token,
+                  llm_step: outcome.iterative.llmStep,
+                  pool_ids: [...outcome.iterative.poolIds],
+                  gaps: [...outcome.iterative.gaps],
+                  // The deterministic loop's accounting before the pause,
+                  // projected the same way the final marker does it.
+                  rounds: [...outcome.iterative.rounds],
+                  stop_reason: outcome.iterative.stopReason,
+                }
+              : {
+                  phase: outcome.iterative.phase,
+                  rounds: [...outcome.iterative.rounds],
+                  stop_reason: outcome.iterative.stopReason,
+                },
+        }),
     // Advisory decision-model answer carried by the rerank request (issue
     // #213, Part 8). Absent unless rerank kind `decision-model` ran with
     // the `answerable` use on and a valid answer arrived.
@@ -1322,10 +1433,11 @@ async function toolBrainRecallGate(
   // the gate record so that record can carry the advisory signal below;
   // a refused argument is rethrown only after the record, as before.
   let refused: unknown = null;
+  let attempt: ReturnType<typeof coerceRecallAdequacyInput> | undefined;
   let verdict: ReturnType<typeof assessRecallAdequacy> | undefined;
   let answerable: DecisionAnswerableOutcome | undefined;
   try {
-    const attempt = coerceRecallAdequacyInput("brain_recall_gate", args, RECALL_SCORES_ARG_NAME);
+    attempt = coerceRecallAdequacyInput("brain_recall_gate", args, RECALL_SCORES_ARG_NAME);
     const answerableArg = coerceDecisionAnswerable(
       "brain_recall_gate",
       args,
@@ -1346,6 +1458,26 @@ async function toolBrainRecallGate(
   } catch (err) {
     refused = err;
   }
+  // Graded surfacing key (t_107a3249): the structural decision above
+  // composed with the shared admission calculator over the MEASURED
+  // quality, when the caller supplied the pair. The quality argument is
+  // already validated to a finite [0,1] number by the coercion above, so
+  // this cannot refuse. With a measurement the graded admission IS the
+  // binary verdict - a below-floor quality refuses, it does not ride the
+  // structural fail-open behind the tier's back - and the response carries
+  // both `retrieve` and `admit` so the two can never drift apart again.
+  // Without a measurement the structural fail-open stands unchanged and
+  // `admit` simply names it.
+  const measured = attempt?.matchQuality;
+  const graded = evaluateGradedSurfacing({
+    prompt,
+    previousPrompt: previousPrompt ?? null,
+    explicit,
+    channel: RECALL_CHANNEL.mcp,
+    ...(measured !== undefined ? { matchQuality: measured } : {}),
+  });
+  const retrieve = measured !== undefined ? graded.admit : decision.retrieve;
+  const gradedFields = measured !== undefined ? { key: graded.key, tier: graded.tier } : {};
   const answerableVerdict = answerable?.kind === "annotated" ? answerable.verdict : undefined;
   // Gate telemetry (t_65036e02): default off. Routed through the lazy
   // emit kernel (t_5d7aa7c5) - the payload thunk never runs with the
@@ -1355,10 +1487,17 @@ async function toolBrainRecallGate(
     emitGateTelemetry(ctx.vault, {
       host: telemetryHost,
       prompt,
-      retrieve: decision.retrieve,
+      // The recorded decision agrees with the admission, so a measured
+      // below-floor call is summarized as a skip, never as retrieved.
+      retrieve,
       reason: decision.reason,
       ...(sessionId !== undefined ? { sessionId } : {}),
       ...(turnId !== undefined ? { turnId } : {}),
+      // The transport rides measured decisions only: it calibrates the
+      // measured admission, and an unmeasured structural verdict is
+      // already described by decision and reason.
+      ...(measured !== undefined ? { channel: RECALL_CHANNEL.mcp } : {}),
+      ...(measured !== undefined ? { surfacing: { key: graded.key, tier: graded.tier } } : {}),
       ...(verdict !== undefined && answerableVerdict !== undefined
         ? {
             decisionAnswerable: {
@@ -1371,7 +1510,8 @@ async function toolBrainRecallGate(
     }),
   );
   if (refused !== null) throw refused;
-  if (verdict === undefined) return { ...decision };
+  if (verdict === undefined)
+    return { retrieve, admit: retrieve, reason: decision.reason, ...gradedFields };
   // signals-that-survive, unit 6: an unmet verdict is stamped onto the
   // cross-query demand log under the bucket key normalizeQueryTerms already
   // computes, so the knowledge-gap loop can aggregate recurrence without a
@@ -1401,7 +1541,10 @@ async function toolBrainRecallGate(
     );
   }
   return {
-    ...decision,
+    retrieve,
+    admit: retrieve,
+    reason: decision.reason,
+    ...gradedFields,
     adequacy: {
       level: verdict.level,
       action: verdict.action,
@@ -1976,7 +2119,7 @@ export const SEARCH_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: "brain_recall_gate",
     description:
-      "Classify whether an automatic recall attempt should run. Diagnostics only; does not search. Pass `scores` AND `match_quality` TOGETHER for an adequacy verdict — sufficient/proceed, weak/re_recall, insufficient/abstain; either alone is INVALID_PARAMS (see `dependentRequired`).",
+      "Classify whether recall should run. Diagnostics only; does not search. Pass `scores` AND `match_quality` together for an adequacy verdict; either alone is INVALID_PARAMS (see `dependentRequired`). A measurement decides the verdict: below-floor quality answers retrieve false. `admit` echoes it.",
     inputSchema: RECALL_GATE_INPUT_SCHEMA,
     outputSchema: RECALL_GATE_OUTPUT_SCHEMA,
     handler: toolBrainRecallGate,

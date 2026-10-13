@@ -20,6 +20,13 @@
 
 import { deriveRecallHint, type RecallHintInput } from "../search/recall-hint.ts";
 import { searchAcrossVaults } from "../search/cross-vault.ts";
+import type { SurfacingGateReason } from "../search/surfacing-gate.ts";
+import {
+  computeSurfacingKey,
+  SURFACING_ADMISSION_FLOORS,
+  type SurfacingKeyDecision,
+} from "../search/surfacing-key.ts";
+import { RECALL_CHANNEL } from "./recall-telemetry.ts";
 import type { RetrievalDegradationCode } from "../search/retrieval-trail.ts";
 import type { RecallSource } from "./portability/recall-sources.ts";
 import { LOCAL_ORIGIN } from "./portability/origins.ts";
@@ -62,8 +69,13 @@ export const RECALL_INJECT_TIME_BUDGET_MS = 2_500;
  * about a third of what was asked, which sits below
  * `COMPLETENESS_PARTIAL_THRESHOLD` (0.4) - this gate filters noise, it
  * does not demand a complete retrieval.
+ *
+ * Owned by `SURFACING_ADMISSION_FLOORS.hook` (`surfacing-key.ts`), the
+ * shared calculator's hook member, so the gate's diagnostic grading and
+ * this floor cannot drift apart; this export keeps the name and value
+ * every caller and config test pins.
  */
-export const RECALL_INJECT_CONFIDENCE_FLOOR = 0.35;
+export const RECALL_INJECT_CONFIDENCE_FLOOR = SURFACING_ADMISSION_FLOORS.hook;
 
 /** One relevance-matched note, narrowed to exactly what the brief needs. */
 export interface RecallCandidate {
@@ -268,7 +280,18 @@ export type RecallAbstainReason =
    */
   | "all_already_injected"
   /** Slices were declared and none of them placed a note in the brief. */
-  | "all_slices_abstained";
+  | "all_slices_abstained"
+  /**
+   * The structural gate (`evaluateSurfacingGate`) refused before any
+   * retrieval ran - the prompt is a verbatim repeat of its predecessor, a
+   * slash command, a shell command, or empty, and the gate's own reason
+   * rides `structuralReason`. `decideRecallInject` itself never returns
+   * this: in production the transports run the gate AHEAD of this core,
+   * and a caller that reproduces that composition (the bench's
+   * proactive-recall arm) persists the refusal as this member, so an
+   * abstention always names the layer that refused it.
+   */
+  | "structural";
 
 /**
  * Why an attempt failed, as a closed vocabulary rather than as prose.
@@ -321,8 +344,13 @@ export type RecallInjectDecision =
       readonly brief: string;
       readonly noteCount: number;
       readonly topScore: number;
-      /** The quantity the floor was compared against; see the floor's docblock. */
-      readonly matchQuality: number;
+      /**
+       * The quantity the floor was compared against; see the floor's
+       * docblock. Null on an inject admitted without a comparable
+       * measurement (an explicit request or an unmeasurable report):
+       * the graded admission carried it as a null key.
+       */
+      readonly matchQuality: number | null;
       /**
        * Exactly the notes rendered into {@link brief}, in brief order:
        * after the char-budget fit and after the decision-model filter. The
@@ -340,6 +368,13 @@ export type RecallInjectDecision =
   | {
       readonly kind: "abstain";
       readonly reason: RecallAbstainReason;
+      /**
+       * Present only on a `structural` abstain: the gate's own closed
+       * reason (`duplicate`, `slash_command`, `shell_command`, `empty`),
+       * carried beside the carrier member so the abstention says both
+       * which layer refused and why.
+       */
+      readonly structuralReason?: SurfacingGateReason;
       readonly topScore: number;
       /**
        * The quantity the floor was compared against; see the floor's
@@ -520,20 +555,31 @@ async function decideOverRetrieval(
   // what the brief's bullets show and what the audit line records - it is
   // simply no longer allowed to decide anything.
   //
+  // Admission is the SHARED calculator (`surfacing-key.ts`), not a
+  // private floor comparison: the gate channel grades the same quality
+  // against the same bound, so a boundary decision is identical on every
+  // channel. The floor override rides the calculator's `floor` parameter.
+  //
   // No quality means no comparison. Abstaining is the explicit choice
-  // this branch makes rather than a fallback: the alternative was the
-  // producer's old `1`, which put every unweighable prompt above every
-  // floor and injected on it.
-  if (matchQuality === null) {
+  // the `unmeasurable_quality` tier makes rather than a fallback: the
+  // alternative was the producer's old `1`, which put every unweighable
+  // prompt above every floor and injected on it.
+  let admission: SurfacingKeyDecision;
+  try {
+    admission = computeSurfacingKey({ matchQuality, channel: RECALL_CHANNEL.hook, floor });
+  } catch (exc) {
+    // A retriever that reports NaN where the contract says a [0,1] number
+    // or `null` has broken its report contract - an explicit error
+    // decision, never a silent admit.
+    return retrievalError(exc);
+  }
+  if (!admission.admit) {
     return Object.freeze({
       kind: "abstain",
-      reason: "unmeasurable_quality",
+      reason: admission.reason,
       topScore,
       matchQuality,
     });
-  }
-  if (matchQuality < floor) {
-    return Object.freeze({ kind: "abstain", reason: "below_floor", topScore, matchQuality });
   }
 
   // Dedupe sits after the floor, which read the unfiltered retrieval, and
@@ -617,8 +663,13 @@ function judgeSlice(spec: RecallSliceSpec, set: RecallResultSet, floor: number):
   const topScore = ranked[0]?.score ?? 0;
   const base = { spec, ranked, total: set.total, topScore, matchQuality };
   if (ranked.length === 0) return { ...base, outcome: "no_matches" };
-  if (matchQuality === null) return { ...base, outcome: "unmeasurable_quality" };
-  if (matchQuality < floor) return { ...base, outcome: "below_floor" };
+  // The same shared admission calculator the single-pool path uses, so a
+  // slice and a whole-pool verdict agree at the tier boundaries. A
+  // malformed quality report throws the calculator's named refusal, which
+  // the caller catches into the same explicit error decision a broken
+  // retrieval gets.
+  const admission = computeSurfacingKey({ matchQuality, channel: RECALL_CHANNEL.hook, floor });
+  if (!admission.admit) return { ...base, outcome: admission.reason };
   return { ...base, outcome: "inject" };
 }
 
@@ -651,7 +702,16 @@ async function decideSliced(
   } catch (exc) {
     return retrievalError(exc);
   }
-  const verdicts = slices.map((spec, i) => judgeSlice(spec, sets[i]!, caps.floor));
+  let verdicts: ReadonlyArray<SliceVerdict>;
+  try {
+    verdicts = slices.map((spec, i) => judgeSlice(spec, sets[i]!, caps.floor));
+  } catch (exc) {
+    // A slice's coverage report broke the calculator's contract (a
+    // non-finite or out-of-range `idfWeightedCoverage`): the same explicit
+    // error decision a broken or slow retrieval gets, never a throw out of
+    // the exported decision core.
+    return retrievalError(exc);
+  }
   const total = sets.reduce((sum, set) => sum + set.total, 0);
   const groups = verdicts.map((v) =>
     v.outcome === "inject" ? withoutDelivered(v.ranked, options) : [],
@@ -1075,6 +1135,12 @@ export function recallInjectTelemetryMetadata(
     return Object.freeze({
       decision: "abstain",
       reason: decision.reason,
+      // The gate's own reason is a closed classification like the abstain
+      // reason itself, so it satisfies the same names-nothing-sensitive
+      // rule; dropping it would leave an unexplainable `structural`.
+      ...(decision.structuralReason !== undefined
+        ? { structural_reason: decision.structuralReason }
+        : {}),
       top_score: decision.topScore,
       match_quality: decision.matchQuality,
       ...decisionModelTelemetry(decision.decisionModel),

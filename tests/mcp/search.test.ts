@@ -7,7 +7,7 @@
  * the actual search query are all exercised together.
  */
 
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -228,6 +228,7 @@ test("brain_recall_gate reports skip reasons without affecting explicit brain_se
   });
   expect(extractToolResult(gate)).toEqual({
     retrieve: false,
+    admit: false,
     reason: "shell_command",
   });
 
@@ -390,4 +391,255 @@ test("brain_recall_feedback enforces its advertised query maxLength before recor
   const within = extractToolResult(await feedback(astral.repeat(2000)));
   expect(within["recorded"]).toBe(true);
   expect(readdirSync(feedbackDir(vault))).toHaveLength(1);
+});
+
+// ----- Iterative recall round-trip (recall-quality wave, lane A) ----------
+
+/**
+ * Six common-term docs pin the IDF floor; the relic docs are recoverable;
+ * the wyrm terms live only in the query, so their IDF mass keeps coverage
+ * below the completeness threshold no matter how many relics the loop
+ * recovers - which is what leaves the plan phase a measurable gap to
+ * pause on.
+ */
+function seedIterativeVault(): void {
+  for (let i = 1; i <= 6; i++) {
+    writeMd(`notes/wh${i}.md`, `# WH${i}\n\nWarehouse rotation schedule, bay ${i}.\n`);
+  }
+  for (const term of ["relic01", "relic02"]) {
+    writeMd(`notes/${term}.md`, `# ${term}\n\n${term} provenance record.\n`);
+  }
+}
+
+/**
+ * The common terms anchor the match; the numbered relic terms name the
+ * provenance docs. The pool the lanes return leaves rare query terms
+ * uncovered past the deterministic budget, so the loop pauses with
+ * measurable gaps - the state the round-trip needs. The query stays
+ * SHORT: the plan-phase envelope echoes it, and a long query would push
+ * the response past the server's preview budget, which swaps the
+ * response for a preview artifact and hides the marker this test reads.
+ */
+const iterativeQuery = () => "warehouse rotation relic01 relic02 relic03 relic04 relic05 relic06";
+
+interface IterativePlan {
+  phase: string;
+  round: number;
+  token: string;
+  llm_step: { status: string; step: string; prompt: string; schema_hints: string[] };
+  pool_ids: number[];
+  gaps: string[];
+  rounds?: ReadonlyArray<{ round: number; added: number }>;
+  stop_reason?: string;
+}
+
+/**
+ * The round-trip responses carry the plan envelope, which can exceed the
+ * server's preview budget: `content[0].text` then holds the bounded
+ * preview envelope, while `structuredContent` always holds the full,
+ * contract-validated object. The round-trip asserts on the full body.
+ */
+function extractFullBody(resp: any): Record<string, unknown> {
+  if (resp?.result?.structuredContent) return resp.result.structuredContent;
+  return extractToolResult(resp);
+}
+
+test("brain_search iterative round-trip: plan phase carries the envelope, commit phase finalizes", async () => {
+  savedEnv["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"] =
+    process.env["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"];
+  process.env["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"] = "true";
+  seedIterativeVault();
+  const cfg = resolveSearchConfig({ vault, configPath });
+  try {
+    await indexVault(cfg);
+    const server = makeServer();
+    await initialize(server);
+
+    // Phase one: the flag alone asks for the plan.
+    const planResp = extractFullBody(
+      await call(server, "brain_search", { query: iterativeQuery(), limit: 5, iterative: true }),
+    );
+    const plan = planResp["iterative"] as IterativePlan | undefined;
+    expect(plan).toBeDefined();
+    expect(plan!.phase).toBe("needs-llm-step");
+    expect(plan!.llm_step.status).toBe("needs-llm-step");
+    expect(plan!.token).toMatch(/^drt-\d+-/);
+    expect(plan!.round).toBeGreaterThanOrEqual(2);
+    expect(plan!.pool_ids.length).toBeGreaterThan(0);
+    expect(plan!.gaps.length).toBeGreaterThan(0);
+    expect(typeof plan!.llm_step.prompt).toBe("string");
+    // The plan marker carries the deterministic loop's accounting too:
+    // what the rounds before the pause recovered and why the budget
+    // stopped while gaps remain - both fields the type carries and the
+    // output schema declares for this marker.
+    expect(Array.isArray(plan!.rounds)).toBe(true);
+    expect((plan!.rounds ?? []).length).toBeGreaterThan(0);
+    expect(typeof plan!.stop_reason).toBe("string");
+
+    // Phase two: the token plus the committed payload finalizes.
+    const commitArgs = {
+      query: iterativeQuery(),
+      limit: 5,
+      iterative: true,
+      iterative_token: plan!.token,
+      iterative_payload: {
+        evidence: [plan!.pool_ids[0]],
+        subQueries: ["relic01 relic02"],
+      },
+    };
+    const finalBody = extractFullBody(await call(server, "brain_search", commitArgs));
+    const finalPhase = finalBody["iterative"] as
+      | {
+          phase: string;
+          rounds?: ReadonlyArray<{ round: number; added: number }>;
+          stop_reason?: string;
+        }
+      | undefined;
+    expect(finalPhase).toBeDefined();
+    expect(finalPhase!.phase).toBe("final");
+    // The final marker carries the loop's accounting: what each
+    // deterministic round recovered and why the budget stopped.
+    expect(Array.isArray(finalPhase!.rounds)).toBe(true);
+    expect((finalPhase!.rounds ?? []).length).toBeGreaterThan(0);
+    expect(typeof finalPhase!.stop_reason).toBe("string");
+    const results = finalBody["results"] as Array<Record<string, unknown>>;
+    expect(results.length).toBeGreaterThan(0);
+
+    // The token was single use: replaying the commit is refused by name,
+    // never silently re-run.
+    const replay = (await call(server, "brain_search", commitArgs)) as any;
+    expect(replay?.error?.code).toBe(-32602);
+    expect(replay?.error?.message ?? "").toContain("token_used");
+  } finally {
+    if (savedEnv["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"] === undefined) {
+      delete process.env["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"];
+    } else {
+      process.env["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"] =
+        savedEnv["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"];
+    }
+  }
+});
+
+test("a malformed decider payload is a caller error (-32602), never an internal error", async () => {
+  savedEnv["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"] =
+    process.env["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"];
+  process.env["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"] = "true";
+  seedIterativeVault();
+  const cfg = resolveSearchConfig({ vault, configPath });
+  try {
+    await indexVault(cfg);
+    const server = makeServer();
+    await initialize(server);
+    const planResp = extractFullBody(
+      await call(server, "brain_search", { query: iterativeQuery(), limit: 5, iterative: true }),
+    );
+    const plan = planResp["iterative"] as IterativePlan | undefined;
+    expect(plan).toBeDefined();
+
+    // The most likely caller mistake - a payload missing its `subQueries`
+    // half - is a shape refusal. It must surface as the caller-error code
+    // with the typed INVALID_INPUT token, never as -32603 with prose.
+    const malformed = (await call(server, "brain_search", {
+      query: iterativeQuery(),
+      limit: 5,
+      iterative: true,
+      iterative_token: plan!.token,
+      iterative_payload: { evidence: [plan!.pool_ids[0]] },
+    })) as any;
+    expect(malformed?.error?.code).toBe(-32602);
+    expect(malformed?.error?.data?.code).toBe("INVALID_INPUT");
+    expect(malformed?.error?.message ?? "").toContain("shape");
+
+    // A payload that passes shape but breaks a registered semantic rule
+    // (five sub-queries against a budget of four) is the same class of
+    // caller error.
+    const overLimit = (await call(server, "brain_search", {
+      query: iterativeQuery(),
+      limit: 5,
+      iterative: true,
+      iterative_token: plan!.token,
+      iterative_payload: {
+        evidence: [plan!.pool_ids[0]],
+        subQueries: ["a", "b", "c", "d", "e"],
+      },
+    })) as any;
+    expect(overLimit?.error?.code).toBe(-32602);
+    expect(overLimit?.error?.data?.code).toBe("INVALID_INPUT");
+
+    // A sub-query of pure punctuation passes shape but carries no
+    // significant terms; the registered check refuses it as the same
+    // caller-error class.
+    const punctuationOnly = (await call(server, "brain_search", {
+      query: iterativeQuery(),
+      limit: 5,
+      iterative: true,
+      iterative_token: plan!.token,
+      iterative_payload: { evidence: [plan!.pool_ids[0]], subQueries: ["---"] },
+    })) as any;
+    expect(punctuationOnly?.error?.code).toBe(-32602);
+    expect(punctuationOnly?.error?.data?.code).toBe("INVALID_INPUT");
+
+    // Neither refusal spent the token: the valid commit still goes through.
+    const finalBody = extractFullBody(
+      await call(server, "brain_search", {
+        query: iterativeQuery(),
+        limit: 5,
+        iterative: true,
+        iterative_token: plan!.token,
+        iterative_payload: { evidence: [plan!.pool_ids[0]], subQueries: ["relic01 relic02"] },
+      }),
+    );
+    const finalPhase = finalBody["iterative"] as { phase: string } | undefined;
+    expect(finalPhase).toBeDefined();
+    expect(finalPhase!.phase).toBe("final");
+  } finally {
+    if (savedEnv["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"] === undefined) {
+      delete process.env["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"];
+    } else {
+      process.env["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"] =
+        savedEnv["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"];
+    }
+  }
+});
+
+test("brain_search with the knob on but the flag omitted is byte-identical to the knob off", async () => {
+  writeMd("notes/plain.md", "# Plain\n\nthe quarterly ledger reconciliation runbook\n");
+  await indexVault(resolveSearchConfig({ vault, configPath }));
+  const server = makeServer();
+  await initialize(server);
+  const query = "quarterly ledger reconciliation";
+  // Pin the wall clock: the recency boost reads Date.now() per call, so
+  // two searches a millisecond apart differ in float noise that has
+  // nothing to do with the mode.
+  savedEnv["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"] =
+    process.env["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"];
+  process.env["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"] = "true";
+  try {
+    // Pin the wall clock: the recency boost reads Date.now() per call, so
+    // two searches a millisecond apart differ in float noise that has
+    // nothing to do with the mode. The pin never outlives this test.
+    setSystemTime(1_750_000_000_000);
+    // record_access off on both legs: the first call's activation record
+    // would otherwise feed the second call's usage-aware ranking - a real
+    // effect, but one that has nothing to do with the mode under test.
+    const off = extractToolResult(
+      await call(server, "brain_search", { query, limit: 5, record_access: false }),
+    );
+    expect(off["iterative"]).toBeUndefined();
+    setSystemTime(1_750_000_000_000);
+    // Mode on (the operator knob), operation not requested (no flag):
+    // the same request must serialize identically, no phase marker.
+    const inert = extractToolResult(
+      await call(server, "brain_search", { query, limit: 5, record_access: false }),
+    );
+    expect(JSON.stringify(inert)).toBe(JSON.stringify(off));
+  } finally {
+    setSystemTime();
+    if (savedEnv["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"] === undefined) {
+      delete process.env["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"];
+    } else {
+      process.env["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"] =
+        savedEnv["OPEN_SECOND_BRAIN_SEARCH_ITERATIVE"];
+    }
+  }
 });

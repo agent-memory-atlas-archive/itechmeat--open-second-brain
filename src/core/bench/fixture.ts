@@ -19,12 +19,27 @@ import {
   type BenchFixture,
   type BenchFixtureContinuity,
   type BenchFixtureNote,
+  type BenchJudgeInput,
   type BenchQuestion,
   RETRIEVAL_CATEGORIES,
 } from "./types.ts";
 
+/**
+ * Named relaxations of the canonical fixture invariants. Each option is
+ * an opt-in a caller must vouch for explicitly - never a looser default.
+ */
+export interface ParseBenchFixtureOptions {
+  /**
+   * Accept `notes: []`. The replay converter passes this: a recorded
+   * session with no ingested notes has nothing to materialize, and its
+   * prompts are judged against an empty vault. Committed fixture files
+   * keep the non-empty requirement.
+   */
+  readonly allowEmptyNotes?: boolean;
+}
+
 /** Parse and validate a raw fixture document. Throws named errors. */
-export function parseBenchFixture(raw: unknown): BenchFixture {
+export function parseBenchFixture(raw: unknown, opts?: ParseBenchFixtureOptions): BenchFixture {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("bench fixture: expected a JSON object");
   }
@@ -34,7 +49,7 @@ export function parseBenchFixture(raw: unknown): BenchFixture {
   const description = nonEmptyString(record["description"]);
 
   const notesRaw = record["notes"];
-  if (!Array.isArray(notesRaw) || notesRaw.length === 0) {
+  if (!Array.isArray(notesRaw) || (notesRaw.length === 0 && opts?.allowEmptyNotes !== true)) {
     throw new Error("bench fixture: notes must be a non-empty array");
   }
   const notes = notesRaw.map(parseNote);
@@ -148,6 +163,7 @@ function parseQuestion(raw: unknown, index: number): BenchQuestion {
       `bench fixture: question ${id} has an unknown category (expected one of ${BENCH_CATEGORIES.join(", ")})`,
     );
   }
+  const judgeInput = parseJudgeInput(record["judge_input"]);
   const question: BenchQuestion = Object.freeze({
     id,
     category,
@@ -182,6 +198,13 @@ function parseQuestion(raw: unknown, index: number): BenchQuestion {
     ...(nonEmptyString(record["prompt"]) !== undefined
       ? { prompt: nonEmptyString(record["prompt"]) }
       : {}),
+    // Replay glue (surfacing-replay): the prompt this question follows,
+    // consumed by the structural gate the phase pipeline reproduces.
+    // Present only when the fixture carries it, so every fixture without
+    // one parses byte-identically.
+    ...(nonEmptyString(record["previous_prompt"]) !== undefined
+      ? { previous_prompt: nonEmptyString(record["previous_prompt"]) }
+      : {}),
     // `expect_inject` is the one boolean field, and `false` is its most
     // load-bearing value (the anti-gaming half of the fixture), so it is
     // read by type rather than by truthiness.
@@ -203,9 +226,37 @@ function parseQuestion(raw: unknown, index: number): BenchQuestion {
     ...(stringArray(record["forbidden_ids"]) !== undefined
       ? { forbidden_ids: stringArray(record["forbidden_ids"]) }
       : {}),
+    // Judge glue (longmemeval): present only when the fixture carries
+    // it, so every default-path fixture parses byte-identically.
+    ...(judgeInput !== undefined ? { judge_input: judgeInput } : {}),
   });
   validateQuestionShape(question);
   return question;
+}
+
+/**
+ * Parse the optional official-prompt judge input. Absent means absent;
+ * present it is validated as a whole - a half-stated input is a named
+ * error, never a silently partial payload.
+ */
+function parseJudgeInput(raw: unknown): BenchJudgeInput | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("bench fixture: judge_input must be an object");
+  }
+  const record = raw as Record<string, unknown>;
+  const question = nonEmptyString(record["question"]);
+  if (question === undefined) throw new Error("bench fixture: judge_input needs a question");
+  const answer = nonEmptyString(record["answer"]);
+  const gold = stringArray(record["gold"]);
+  if (gold === undefined || gold.length === 0) {
+    throw new Error("bench fixture: judge_input needs a non-empty gold array");
+  }
+  return Object.freeze({
+    question,
+    ...(answer !== undefined ? { answer } : {}),
+    gold: Object.freeze([...gold]),
+  });
 }
 
 function validateQuestionShape(question: BenchQuestion): void {

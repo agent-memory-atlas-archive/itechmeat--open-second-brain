@@ -53,6 +53,7 @@ import type {
   ResolvedSearchConfig,
   VaultScopeRules,
 } from "./types.ts";
+import { ITERATIVE_RECALL_MAX_ROUNDS_CAP, ITERATIVE_RECALL_MAX_ROUNDS_DEFAULT } from "./types.ts";
 
 type SearchConfigOverrides = Partial<
   Omit<ResolvedSearchConfig, "scopeRules" | "semantic" | "rerank">
@@ -1326,6 +1327,27 @@ export function resolveSearchConfig(opts: {
     true,
     "search_two_pass_enabled",
   );
+  const iterativeRecallEnabled = parseBool(
+    envOrConfig(
+      env,
+      config,
+      "OPEN_SECOND_BRAIN_SEARCH_ITERATIVE",
+      "search_iterative_recall_enabled",
+    ),
+    false,
+    "search_iterative_recall_enabled",
+  );
+  const iterativeRecallMaxRounds = parseInteger(
+    envOrConfig(
+      env,
+      config,
+      "OPEN_SECOND_BRAIN_SEARCH_ITERATIVE_MAX_ROUNDS",
+      "search_iterative_recall_max_rounds",
+    ),
+    ITERATIVE_RECALL_MAX_ROUNDS_DEFAULT,
+    "search_iterative_recall_max_rounds",
+    { min: 1, max: ITERATIVE_RECALL_MAX_ROUNDS_CAP },
+  );
   const poolMultiplier = parseInteger(
     envOrConfig(env, config, "OPEN_SECOND_BRAIN_SEARCH_POOL_MULTIPLIER", "search_pool_multiplier"),
     3,
@@ -1434,6 +1456,8 @@ export function resolveSearchConfig(opts: {
     learnedWeightsEnabled,
     activationEnabled,
     twoPassEnabled,
+    iterativeRecallEnabled,
+    iterativeRecallMaxRounds,
     poolMultiplier,
     selfTuningEnabled,
     chainStopEnabled,

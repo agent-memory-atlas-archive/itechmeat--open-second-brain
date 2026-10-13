@@ -27,6 +27,12 @@ import {
   type RecallInjectDecision,
 } from "../brain/recall-inject.ts";
 import { resolveSearchConfig, search } from "../search/index.ts";
+import { evaluateSurfacingGate } from "../search/surfacing-gate.ts";
+import {
+  BENCH_EMBEDDING_RECEIPT_FILENAME,
+  embedBenchVaultIndex,
+  readBenchEmbeddingReceipt,
+} from "./embedding-cache.ts";
 import {
   benchRecallRetriever,
   classifyRecallDecision,
@@ -37,6 +43,7 @@ import {
 } from "./failure-modes.ts";
 import { fixtureHash, materializeBenchVault } from "./fixture.ts";
 import { runJudge } from "./judge.ts";
+import { LONGMEMEVAL_SUITE_NAME, scoreLongMemEvalRecall } from "./longmemeval.ts";
 import {
   benchResultsDir,
   benchVaultDir,
@@ -48,11 +55,17 @@ import {
 } from "./run-store.ts";
 import {
   BENCH_REPORT_SCHEMA,
+  DEFAULT_BENCH_KNOB_PIN,
   RETRIEVAL_CATEGORIES,
   type BenchFixture,
+  type BenchEmbeddingReceipt,
+  type BenchLongMemEvalFamily,
+  type BenchPinnedKnobs,
   type BenchQuestion,
   type BenchQuestionResult,
   type BenchReport,
+  type BenchSuiteCapabilities,
+  type BenchSuiteReceipt,
 } from "./types.ts";
 
 /**
@@ -67,10 +80,43 @@ const BENCH_REACH = TRANSPORT_REACH.local;
 export interface BenchRunOptions {
   readonly fixture: BenchFixture;
   readonly runsDir: string;
+  /** Registered suite name, when the run goes through a named suite. */
+  readonly suite?: string;
+  /**
+   * What the run's suite may do, set by the CLI verb from the suite
+   * registry. Inert on its own: a capability is exercised only when the
+   * run's knob pin enables the feature too.
+   */
+  readonly capabilities?: BenchSuiteCapabilities;
+  /**
+   * Search-configuration knobs pinned for this run, applied last via
+   * `resolveSearchConfig` and folded into the run identity (the
+   * checkpoint hash). Absent means {@link DEFAULT_BENCH_KNOB_PIN}.
+   */
+  readonly pinnedKnobs?: BenchPinnedKnobs;
   /** Resume an existing run id; validates the fixture hash first. */
   readonly resume?: string;
+  /**
+   * Optional admission floor override for the proactive-recall decisions,
+   * passed to the decision core's `confidenceFloor` option, which routes
+   * through the shared surfacing calculator. Absent keeps the shipped
+   * default (`RECALL_INJECT_CONFIDENCE_FLOOR`). The surfacing-replay
+   * suite sweeps this to measure gate calibration.
+   *
+   * Part of the run identity: a resumed run whose floor changed fails
+   * the identity guard instead of deciding the remaining questions under
+   * a new floor while the persisted ones keep the old. A floor change
+   * takes effect in a fresh run id.
+   */
+  readonly recallFloor?: number;
   /** Optional external judge command (config bench_judge_cmd). */
   readonly judgeCmd?: string;
+  /**
+   * The suite loader's conversion receipt, threaded through to the
+   * report family - for LongMemEval, how many abstention questions the
+   * conversion excluded from scoring.
+   */
+  readonly suiteReceipt?: BenchSuiteReceipt;
   readonly now?: Date;
 }
 
@@ -121,17 +167,87 @@ interface RetrievedQuestion {
  * provider it does not recognise makes this throw. That is a loud, named
  * failure rather than a silently different bench.
  */
-export function benchSearchConfig(vault: string): ReturnType<typeof resolveSearchConfig> {
-  return resolveSearchConfig({ vault, overrides: { semantic: { enabled: false } } });
+/**
+ * The search configuration every phase uses, driven by the run's knob
+ * pin.
+ *
+ * `resolveSearchConfig` still reads `process.env`, and overrides are
+ * applied last and win, so the pin is what makes the harness's network-
+ * freedom an invariant instead of an inherited accident. The default pin
+ * ({@link DEFAULT_BENCH_KNOB_PIN}) is the hardcoded semantic-off override
+ * this function always applied - a named value now, so the default run
+ * identity is deterministic and locomo report numbers stay identical. A
+ * suite that declares the embeddings capability may pin the semantic
+ * lane on (the deterministic local provider keeps the run network-free).
+ *
+ * Exported so the invariant is assertable directly. It has to be: a test
+ * that sets the env vars and compares two reports passes whether or not
+ * the override is there, because reaching the embedding lane also needs
+ * an index built with embeddings, which the default harness does not
+ * build. The resolved config is where the difference is real, so that is
+ * what the test reads.
+ *
+ * One residual, named rather than implied: `resolveSearchConfig` parses
+ * the provider name BEFORE merging overrides, so an env var naming a
+ * provider it does not recognise makes this throw. That is a loud, named
+ * failure rather than a silently different bench.
+ */
+export function benchSearchConfig(
+  vault: string,
+  pinnedKnobs: BenchPinnedKnobs = DEFAULT_BENCH_KNOB_PIN,
+): ReturnType<typeof resolveSearchConfig> {
+  return resolveSearchConfig({ vault, overrides: pinnedKnobs });
 }
 
+/** Char budget per evidence excerpt a judged question carries. */
+const JUDGE_EVIDENCE_EXCERPT_CHARS = 800;
+
 export async function runMemoryBench(opts: BenchRunOptions): Promise<BenchReport> {
+  // Refused BEFORE any run state exists (pr-250 review, L9): the floor
+  // routes into the shared surfacing calculator, whose own contract
+  // refuses out-of-range values per question - so an out-of-range floor
+  // used to buy a full run whose every proactive decision was a
+  // retrievalError, paid after ingest and index, instead of this one
+  // named error. The bound is the calculator's own: a finite number in
+  // [0, 1]. Zero stays legal - the replay suite's permissive sweep arm
+  // uses it as the maximally permissive calibration point.
+  if (
+    opts.recallFloor !== undefined &&
+    !(Number.isFinite(opts.recallFloor) && opts.recallFloor >= 0 && opts.recallFloor <= 1)
+  ) {
+    throw new Error(
+      `bench run refused: recallFloor ${opts.recallFloor} is outside [0, 1]; the admission floor must be a finite number in the unit interval`,
+    );
+  }
+  const pinnedKnobs = opts.pinnedKnobs ?? DEFAULT_BENCH_KNOB_PIN;
   const run: BenchRunHandle =
     opts.resume !== undefined
-      ? loadBenchRun(opts.runsDir, opts.resume, { expectFixture: opts.fixture })
-      : createBenchRun(opts.runsDir, opts.fixture, opts.now ? { now: opts.now } : {});
+      ? loadBenchRun(opts.runsDir, opts.resume, {
+          expectFixture: opts.fixture,
+          pinnedKnobs,
+          ...(opts.recallFloor !== undefined ? { recallFloor: opts.recallFloor } : {}),
+        })
+      : createBenchRun(opts.runsDir, opts.fixture, {
+          ...(opts.now !== undefined ? { now: opts.now } : {}),
+          pinnedKnobs,
+          ...(opts.recallFloor !== undefined ? { recallFloor: opts.recallFloor } : {}),
+        });
   let checkpoint = run.checkpoint;
   const vault = benchVaultDir(run.runDir);
+  // One resolved config for every phase: the pin cannot drift between
+  // the index warmup and the timed retrievals.
+  const config = benchSearchConfig(vault, pinnedKnobs);
+  // The capability gate: the semantic lane is reachable only when the
+  // run's suite declared the embeddings capability, so a pin can never
+  // silently arm a lane the suite never asked for.
+  if (config.semantic.enabled && opts.capabilities?.embeddings !== true) {
+    throw new Error(
+      "bench run pins the semantic lane on without the embeddings capability - declare { embeddings: true } for the suite or keep the semantic lane pinned off",
+    );
+  }
+  // Present when this invocation ran the embedding index phase; read
+  // back from the run artifact on a resumed run.
+  let embeddings: BenchEmbeddingReceipt | undefined;
 
   // Phase: ingest - materialize the disposable vault.
   if (!phaseDone(checkpoint, "ingest")) {
@@ -140,23 +256,36 @@ export async function runMemoryBench(opts: BenchRunOptions): Promise<BenchReport
   }
 
   // Phase: index - one warmup search triggers the store self-heal so
-  // the FTS index exists before any timed retrieval.
+  // the FTS index exists before any timed retrieval. A suite that both
+  // declares the embeddings capability and pins the semantic lane on
+  // builds real vectors instead, through the apply-gated indexer path
+  // and the shared runs-dir vector cache.
   if (!phaseDone(checkpoint, "index")) {
-    const config = benchSearchConfig(vault);
-    await search(config, { query: "warmup", limit: 1, transportReach: BENCH_REACH });
+    if (config.semantic.enabled) {
+      embeddings = await embedBenchVaultIndex({ config, runsDir: opts.runsDir });
+      writeFileSync(
+        join(run.runDir, BENCH_EMBEDDING_RECEIPT_FILENAME),
+        `${JSON.stringify(embeddings, null, 2)}\n`,
+        "utf8",
+      );
+    } else {
+      await search(config, { query: "warmup", limit: 1, transportReach: BENCH_REACH });
+    }
     checkpoint = completeBenchPhase(run.runDir, checkpoint, "index");
+  }
+  if (embeddings === undefined && config.semantic.enabled) {
+    embeddings = readBenchEmbeddingReceipt(run.runDir);
   }
 
   // Phase: retrieve - run every question once, persist raw results.
   if (!phaseDone(checkpoint, "retrieve")) {
-    const config = benchSearchConfig(vault);
     mkdirSync(benchResultsDir(run.runDir), { recursive: true });
     // Deliberately sequential: per-question latency_ms must not include
     // contention from sibling searches running on the same store.
     // oxlint-disable-next-line no-await-in-loop
     for (const question of opts.fixture.questions) {
       // oxlint-disable-next-line no-await-in-loop
-      const retrieved = await retrieveQuestion(vault, config, question);
+      const retrieved = await retrieveQuestion(vault, config, question, opts.recallFloor);
       writeFileSync(
         join(benchResultsDir(run.runDir), `${question.id}.json`),
         `${JSON.stringify(retrieved, null, 2)}\n`,
@@ -167,16 +296,57 @@ export async function runMemoryBench(opts: BenchRunOptions): Promise<BenchReport
   }
 
   // Phase: evaluate - pure over the persisted results; no vault access.
+  // Each persisted record is read once and shared by the evaluator and
+  // the suite metric families.
+  const retrievedById = new Map(
+    opts.fixture.questions.map((question) => [question.id, readRetrieved(run.runDir, question.id)]),
+  );
   const results = opts.fixture.questions
-    .map((question) => evaluateQuestion(question, readRetrieved(run.runDir, question.id)))
+    .map((question) => evaluateQuestion(question, retrievedById.get(question.id)!))
     .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   if (!phaseDone(checkpoint, "evaluate")) {
     checkpoint = completeBenchPhase(run.runDir, checkpoint, "evaluate");
   }
 
-  // Optional judge (advisory, fail-open), then report.
-  const judge = runJudge(opts.judgeCmd, results);
-  const report = buildReport(run, opts.fixture, results, judge);
+  // The LongMemEval suite's named metric family: strict recall_all@5
+  // rolled off the same persisted results the evaluator read. The
+  // exclusion count comes only from a real conversion receipt - without
+  // one it reports null, never a manufactured 0.
+  let longmemeval: BenchLongMemEvalFamily | undefined;
+  if (opts.suite === LONGMEMEVAL_SUITE_NAME) {
+    const scored = scoreLongMemEvalRecall(opts.fixture.questions, [...retrievedById.values()]);
+    longmemeval = Object.freeze({
+      recall_all_at_5: scored.scored > 0 ? round3(scored.passed / scored.scored) : 0,
+      abstention_excluded: opts.suiteReceipt?.abstention_excluded ?? null,
+    });
+  }
+
+  // Optional judge (advisory, fail-open), then report. Questions whose
+  // suite provides official-prompt judge input carry it on the stdin
+  // payload; suites without it keep the payload unchanged.
+  // Judged questions carry the retrieved evidence (path plus a bounded
+  // excerpt, in rank order) beside the reference answer, so a judge can
+  // evaluate against what the system actually showed.
+  const bodiesByPath = new Map(opts.fixture.notes.map((n) => [n.path, n.body]));
+  const excerpt = (body: string): string =>
+    body.length > JUDGE_EVIDENCE_EXCERPT_CHARS
+      ? `${body.slice(0, JUDGE_EVIDENCE_EXCERPT_CHARS)}...`
+      : body;
+  const judgeInputs = new Map(
+    opts.fixture.questions.flatMap((question) => {
+      if (question.judge_input === undefined) return [];
+      const retrieved = retrievedById.get(question.id);
+      const evidence = (retrieved?.paths ?? []).flatMap((path) => {
+        const body = bodiesByPath.get(path);
+        return body === undefined ? [] : [{ path, text: excerpt(body) }];
+      });
+      const input =
+        evidence.length > 0 ? { ...question.judge_input, evidence } : question.judge_input;
+      return [[question.id, input] as const];
+    }),
+  );
+  const judge = runJudge(opts.judgeCmd, results, judgeInputs);
+  const report = buildReport(run, opts.fixture, results, judge, embeddings, longmemeval);
   writeFileSync(join(run.runDir, "report.json"), `${JSON.stringify(report, null, 2)}\n`, "utf8");
   if (!phaseDone(checkpoint, "report")) {
     completeBenchPhase(run.runDir, checkpoint, "report");
@@ -188,6 +358,7 @@ async function retrieveQuestion(
   vault: string,
   config: ReturnType<typeof resolveSearchConfig>,
   question: BenchQuestion,
+  recallFloor?: number,
 ): Promise<RetrievedQuestion> {
   const startedAt = Date.now();
   if (RETRIEVAL_CATEGORIES.has(question.category)) {
@@ -216,12 +387,42 @@ async function retrieveQuestion(
     };
   }
   if (question.category === "proactive_recall") {
+    // The structural pre-tier (pr-250 review, M9): the transports run
+    // `evaluateSurfacingGate` ahead of the decision core, so a duplicate,
+    // slash-command, shell-command or empty prompt never reaches
+    // retrieval. The bench reproduces that composition exactly whenever
+    // the fixture records the prompt this question follows: a structural
+    // refusal is persisted as an honest abstention - the gate's own
+    // reason, nothing measured, zero injected cost - and the decision
+    // core never runs for it.
+    const previousPrompt = question.previous_prompt;
+    if (previousPrompt !== undefined && previousPrompt.length > 0) {
+      const gate = evaluateSurfacingGate({ prompt: question.prompt ?? "", previousPrompt });
+      if (!gate.retrieve) {
+        return {
+          id: question.id,
+          latency_ms: Date.now() - startedAt,
+          recall_decision: Object.freeze({
+            kind: "abstain",
+            reason: "structural",
+            structuralReason: gate.reason,
+            topScore: 0,
+            matchQuality: null,
+          }),
+          context_chars: 0,
+          injected_tokens: injectedTokens(""),
+        };
+      }
+    }
     // The shipped decision core, driven directly over the fixture vault.
     // The retriever is a PARAMETER of that function, which is the only
-    // reason this is measurable offline at all.
+    // reason this is measurable offline at all. The admission floor is a
+    // parameter too (t_107a3249): the replay suite sweeps it to measure
+    // gate calibration; absent keeps the shipped default.
     const decision = await decideRecallInject(
       question.prompt ?? "",
       benchRecallRetriever(config, question.top_k ?? RECALL_INJECT_MAX_NOTES),
+      recallFloor === undefined ? {} : { confidenceFloor: recallFloor },
     );
     // An abstain injects nothing, and zero is the honest cost of nothing -
     // not an absent measurement.
@@ -439,7 +640,11 @@ function evaluateProactiveRecall(
 
 /** One decision as a diffable one-liner. Classifications only, no prose. */
 function describeDecision(decision: RecallInjectDecision): string {
-  if (decision.kind === "abstain") return `abstain(${decision.reason})`;
+  if (decision.kind === "abstain") {
+    return decision.structuralReason !== undefined
+      ? `abstain(${decision.reason}:${decision.structuralReason})`
+      : `abstain(${decision.reason})`;
+  }
   if (decision.kind === "error") return `error(${decision.fault})`;
   return `inject(${decision.noteCount} notes)`;
 }
@@ -512,6 +717,8 @@ function buildReport(
   fixture: BenchFixture,
   results: ReadonlyArray<BenchQuestionResult>,
   judge: ReturnType<typeof runJudge>,
+  embeddings?: BenchEmbeddingReceipt,
+  longmemeval?: BenchLongMemEvalFamily,
 ): BenchReport {
   const byCategory: Record<string, { passed: number; total: number }> = {};
   let passed = 0;
@@ -569,6 +776,8 @@ function buildReport(
       false_fire_rate: proactive.false_fire_rate,
       source_isolation_violations: isolationTotal,
     }),
+    ...(embeddings !== undefined ? { embeddings: Object.freeze({ ...embeddings }) } : {}),
+    ...(longmemeval !== undefined ? { longmemeval } : {}),
     judge: Object.freeze({
       status: judge.status,
       ...(judge.detail !== undefined ? { detail: judge.detail } : {}),

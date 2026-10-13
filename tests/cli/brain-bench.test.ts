@@ -6,10 +6,18 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import {
+  benchSuite,
+  benchSuiteNames,
+  parseBenchPinnedKnobs,
+  parseRecallFloorFlag,
+  registerBenchSuite,
+} from "../../src/cli/brain/verbs/bench.ts";
+import { parseBenchFixture } from "../../src/core/bench/fixture.ts";
 import { runCli } from "../helpers/run-cli.ts";
 
 let tmp: string;
@@ -82,5 +90,357 @@ describe("o2b brain bench memory", () => {
     );
     expect(out.returncode).not.toBe(0);
     expect(out.stderr).toContain("fixture not found");
+  });
+});
+
+/**
+ * The suite registry (recall-quality wave, t_607d429d): a --suite name
+ * maps to `{ loader, capabilities }`, the registry is the appendable
+ * registration point for suite modules, and the no-flag default path is
+ * byte-identical to the pre-registry dispatch.
+ */
+describe("bench suite registry", () => {
+  const STUB_SUITE = "registry-stub";
+  const STUB_FIXTURE = parseBenchFixture({
+    name: "registry-stub",
+    notes: [{ path: "Brain/notes/a.md", body: "alpha note" }],
+    questions: [
+      { id: "q1", category: "single_hop", query: "alpha", expected_paths: ["Brain/notes/a.md"] },
+    ],
+  });
+  const stubLoaderCalls: string[] = [];
+
+  registerBenchSuite(STUB_SUITE, {
+    loader: (fixturePath: string) => {
+      stubLoaderCalls.push(fixturePath);
+      return { fixture: STUB_FIXTURE };
+    },
+    capabilities: { embeddings: false },
+  });
+
+  beforeEach(() => {
+    stubLoaderCalls.length = 0;
+  });
+
+  test("the registry maps suite names to loader and capabilities", () => {
+    const locomo = benchSuite("locomo");
+    expect(locomo).toBeDefined();
+    expect(locomo!.capabilities).toEqual({ embeddings: false });
+    expect(typeof locomo!.loader).toBe("function");
+    expect(benchSuiteNames()).toContain("locomo");
+    // Sorted for stable listings (order-dependent assertions use sorted listings).
+    expect(benchSuiteNames()).toEqual(benchSuiteNames().toSorted());
+  });
+
+  test("a registered suite reaches its loader through --suite", async () => {
+    const out = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        "core-recall",
+        "--suite",
+        STUB_SUITE,
+        "--runs-dir",
+        runsDir,
+        "--json",
+      ],
+      {},
+    );
+    expect(out.returncode).toBe(0);
+    // The stub loader received the RESOLVED fixture path.
+    expect(stubLoaderCalls).toEqual([join("tests", "fixtures", "bench", "core-recall.json")]);
+    const report = JSON.parse(out.stdout) as { fixture: string };
+    expect(report.fixture).toBe("registry-stub");
+  }, 60_000);
+
+  test("an unknown suite fails with the current message shape", async () => {
+    const out = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        "core-recall",
+        "--suite",
+        "bogus",
+        "--runs-dir",
+        runsDir,
+      ],
+      {},
+    );
+    expect(out.returncode).not.toBe(0);
+    expect(out.stderr).toContain("unknown --suite 'bogus' (supported:");
+  });
+
+  test("omitting --suite keeps the native loader and the report shape unchanged", async () => {
+    const out = await runCli(
+      ["brain", "bench", "memory", "--fixture", "core-recall", "--runs-dir", runsDir, "--json"],
+      {},
+    );
+    expect(out.returncode).toBe(0);
+    const report = JSON.parse(out.stdout) as { fixture: string };
+    expect(report.fixture).toBe("core-recall");
+    // The native default path is not a named suite and adds no suite fields.
+    expect("suite" in report).toBe(false);
+    expect(stubLoaderCalls).toEqual([]);
+  }, 60_000);
+
+  test("the longmemeval suite prints its strict recall_all@5 family", async () => {
+    const out = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        "longmemeval-sample",
+        "--suite",
+        "longmemeval",
+        "--runs-dir",
+        runsDir,
+      ],
+      {},
+    );
+    expect(out.returncode).toBe(0);
+    // The named metric family rides the CLI output beside the existing
+    // families - never folded into the pass rate.
+    expect(out.stdout).toContain("longmemeval: recall_all@5 1 abstention_excluded 1");
+  }, 60_000);
+
+  test("the longmemeval report family rides the --json report", async () => {
+    const out = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        "longmemeval-sample",
+        "--suite",
+        "longmemeval",
+        "--runs-dir",
+        runsDir,
+        "--json",
+      ],
+      {},
+    );
+    expect(out.returncode).toBe(0);
+    const report = JSON.parse(out.stdout) as {
+      longmemeval?: { recall_all_at_5: number; abstention_excluded: number };
+    };
+    expect(report.longmemeval).toEqual({ recall_all_at_5: 1, abstention_excluded: 1 });
+  }, 60_000);
+
+  test("a duplicate suite registration is refused by name", () => {
+    expect(() =>
+      registerBenchSuite("locomo", {
+        loader: () => ({ fixture: STUB_FIXTURE }),
+        capabilities: { embeddings: false },
+      }),
+    ).toThrow(/already registered/);
+  });
+});
+
+/**
+ * The knob pin and the recall floor reach `runMemoryBench` from the CLI
+ * (pr-250 review, M7): the pin is the run's search configuration and the
+ * floor is the admission bound the surfacing-replay suite sweeps, and
+ * both are part of the run identity - asserted here through the
+ * checkpoint each run persists.
+ */
+describe("bench knob pin and recall floor", () => {
+  /** A one-question fixture, so each e2e run stays cheap. */
+  function writePinFixture(): string {
+    const path = join(tmp, "pin-fixture.json");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        name: "pin-check",
+        notes: [{ path: "Brain/notes/a.md", body: "alpha note" }],
+        questions: [
+          {
+            id: "q1",
+            category: "single_hop",
+            query: "alpha",
+            expected_paths: ["Brain/notes/a.md"],
+          },
+        ],
+      }),
+    );
+    return path;
+  }
+
+  function checkpointOf(
+    runsDir: string,
+    runId: string,
+  ): {
+    pinned_knobs?: unknown;
+    knobs_hash?: string;
+  } {
+    return JSON.parse(readFileSync(join(runsDir, runId, "checkpoint.json"), "utf8")) as {
+      pinned_knobs?: unknown;
+      knobs_hash?: string;
+    };
+  }
+
+  test("--pin reaches the run identity verbatim, replacing the default pin", async () => {
+    const fixturePath = writePinFixture();
+    // A pin the resolver accepts: the semantic lane stays off and one
+    // chunking knob moves. Value semantics are the resolver's, not this
+    // flag's - a pin like `keywordWeight: 0.7` alone dies there with its
+    // named sum-to-one error, which is the loud path by design.
+    const pin = { semantic: { enabled: false }, chunkSize: 512 };
+    const out = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        fixturePath,
+        "--runs-dir",
+        runsDir,
+        "--pin",
+        JSON.stringify(pin),
+        "--json",
+      ],
+      {},
+    );
+    expect(out.returncode).toBe(0);
+    const report = JSON.parse(out.stdout) as { run_id: string };
+    const checkpoint = checkpointOf(runsDir, report.run_id);
+    // The pin rides the checkpoint byte for byte - nothing merged in, so
+    // the run the report describes is exactly the configuration asked for.
+    expect(checkpoint.pinned_knobs).toEqual(pin);
+  }, 60_000);
+
+  test("--recall-floor reaches the run identity: a floor change is a different run", async () => {
+    const fixturePath = writePinFixture();
+    const plain = await runCli(
+      ["brain", "bench", "memory", "--fixture", fixturePath, "--runs-dir", runsDir, "--json"],
+      {},
+    );
+    expect(plain.returncode).toBe(0);
+    const plainId = (JSON.parse(plain.stdout) as { run_id: string }).run_id;
+    const floored = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        fixturePath,
+        "--runs-dir",
+        runsDir,
+        "--recall-floor",
+        "0.5",
+        "--json",
+      ],
+      {},
+    );
+    expect(floored.returncode).toBe(0);
+    const flooredId = (JSON.parse(floored.stdout) as { run_id: string }).run_id;
+    expect(flooredId).not.toBe(plainId);
+    // And resuming with the SAME floor reuses the run; the identity
+    // guard, not the CLI, owns what a floor change on resume means.
+    const resumed = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        fixturePath,
+        "--runs-dir",
+        runsDir,
+        "--recall-floor",
+        "0.5",
+        "--resume",
+        flooredId,
+        "--json",
+      ],
+      {},
+    );
+    expect(resumed.returncode).toBe(0);
+    expect((JSON.parse(resumed.stdout) as { run_id: string }).run_id).toBe(flooredId);
+    expect(readdirSync(runsDir)).toHaveLength(2);
+  }, 60_000);
+
+  test("garbage is refused by name", async () => {
+    const fixturePath = writePinFixture();
+    const badJson = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        fixturePath,
+        "--runs-dir",
+        runsDir,
+        "--pin",
+        "{not json",
+      ],
+      {},
+    );
+    expect(badJson.returncode).not.toBe(0);
+    expect(badJson.stderr).toContain("--pin is not valid JSON");
+
+    const notAnObject = await runCli(
+      ["brain", "bench", "memory", "--fixture", fixturePath, "--pin", "[1,2]"],
+      {},
+    );
+    expect(notAnObject.stderr).toContain("--pin must be a JSON object");
+
+    const unknownKnob = await runCli(
+      ["brain", "bench", "memory", "--fixture", fixturePath, "--pin", '{"frobNobs":1}'],
+      {},
+    );
+    expect(unknownKnob.stderr).toContain("unknown knob 'frobNobs'");
+
+    const unknownMember = await runCli(
+      [
+        "brain",
+        "bench",
+        "memory",
+        "--fixture",
+        fixturePath,
+        "--pin",
+        '{"semantic":{"enabeled":true}}',
+      ],
+      {},
+    );
+    expect(unknownMember.stderr).toContain("--pin 'semantic.enabeled' is not a known knob");
+
+    const harnessOwned = await runCli(
+      ["brain", "bench", "memory", "--fixture", fixturePath, "--pin", '{"vault":"/elsewhere"}'],
+      {},
+    );
+    expect(harnessOwned.stderr).toContain("--pin may not set 'vault'");
+
+    const badFloor = await runCli(
+      ["brain", "bench", "memory", "--fixture", fixturePath, "--recall-floor", "abc"],
+      {},
+    );
+    expect(badFloor.returncode).not.toBe(0);
+    expect(badFloor.stderr).toContain("--recall-floor must be a positive number, got 'abc'");
+
+    const zeroFloor = await runCli(
+      ["brain", "bench", "memory", "--fixture", fixturePath, "--recall-floor", "0"],
+      {},
+    );
+    expect(zeroFloor.stderr).toContain("--recall-floor must be a positive number, got '0'");
+  }, 60_000);
+
+  test("the pin parser refuses shape garbage and leaves value semantics to the resolver", () => {
+    expect(parseBenchPinnedKnobs('{"semantic":{"enabled":false}}')).toEqual({
+      semantic: { enabled: false },
+    });
+    // A scalar knob's VALUE is not shape-checked here: an out-of-range
+    // number is resolveSearchConfig's named error, not this parser's.
+    expect(parseBenchPinnedKnobs('{"keywordWeight":99}')).toEqual({ keywordWeight: 99 });
+    expect(() => parseBenchPinnedKnobs('{"semantic":false}')).toThrow(
+      /'semantic' must be a JSON object/,
+    );
+    expect(() => parseRecallFloorFlag(undefined)).not.toThrow();
+    expect(parseRecallFloorFlag("0.35")).toBe(0.35);
+    expect(() => parseRecallFloorFlag("")).toThrow(/got ''/);
+    expect(() => parseRecallFloorFlag("-1")).toThrow(/got '-1'/);
   });
 });

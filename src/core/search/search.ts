@@ -14,7 +14,16 @@
 
 import { assembleRankedResults } from "./pipeline/assemble.ts";
 import { decorateFinalResults } from "./pipeline/attribution.ts";
-import { isCacheEligible, persistCachedOutcome, probeQueryCache } from "./pipeline/cache-slot.ts";
+import {
+  isCacheEligible,
+  iterativeTokenSpent,
+  mintIterativeToken,
+  readIterativeTokenRecord,
+  claimIterativeToken,
+  releaseIterativeToken,
+  persistCachedOutcome,
+  probeQueryCache,
+} from "./pipeline/cache-slot.ts";
 import { collectCandidateSignals } from "./pipeline/candidate-signals.ts";
 import { createEventTimeResolver, filterCandidatesInRange } from "./pipeline/event-time.ts";
 import { runKeywordLane } from "./pipeline/keyword-lane.ts";
@@ -33,6 +42,14 @@ import {
   runRelationalArm,
 } from "./pipeline/relational-arm.ts";
 import { resolveSearchRequest } from "./pipeline/request.ts";
+import {
+  resolveIterativeRequest,
+  runDeciderRound,
+  runIterativeRecall,
+} from "./pipeline/iterative-recall.ts";
+import { DeciderStepError, nonceRoundToken, randomRoundNonce } from "./decider-step.ts";
+import { ResponseCheckError } from "../brain/response-checks.ts";
+import { ResponseShapeError } from "../brain/response-shape.ts";
 import { resolveKindFilter } from "./property-pushdown.ts";
 import { noSecondPass, runSecondPassRecall } from "./pipeline/second-pass.ts";
 import { runSemanticLane, type SemanticLaneOutcome } from "./pipeline/semantic-lane.ts";
@@ -45,13 +62,47 @@ import type { RetrievalDegradationSink } from "./retrieval-trail.ts";
 import { RETRIEVAL_DEGRADATION, noteDegradation } from "./retrieval-trail.ts";
 import { indexAgeSeconds, maybeFreshenIndex } from "./freshen.ts";
 import { LAST_INDEXED_AT_STATE_KEY } from "./store/state.ts";
-import type { FrontmatterCache } from "./result-filters.ts";
+import { isPathReadableAtReach, type FrontmatterCache } from "./result-filters.ts";
 import { Store } from "./store.ts";
-import type { ResolvedSearchConfig, SearchOptions, SearchOutcome } from "./types.ts";
+import { SearchError } from "./types.ts";
+import type { BrainSearchResult } from "./search-result.ts";
+import type {
+  IterativeStopReason,
+  ResolvedSearchConfig,
+  SearchOptions,
+  SearchOutcome,
+  SearchOutcomeIterative,
+} from "./types.ts";
 
 export { SEARCH_LIMIT_MAX, SEARCH_LIMIT_MIN } from "./pipeline/request.ts";
 
 const CACHE_BYPASSED: CacheProbe = { slot: null, hit: null };
+
+/**
+ * The committed decider evidence's preference over the final window
+ * (recall-quality wave, M3): the ranked prefix keeps its head, and the
+ * pinned ids that ranked OUTSIDE the `limit` window displace the window's
+ * tail - so a core-evidence chunk the ranking would have dropped still
+ * reaches the answer, while every pinned id that never survived ranking
+ * (a gate exclusion, a reach withdrawal) is silently not pinned: the
+ * preference only ever promotes candidates the ranked pool actually
+ * holds, in ranked order. Deterministic, and a no-op whenever the ranked
+ * pool already covers the evidence.
+ */
+function pinCommittedEvidence(
+  ranked: ReadonlyArray<BrainSearchResult>,
+  limit: number,
+  evidenceIds: ReadonlyArray<number>,
+): ReadonlyArray<BrainSearchResult> {
+  const window = ranked.slice(0, limit);
+  if (evidenceIds.length === 0 || window.length === 0) return window;
+  const inWindow = new Set(window.map((row) => row.chunkId));
+  const pinned = new Set(evidenceIds);
+  const missing = ranked.filter((row) => pinned.has(row.chunkId) && !inWindow.has(row.chunkId));
+  if (missing.length === 0) return window;
+  const keep = Math.max(0, limit - missing.length);
+  return [...window.slice(0, keep), ...missing].slice(0, limit);
+}
 
 /** Lead of the warning that names an abandoned lane's late, non-abort failure. */
 const ABANDONED_LANE_FAILURE_PREFIX = "hybrid deadline: an abandoned lane failed after the answer:";
@@ -293,6 +344,22 @@ export async function search(
     // the generic-surface response byte-identical to today.
     const routedSurface = shape.basePlan.surface;
 
+    // Iterative recall request resolution (recall-quality wave): hoisted
+    // ABOVE the cache probe because a commit call must refuse an
+    // already-spent round token before any cached commit response could
+    // be served - the refusal is the single-use contract, and a warm row
+    // must not bypass it.
+    const iterativeRequest = resolveIterativeRequest(opts, effectiveConfig);
+    if (
+      iterativeRequest?.phase === "commit" &&
+      iterativeTokenSpent(store, effectiveConfig, opts.iterativeToken!, nowMs)
+    ) {
+      throw new SearchError(
+        "INVALID_INPUT",
+        `iterative commit refused (token_used): round token ${JSON.stringify(opts.iterativeToken)} was already spent; a round token is single use`,
+      );
+    }
+
     // Persistent query cache (v0.20.0): opt-in. A hit returns the
     // previously computed outcome; generation changes (embedding change or
     // content reindex) and TTL expiry invalidate it. The write-back is
@@ -309,7 +376,23 @@ export async function search(
           planHash: shape.basePlan.planHash,
         })
       : CACHE_BYPASSED;
-    if (cache.hit !== null) return served(cache.hit);
+    if (cache.hit !== null) {
+      // A cached PLAN row carries the round token its plan call minted.
+      // When that token was already spent by a commit, the row is stale
+      // for purpose - serving it would hand the caller a dead token and
+      // lock the retry out until the TTL - so the hit is discarded and
+      // the plan recomputes (and mints fresh). Every other hit serves as
+      // usual; a commit row never carries a token, and the entry refusal
+      // above already arbitrates replays.
+      const cachedMarker = cache.hit.iterative;
+      const cachedToken = cachedMarker?.phase === "needs-llm-step" ? cachedMarker.token : undefined;
+      if (
+        cachedToken === undefined ||
+        !iterativeTokenSpent(store, effectiveConfig, cachedToken, nowMs)
+      ) {
+        return served(cache.hit);
+      }
+    }
     // A deadline-degraded answer is keyword-only under a key that promises
     // the hybrid one: serve it, but never cache it. A spend-gated one is
     // the same, and the key carries no gate or price either, so a cached
@@ -453,7 +536,229 @@ export async function search(
       : noSecondPass({ keywordHits, ids: Array.from(allChunkIds) });
     keywordHits = retry.keywordHits;
     for (const w of retry.warnings) warnings.push(w);
-    const idsList = retry.ids;
+    let idsList = retry.ids;
+
+    // Bounded iterative recall (recall-quality wave): with the caller's
+    // per-query flag and the operator's knob both on, gap-proposal rounds
+    // run past the single second pass over the same pool-merging
+    // discipline, bounded by the round cap and the composite deadline the
+    // second pass itself answers to. The loop is deterministic and
+    // model-free; the caller-executed decider round rides this seam too
+    // (decider-step.ts). Flag absent, or knob off, this block is never
+    // entered and the pipeline is byte-identical.
+    const reachFilterFor = (reach: NonNullable<typeof opts.transportReach>) => {
+      return (ids: ReadonlyArray<number>): ReadonlyArray<number> => {
+        const hydrated = store.hydrateChunks(ids);
+        const indexed = store.indexedVisibilityByPaths([...hydrated.values()].map((c) => c.path));
+        return ids.filter((id) => {
+          const chunk = hydrated.get(id);
+          return (
+            chunk !== undefined &&
+            isPathReadableAtReach(
+              effectiveConfig.vault,
+              chunk.path,
+              reach,
+              frontmatterCache,
+              indexed.get(chunk.path),
+            )
+          );
+        });
+      };
+    };
+    let iterativeMarker: SearchOutcomeIterative | null = null;
+    // The committed decider evidence (recall-quality wave, M3): carried
+    // out of the commit so the final window can prefer it and the marker
+    // can name it. Empty on every other leg.
+    let committedEvidenceIds: ReadonlyArray<number> = [];
+    if (
+      iterativeRequest !== null &&
+      iterativeRequest.phase === "commit" &&
+      deadlineExpired(deadline)
+    ) {
+      // A commit whose clock died before the block is refused by name,
+      // exactly like a commit against moved state: silence here would
+      // spend nothing it named and return a plain answer the caller
+      // would read as its commit's outcome.
+      throw new SearchError(
+        "INVALID_INPUT",
+        "iterative commit refused: no decider round is pending for this query state; run the plan phase again",
+      );
+    }
+    if (iterativeRequest !== null && !deadlineExpired(deadline)) {
+      // The plan phase mints the round token through the registry: a
+      // nonce token registered with the pause state's digest, so "spent"
+      // means "this plan call" and a second plan for the same query
+      // mints a fresh token instead of handing out the already-claimed
+      // one. When the registry cannot take the write, the mint reports
+      // null and the pause falls back to the deterministic digest token
+      // - best-effort by contract, so the loop still works with the
+      // cache table unavailable (the fallback validates by re-derivation
+      // at commit time instead). The commit leg's replay never mints: it
+      // rebuilds the pause only to validate the caller's token against.
+      const mintRoundToken =
+        iterativeRequest.phase === "plan"
+          ? ({
+              round,
+              pauseDigest,
+              deterministicRounds,
+              stopReason,
+            }: {
+              readonly round: number;
+              readonly pauseDigest: string;
+              readonly deterministicRounds: number;
+              readonly stopReason: IterativeStopReason;
+            }): string | null => {
+              const token = nonceRoundToken(round, randomRoundNonce());
+              // The row is the commit leg's replay brief: the digest to
+              // validate the replayed state against, and the deterministic
+              // round count the replay must run regardless of its own
+              // clock.
+              return mintIterativeToken(
+                store,
+                effectiveConfig,
+                token,
+                { pauseDigest, rounds: deterministicRounds, stopReason },
+                nowMs,
+              )
+                ? token
+                : null;
+            }
+          : undefined;
+      // The commit leg reads the plan's mint row before the replay: the
+      // digest for the validator, and the recorded round count the replay
+      // must run. Null (deterministic fallback token, or a row that aged
+      // out) downgrades to re-derivation and the live-clock replay.
+      const tokenRecord =
+        iterativeRequest.phase === "commit"
+          ? readIterativeTokenRecord(store, effectiveConfig, opts.iterativeToken!, nowMs)
+          : null;
+      const loop = runIterativeRecall({
+        store,
+        query,
+        limit,
+        pathPrefix,
+        ...(kind !== undefined ? { kind } : {}),
+        ...(pushdown !== null ? { pushdown } : {}),
+        timeRange,
+        validityWindowFor: eventTime.validityWindowFor,
+        keywordHits,
+        chunkIds: allChunkIds,
+        ids: idsList,
+        maxRounds: iterativeRequest.maxRounds,
+        firstRoundNumber: retry.secondPass !== undefined ? 3 : 2,
+        isExpired: () => deadlineExpired(deadline),
+        ...(mintRoundToken !== undefined ? { mintRoundToken } : {}),
+        ...(tokenRecord?.rounds !== undefined ? { replayRounds: tokenRecord.rounds } : {}),
+        ...(opts.transportReach !== undefined && opts.transportReach !== "local"
+          ? { filterReachableIds: reachFilterFor(opts.transportReach) }
+          : {}),
+      });
+      keywordHits = loop.keywordHits;
+      idsList = loop.ids;
+      if (iterativeRequest.phase === "commit") {
+        // The pause digest the plan's mint stored for this token: the
+        // validator compares it against the replayed state's digest, so
+        // a commit whose replay landed on another round or pool is
+        // refused as token_mismatch even though the token itself was
+        // minted honestly. Undefined (deterministic fallback token, or a
+        // row that aged out) downgrades to re-derivation alone.
+        const mintedPauseDigest = tokenRecord?.pauseDigest;
+        // The deterministic replay reached a state with no pending round
+        // (the index moved under the caller between the two calls): the
+        // commit is refused rather than executed against a pool its
+        // token never named.
+        if (loop.pause === null) {
+          throw new SearchError(
+            "INVALID_INPUT",
+            "iterative commit refused: no decider round is pending for this query state; run the plan phase again",
+          );
+        }
+        // The claim, not the entry check, arbitrates single use: two
+        // commits racing the same token both pass the entry read, and
+        // one atomic insert lets exactly one of them run the round.
+        let claimed = false;
+        try {
+          if (!claimIterativeToken(store, effectiveConfig, opts.iterativeToken!, nowMs)) {
+            throw new SearchError(
+              "INVALID_INPUT",
+              `iterative commit refused (token_used): round token ${JSON.stringify(opts.iterativeToken)} was already claimed; a round token is single use`,
+            );
+          }
+          claimed = true;
+          // One call commits at most once, so the in-call spent set the
+          // validator sees stays empty; cross-call single use is the
+          // claim above.
+          const committed = runDeciderRound({
+            store,
+            query,
+            limit,
+            pathPrefix,
+            ...(kind !== undefined ? { kind } : {}),
+            ...(pushdown !== null ? { pushdown } : {}),
+            timeRange,
+            validityWindowFor: eventTime.validityWindowFor,
+            keywordHits,
+            chunkIds: allChunkIds,
+            pause: loop.pause,
+            token: opts.iterativeToken!,
+            payload: opts.iterativePayload,
+            usedTokens: new Set<string>(),
+            ...(mintedPauseDigest !== undefined ? { mintedPauseDigest } : {}),
+            priorRounds: loop.rounds,
+            ...(opts.transportReach !== undefined && opts.transportReach !== "local"
+              ? { filterReachableIds: reachFilterFor(opts.transportReach) }
+              : {}),
+          });
+          keywordHits = committed.keywordHits;
+          idsList = committed.ids;
+          committedEvidenceIds = committed.evidenceIds;
+          iterativeMarker = {
+            phase: "final",
+            rounds: committed.rounds,
+            stopReason: committed.stopReason,
+            evidenceIds: committed.evidenceIds,
+          };
+        } catch (e) {
+          if (claimed) releaseIterativeToken(store, opts.iterativeToken!);
+          if (e instanceof DeciderStepError) {
+            throw new SearchError(
+              "INVALID_INPUT",
+              `iterative commit refused (${e.code}): ${e.message}`,
+            );
+          }
+          // A payload the validators refused (shape, or a registered
+          // semantic rule) is the caller's mistake, named by the same
+          // INVALID_INPUT the decider refusals carry: left raw it would
+          // escape classification and surface over MCP as an internal
+          // error instead of invalid_params. The refusal happens before
+          // any pull, so nothing about the round moved.
+          if (e instanceof ResponseShapeError || e instanceof ResponseCheckError) {
+            throw new SearchError("INVALID_INPUT", `iterative commit refused: ${e.message}`);
+          }
+          throw e;
+        }
+      } else if (loop.pause !== null) {
+        iterativeMarker = {
+          phase: "needs-llm-step",
+          round: loop.pause.round,
+          token: loop.pause.token,
+          llmStep: loop.pause.llmStep,
+          poolIds: loop.pause.poolIds,
+          gaps: loop.lastCoverage?.uncoveredRareTerms ?? [],
+          rounds: loop.rounds,
+          stopReason: loop.stopReason,
+        };
+      } else if (loop.rounds.length > 0) {
+        // The loop ran and finalized within the deterministic budget: the
+        // per-round accounting rides the outcome, while an inert loop
+        // (zero rounds) adds nothing and stays byte-identical.
+        iterativeMarker = {
+          phase: "final",
+          rounds: loop.rounds,
+          stopReason: loop.stopReason,
+        };
+      }
+    }
 
     if (idsList.length === 0) {
       // Nothing to rank, so this answer owes an explanation: the lanes
@@ -464,20 +769,18 @@ export async function search(
         degraded,
         opts.transportReach,
       );
-      return served(
-        finalize(
-          emptyOutcome({
-            store,
-            opts,
-            query,
-            pathPrefix,
-            warnings,
-            routedSurface,
-            degraded,
-            corpus,
-          }),
-        ),
-      );
+      const outcome = emptyOutcome({
+        store,
+        opts,
+        query,
+        pathPrefix,
+        warnings,
+        routedSurface,
+        degraded,
+        corpus,
+        ...(iterativeMarker !== null ? { iterative: iterativeMarker } : {}),
+      });
+      return served(finalize(outcome));
     }
 
     // Two-tier hydration (recall-quality, C5): the pool hydrates
@@ -573,7 +876,7 @@ export async function search(
 
     const results = decorateFinalResults({
       store,
-      results: postRank.results.slice(0, limit),
+      results: pinCommittedEvidence(postRank.results, limit, committedEvidenceIds),
       structured: shape.structured,
       activeLearned,
       canonicalMatchByChunk: signals.canonicalMatchByChunk,
@@ -603,33 +906,34 @@ export async function search(
     );
     const emit =
       postRank.decisionFallback === true || rerankUnavailable ? (o: SearchOutcome) => o : finalize;
-    return served(
-      emit(
-        buildSearchOutcome({
-          store,
-          config: effectiveConfig,
-          opts,
-          query,
-          pathPrefix,
-          results,
-          warnings,
-          secondPass: retry.secondPass,
-          routedSurface,
-          trustReceipts: postRank.trustReceipts,
-          frontmatterCache,
-          poolSize,
-          degraded,
-          corpus,
-          // The arm's reach-gated paths ride into the outcome builder so
-          // the retrieval trail renders them; empty (arm off) projects to
-          // no trail entry at all.
-          ...(relational.reachByChunk.size > 0 ? { relationalReach: relational.reachByChunk } : {}),
-          ...(postRank.decisionModel?.answerable !== undefined
-            ? { decisionModel: { answerable: postRank.decisionModel.answerable } }
-            : {}),
-        }),
-      ),
-    );
+    const built = buildSearchOutcome({
+      store,
+      config: effectiveConfig,
+      opts,
+      query,
+      pathPrefix,
+      results,
+      warnings,
+      secondPass: retry.secondPass,
+      routedSurface,
+      trustReceipts: postRank.trustReceipts,
+      frontmatterCache,
+      poolSize,
+      degraded,
+      corpus,
+      // The arm's reach-gated paths ride into the outcome builder so
+      // the retrieval trail renders them; empty (arm off) projects to
+      // no trail entry at all.
+      ...(relational.reachByChunk.size > 0 ? { relationalReach: relational.reachByChunk } : {}),
+      ...(postRank.decisionModel?.answerable !== undefined
+        ? { decisionModel: { answerable: postRank.decisionModel.answerable } }
+        : {}),
+      // The iterative marker is a property of this request's phase, not
+      // of the ranking; the builder projects it verbatim, so every
+      // no-marker outcome serializes exactly as before.
+      ...(iterativeMarker !== null ? { iterative: iterativeMarker } : {}),
+    });
+    return served(emit(built));
   } finally {
     await store.close();
   }

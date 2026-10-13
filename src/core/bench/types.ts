@@ -19,6 +19,13 @@
  * report be read under the wrong rule.
  */
 import type { RecallFailure } from "./failure-modes.ts";
+import type { EmbeddingGateVerdict } from "../search/embedding-spend.ts";
+import type {
+  ResolvedEmbeddingConfig,
+  ResolvedRerankConfig,
+  ResolvedSearchConfig,
+} from "../search/types.ts";
+import type { VaultScopeRules } from "../vault-scope/defaults.ts";
 
 export const BENCH_REPORT_SCHEMA = "o2b.bench.v2";
 
@@ -60,6 +67,28 @@ export interface BenchFixtureContinuity {
   readonly payload: Readonly<Record<string, unknown>>;
 }
 
+/**
+ * What a suite provides for the official-prompt judge: the question as
+ * the dataset asked it, the reference answer when it states one, and the
+ * gold evidence ids. Rides the judge stdin payload verbatim; it is
+ * NEVER scoring input - `evaluateQuestion` ignores it, and the converter
+ * never sets `expected_text` (that field is ignored for retrieval
+ * categories, so a gold answer pinned there would silently score
+ * nothing).
+ */
+export interface BenchJudgeInput {
+  readonly question: string;
+  readonly answer?: string;
+  readonly gold: ReadonlyArray<string>;
+  /**
+   * The retrieved evidence the run actually injected, path plus a
+   * bounded text excerpt in rank order, so a judge can evaluate an
+   * answer against what the system showed rather than the whole vault.
+   * Present when the run records retrieved texts for a judged question.
+   */
+  readonly evidence?: ReadonlyArray<{ readonly path: string; readonly text: string }>;
+}
+
 export interface BenchQuestion {
   readonly id: string;
   readonly category: BenchCategory;
@@ -76,12 +105,25 @@ export interface BenchQuestion {
   readonly session_id?: string;
   readonly expected_turns?: number;
   readonly expected_text?: string;
+  /**
+   * Official-prompt judge glue (longmemeval), absent for suites that
+   * provide none - their judge payload stays unchanged.
+   */
+  readonly judge_input?: BenchJudgeInput;
   /** budget / source_isolation: pack item ids that must be delivered. */
   readonly expected_ids?: ReadonlyArray<string>;
   readonly max_tokens?: number;
   readonly max_total_chars?: number;
   /** proactive_recall: the user prompt the decision core sees. */
   readonly prompt?: string;
+  /**
+   * proactive_recall: the previous prompt in the replayed sequence, when
+   * the suite records one. The structural gate (`evaluateSurfacingGate`)
+   * consumes it ahead of the decision core, exactly as the transports
+   * run it; absent means the gate is not reproduced for this question
+   * and it is judged on retrieval alone.
+   */
+  readonly previous_prompt?: string;
   /**
    * proactive_recall: whether memory SHOULD speak up for this prompt.
    * `false` is the anti-gaming half of the fixture - a prompt the vault
@@ -108,6 +150,137 @@ export interface BenchFixture {
   readonly questions: ReadonlyArray<BenchQuestion>;
 }
 
+/**
+ * What a registered suite may do inside one bench run.
+ *
+ * Declared at suite registration and carried on {@link BenchRunOptions}
+ * by the CLI verb from the suite registry, so "what a suite may do" is a
+ * property of the suite in code - never of a flag a caller forgot.
+ * A capability declaration alone is inert: the feature also has to be
+ * enabled through the run's knob pin.
+ */
+export interface BenchSuiteCapabilities {
+  /**
+   * Whether the suite may build the disposable vault index with
+   * embeddings (through the apply-gated indexer options) and run the
+   * semantic lane.
+   */
+  readonly embeddings: boolean;
+}
+
+/**
+ * What a suite loader returns: the converted fixture plus a typed
+ * receipt of what conversion decided (for LongMemEval, how many
+ * abstention questions it dropped).
+ */
+export interface BenchSuiteLoad {
+  readonly fixture: BenchFixture;
+  readonly receipt?: BenchSuiteReceipt;
+}
+
+/** Suite-level conversion receipt, surfaced through the report family. */
+export interface BenchSuiteReceipt {
+  /** LongMemEval-style abstention questions dropped at conversion time. */
+  readonly abstention_excluded?: number;
+}
+
+/**
+ * One registered suite: how a dataset file becomes a {@link BenchFixture}
+ * and what the suite may do inside a run. Suites register through the
+ * registry map in the bench verb - an appendable registration point, not
+ * a hard-coded branch chain.
+ */
+export interface BenchSuiteRegistration {
+  readonly loader: (fixturePath: string) => BenchSuiteLoad;
+  readonly capabilities: BenchSuiteCapabilities;
+}
+
+/**
+ * Search-configuration knobs pinned for one bench run. Shaped exactly
+ * like `resolveSearchConfig`'s overrides - applied last and win - so a
+ * pin can express every search, rerank and embedding knob the resolver
+ * knows. The pin is part of the RUN IDENTITY: it is folded into the
+ * checkpoint hash, so a resumed run that would mix two configurations
+ * fails the guard loudly instead of silently comparing them.
+ */
+export type BenchPinnedKnobs = Partial<
+  Omit<ResolvedSearchConfig, "scopeRules" | "semantic" | "rerank">
+> & {
+  readonly scopeRules?: VaultScopeRules;
+  readonly semantic?: Partial<ResolvedEmbeddingConfig>;
+  readonly rerank?: Partial<ResolvedRerankConfig>;
+};
+
+/**
+ * The default knob pin: the hardcoded semantic-off override the harness
+ * has always applied, made an explicit named value so the default run
+ * identity is deterministic and locomo report numbers stay identical.
+ */
+export const DEFAULT_BENCH_KNOB_PIN: BenchPinnedKnobs = Object.freeze({
+  semantic: Object.freeze({ enabled: false }),
+});
+
+/**
+ * The embedding spend receipt a capability-declaring suite surfaces.
+ *
+ * It records the ONE spend plan the suite's index phase computed through
+ * the apply-gated path (`planEmbeddingSpend`, the indexer's own gate) and
+ * how the shared vector cache split it: `cache_hits` vectors came off the
+ * runs-dir cache with zero provider contact, `cache_misses` were embedded
+ * through the indexer's embedding phase - which re-prices and re-gates
+ * that census itself, so the verdict acted on is never a caller's. A
+ * blocked gate is a named refusal, never a silent bypass.
+ */
+export interface BenchEmbeddingReceipt {
+  readonly provider: string;
+  /** The model the vectors are stored under. */
+  readonly model: string | null;
+  /**
+   * Canonical embedding identity: the `<provider>:<model>:<dimension>`
+   * triple plus the query/passage prefixes, rendered by
+   * `benchEmbeddingSignature`.
+   */
+  readonly signature: string;
+  /** Chunks the spend plan found pending when the phase opened. */
+  readonly planned: number;
+  /** Pending chunks served from the shared cache (no provider contact). */
+  readonly cache_hits: number;
+  /** Pending chunks embedded through the apply-gated embedding phase. */
+  readonly cache_misses: number;
+  /** Tokens the full pending census estimated. */
+  readonly tokens: number;
+  /** Estimated spend of the full pending census; null when unpriced. */
+  readonly estimated_usd: number | null;
+  /** Who stated the price the estimate used. */
+  readonly price_source: string;
+  /** The plan's own gate verdict, verbatim. */
+  readonly gate: EmbeddingGateVerdict;
+  /**
+   * True only when the embedding phase's receipt records a forced pass
+   * over a gate that would have refused. The bench itself never forces;
+   * the field exists so a receipt can never hide a bypass.
+   */
+  readonly forced?: boolean;
+}
+
+/**
+ * The LongMemEval report family (the MemScore rule: metric families stay
+ * separate and named). The strict recall_all@5 aggregate is never folded
+ * into `quality.pass_rate`, and the abstention exclusion count is
+ * surfaced beside it rather than hidden - a reader can see what the
+ * number does and does not cover.
+ */
+export interface BenchLongMemEvalFamily {
+  /** Share of scored questions with every gold note inside the cutoff. */
+  readonly recall_all_at_5: number;
+  /**
+   * Abstention questions the conversion excluded from scoring, taken
+   * from the run's conversion receipt. Null when the run carries no
+   * receipt - the count is then unknown, never a manufactured 0.
+   */
+  readonly abstention_excluded: number | null;
+}
+
 export interface BenchQuestionResult {
   readonly id: string;
   readonly category: BenchCategory;
@@ -123,6 +296,12 @@ export interface BenchQuestionResult {
   readonly recall_failure?: RecallFailure;
   /** source_isolation: forbidden ids the pack actually delivered. */
   readonly isolation_violations?: number;
+  /**
+   * The external judge's verdict for this question, present only when a
+   * judge ran and answered for it; deterministic evaluation stays
+   * canonical either way.
+   */
+  readonly judge_pass?: boolean;
 }
 
 export interface BenchReport {
@@ -160,6 +339,20 @@ export interface BenchReport {
     readonly false_fire_rate: number;
     readonly source_isolation_violations: number;
   };
+  /**
+   * The embedding spend receipt, present only when the run's suite
+   * declares the embeddings capability AND the knob pin enables the
+   * semantic lane - so the default (and locomo) report serializes
+   * byte-identically without it. Carries the provider+model signature so
+   * numbers are never compared across embedding identities.
+   */
+  readonly embeddings?: BenchEmbeddingReceipt;
+  /**
+   * The LongMemEval suite's named metric family, present only on runs
+   * through the longmemeval suite - so the default (and locomo) report
+   * serializes byte-identically without it.
+   */
+  readonly longmemeval?: BenchLongMemEvalFamily;
   readonly judge: { readonly status: "skipped" | "ran" | "error"; readonly detail?: string };
   readonly questions: ReadonlyArray<BenchQuestionResult>;
 }
@@ -168,6 +361,14 @@ export interface BenchCheckpoint {
   readonly run_id: string;
   readonly fixture_name: string;
   readonly fixture_hash: string;
+  /**
+   * The knob pin this run was created under, and the run-identity hash
+   * covering fixture plus pin. Both absent on checkpoints written before
+   * knob pinning existed; resume refuses such a checkpoint loudly rather
+   * than mixing configurations.
+   */
+  readonly pinned_knobs?: BenchPinnedKnobs;
+  readonly knobs_hash?: string;
   readonly created_at: string;
   readonly completed_phases: ReadonlyArray<BenchPhase>;
 }

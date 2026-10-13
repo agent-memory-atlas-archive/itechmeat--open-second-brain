@@ -7,13 +7,24 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import {
+  benchEmbeddingSignature,
+  benchVectorCacheKey,
+} from "../../../src/core/bench/embedding-cache.ts";
 import { parseBenchFixture } from "../../../src/core/bench/fixture.ts";
-import { runMemoryBench } from "../../../src/core/bench/phases.ts";
-import { BENCH_REPORT_SCHEMA } from "../../../src/core/bench/types.ts";
+import { FAKE_PROVIDER_KEY } from "../../helpers/fake-credentials.ts";
+import { benchSearchConfig, runMemoryBench } from "../../../src/core/bench/phases.ts";
+import {
+  BENCH_REPORT_SCHEMA,
+  DEFAULT_BENCH_KNOB_PIN,
+  type BenchPinnedKnobs,
+} from "../../../src/core/bench/types.ts";
+import { LOCAL_DEFAULT_DIMENSION } from "../../../src/core/search/embeddings/local-provider.ts";
+import { LOCAL_EMBEDDING_MODEL } from "../../../src/core/search/embeddings/signature.ts";
 
 let runsDir: string;
 
@@ -101,6 +112,13 @@ const FIXTURE = parseBenchFixture({
 });
 
 describe("runMemoryBench", () => {
+  test("the default bench config pins the semantic lane off", () => {
+    // The resolved config is where network-freedom is real: the pin must
+    // hold whatever the surrounding environment configures.
+    const config = benchSearchConfig(runsDir);
+    expect(config.semantic.enabled).toBe(false);
+  });
+
   test("full pipeline produces a diffable report with separate metric families", async () => {
     const report = await runMemoryBench({ fixture: FIXTURE, runsDir });
     expect(report.schema).toBe(BENCH_REPORT_SCHEMA);
@@ -115,6 +133,9 @@ describe("runMemoryBench", () => {
     expect(report.context_cost.avg_chars).toBeGreaterThan(0);
     expect(report.context_cost.avg_injected_tokens).toBeGreaterThan(0);
     expect(report.judge.status).toBe("skipped");
+    // No suite is named, so no suite report family may appear: the
+    // default path stays byte-identical.
+    expect(report.longmemeval).toBeUndefined();
     // Stable question order by id for diffability.
     expect(report.questions.map((q) => q.id)).toEqual(report.questions.map((q) => q.id).toSorted());
     // report.json lands in the run directory.
@@ -182,5 +203,244 @@ describe("runMemoryBench", () => {
     await expect(
       runMemoryBench({ fixture: changed, runsDir, resume: first.run_id }),
     ).rejects.toThrow("hash");
+  }, 30_000);
+
+  test("the default knob pin equals today's hardcoded semantic-off override", () => {
+    expect(DEFAULT_BENCH_KNOB_PIN).toEqual({ semantic: { enabled: false } });
+  });
+
+  test("pinned knobs are applied last and win over env and config", () => {
+    const pin: BenchPinnedKnobs = {
+      keywordWeight: 0.6,
+      semantic: { enabled: false, provider: "local" },
+    };
+    const config = benchSearchConfig(runsDir, pin);
+    expect(config.keywordWeight).toBe(0.6);
+    expect(config.semantic.enabled).toBe(false);
+    expect(config.semantic.provider).toBe("local");
+  });
+
+  test("two runs with different knob pins get different run ids", async () => {
+    const first = await runMemoryBench({
+      fixture: FIXTURE,
+      runsDir,
+      pinnedKnobs: { semantic: { enabled: false }, keywordWeight: 0.6 },
+    });
+    const second = await runMemoryBench({
+      fixture: FIXTURE,
+      runsDir,
+      pinnedKnobs: { semantic: { enabled: false }, keywordWeight: 0.5 },
+    });
+    expect(first.run_id).not.toBe(second.run_id);
+  }, 30_000);
+
+  test("resume with a changed knob pin fails fast on the identity guard", async () => {
+    const first = await runMemoryBench({ fixture: FIXTURE, runsDir });
+    await expect(
+      runMemoryBench({
+        fixture: FIXTURE,
+        runsDir,
+        resume: first.run_id,
+        pinnedKnobs: { semantic: { enabled: false }, keywordWeight: 0.6 },
+      }),
+    ).rejects.toThrow(/run identity mismatch/);
+  }, 30_000);
+
+  test("resume with the same explicit pin reuses the run", async () => {
+    const pin: BenchPinnedKnobs = { semantic: { enabled: false }, keywordWeight: 0.6 };
+    const first = await runMemoryBench({ fixture: FIXTURE, runsDir, pinnedKnobs: pin });
+    const resumed = await runMemoryBench({
+      fixture: FIXTURE,
+      runsDir,
+      resume: first.run_id,
+      pinnedKnobs: pin,
+    });
+    expect(resumed.run_id).toBe(first.run_id);
+    expect(resumed.quality).toEqual(first.quality);
+  }, 30_000);
+
+  test("an out-of-range recallFloor is refused by name before any run starts", async () => {
+    // Each of these used to finish a FULL run: the floor routes into the
+    // shared surfacing calculator, whose own contract refuses out-of-range
+    // values per question, so the report came back complete with a
+    // retrievalError on every proactive decision - paid after ingest and
+    // index, instead of one named error up front (pr-250 review, L9).
+    for (const floor of [-1, 1.5, Number.POSITIVE_INFINITY, Number.NaN]) {
+      await expect(
+        runMemoryBench({ fixture: FIXTURE, runsDir, recallFloor: floor }),
+      ).rejects.toThrow(/recallFloor .* is outside \[0, 1\]/);
+    }
+    // Refused before any run state exists.
+    expect(readdirSync(runsDir)).toHaveLength(0);
+    // The interval's ends are legal calibration points: zero is the
+    // maximally permissive sweep arm, one admits only a perfect match.
+    await expect(
+      runMemoryBench({ fixture: FIXTURE, runsDir, recallFloor: 1 }),
+    ).resolves.toBeDefined();
+  }, 60_000);
+});
+
+describe("the embeddings capability path", () => {
+  // Lexically disjoint notes, so the semantic lane cannot reorder a gold
+  // path below an unrelated one and the assertions stay about the
+  // capability machinery, not about fusion tuning.
+  const SEMANTIC_FIXTURE = parseBenchFixture({
+    name: "embedding-capability",
+    notes: [
+      {
+        path: "Brain/notes/rust.md",
+        body: "# Systems language\n\nThe systems team standardized on Rust for the new ingest service. Rust ownership keeps the parser safe.\n",
+      },
+      {
+        path: "Brain/notes/piano.md",
+        body: "# Evening hobby\n\nThe operator practices piano on weekends and prefers nocturnes. Piano practice happens after dinner.\n",
+      },
+    ],
+    continuity: [],
+    questions: [
+      {
+        id: "q-rust",
+        category: "single_hop",
+        query: "systems programming language for the ingest service",
+        top_k: 5,
+        expected_paths: ["Brain/notes/rust.md"],
+      },
+      {
+        id: "q-piano",
+        category: "single_hop",
+        query: "weekend instrument hobby",
+        top_k: 5,
+        expected_paths: ["Brain/notes/piano.md"],
+      },
+    ],
+  });
+  const CAPABILITIES = { embeddings: true } as const;
+  const SEMANTIC_PIN: BenchPinnedKnobs = { semantic: { enabled: true, provider: "local" } };
+
+  test("a semantic pin without the embeddings capability is a named error", async () => {
+    await expect(
+      runMemoryBench({ fixture: SEMANTIC_FIXTURE, runsDir, pinnedKnobs: SEMANTIC_PIN }),
+    ).rejects.toThrow(/embeddings capability/);
+  }, 30_000);
+
+  test("a blocked embedding spend gate is refused by name, never bypassed", async () => {
+    const pin: BenchPinnedKnobs = {
+      semantic: {
+        enabled: true,
+        provider: "openai-compat",
+        baseUrl: "http://127.0.0.1:9",
+        model: "bench-unpriced-model",
+        apiKey: FAKE_PROVIDER_KEY,
+        costGateUsd: 1,
+      },
+    };
+    // The unpriced model under a positive gate is refused before any
+    // provider contact: the run fails loudly instead of embedding anyway.
+    await expect(
+      runMemoryBench({
+        fixture: SEMANTIC_FIXTURE,
+        runsDir,
+        capabilities: CAPABILITIES,
+        pinnedKnobs: pin,
+      }),
+    ).rejects.toThrow(/spend gate/);
+  }, 30_000);
+
+  test("the capability builds the index through the apply gate and surfaces the spend plan", async () => {
+    const report = await runMemoryBench({
+      fixture: SEMANTIC_FIXTURE,
+      runsDir,
+      capabilities: CAPABILITIES,
+      pinnedKnobs: SEMANTIC_PIN,
+    });
+    expect(report.quality.passed).toBe(report.quality.total);
+    const receipt = report.embeddings;
+    expect(receipt).toBeDefined();
+    expect(receipt!.provider).toBe("local");
+    expect(receipt!.model).toBe(LOCAL_EMBEDDING_MODEL);
+    expect(receipt!.signature).toBe(`local:${LOCAL_EMBEDDING_MODEL}:${LOCAL_DEFAULT_DIMENSION}::`);
+    expect(receipt!.planned).toBeGreaterThan(0);
+    expect(receipt!.cache_hits).toBe(0);
+    expect(receipt!.cache_misses).toBe(receipt!.planned);
+    expect(receipt!.gate).toEqual({ blocked: false, reason: null });
+    // The surfaced plan lands as a run artifact beside report.json.
+    const receiptOnDisk = JSON.parse(
+      readFileSync(join(runsDir, report.run_id, "embeddings.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(receiptOnDisk).toEqual(receipt as unknown as Record<string, unknown>);
+    // The shared cache lives under the runs dir, entries keyed by
+    // provider, model, dimension and text hash.
+    const cache = JSON.parse(readFileSync(join(runsDir, "embedding-cache.json"), "utf8")) as {
+      entries: Record<string, ReadonlyArray<number>>;
+    };
+    const keys = Object.keys(cache.entries);
+    expect(keys.length).toBeGreaterThan(0);
+    const keyPattern = new RegExp(`^${receipt!.signature}\\|[0-9a-f]{64}$`);
+    for (const key of keys) {
+      expect(key).toMatch(keyPattern);
+      expect(cache.entries[key]!.length).toBe(LOCAL_DEFAULT_DIMENSION);
+    }
+  }, 30_000);
+
+  test("vector cache keys differ when only the prefix pins differ", () => {
+    // The stored bytes depend on the prefixes the provider prepends, so
+    // two arms that differ only in prefix pins must never share an entry.
+    const base = benchEmbeddingSignature("local", "m", 384, "", "");
+    const prefixed = benchEmbeddingSignature("local", "m", 384, "search: ", "passage: ");
+    expect(base).not.toBe(prefixed);
+    expect(benchVectorCacheKey(base, "same text")).not.toBe(
+      benchVectorCacheKey(prefixed, "same text"),
+    );
+    // Case and surrounding whitespace canonicalize away, as everywhere
+    // else the signature tokens are compared.
+    expect(benchEmbeddingSignature("Local", "m", 384, "", "")).toBe(base);
+  });
+
+  test("a second arm reuses the shared cache and stores byte-identical vectors", async () => {
+    const t0 = new Date("2026-06-01T00:00:00.000Z");
+    const first = await runMemoryBench({
+      fixture: SEMANTIC_FIXTURE,
+      runsDir,
+      capabilities: CAPABILITIES,
+      pinnedKnobs: SEMANTIC_PIN,
+      now: t0,
+    });
+    const cacheAfterFirst = readFileSync(join(runsDir, "embedding-cache.json"), "utf8");
+    const second = await runMemoryBench({
+      fixture: SEMANTIC_FIXTURE,
+      runsDir,
+      capabilities: CAPABILITIES,
+      pinnedKnobs: SEMANTIC_PIN,
+      now: new Date(t0.getTime() + 60_000),
+    });
+    expect(second.run_id).not.toBe(first.run_id);
+    expect(second.embeddings!.cache_misses).toBe(0);
+    expect(second.embeddings!.cache_hits).toBe(first.embeddings!.planned);
+    // Arm 2 rewrote the cache from its own store read-back: identical
+    // bytes prove the stored vectors equal arm 1's, element for element.
+    expect(readFileSync(join(runsDir, "embedding-cache.json"), "utf8")).toBe(cacheAfterFirst);
+  }, 30_000);
+
+  test("a shared cache written under another schema is refused, never honored", async () => {
+    const cachePath = join(runsDir, "embedding-cache.json");
+    const run = () =>
+      runMemoryBench({
+        fixture: SEMANTIC_FIXTURE,
+        runsDir,
+        capabilities: CAPABILITIES,
+        pinnedKnobs: SEMANTIC_PIN,
+      });
+    writeFileSync(
+      cachePath,
+      `${JSON.stringify({ schema: "some.other.vectors.v9", entries: {} }, null, 2)}\n`,
+      "utf8",
+    );
+    await expect(run()).rejects.toThrow(
+      /schema 'some\.other\.vectors\.v9', expected 'o2b\.bench\.vectors\.v1'/,
+    );
+    // Every writer stamps the schema, so a missing one is foreign state
+    // too - not an older generation to silently adopt.
+    writeFileSync(cachePath, `${JSON.stringify({ entries: {} }, null, 2)}\n`, "utf8");
+    await expect(run()).rejects.toThrow(/schema 'undefined'/);
   }, 30_000);
 });

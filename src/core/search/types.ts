@@ -20,6 +20,7 @@ import type { DegradationNotice } from "../integrity/degradation.ts";
 import type { StampMismatch } from "../integrity/stamp.ts";
 import type { ReconciliationOutcome, ReconciliationReport } from "../reconciliation-report.ts";
 import type { VaultPathRule, VaultScopeRules } from "../vault-scope/defaults.ts";
+import type { NeedsLlmStep } from "../brain/llm-step.ts";
 import type { MaintenanceSpendReceipt } from "../brain/maintenance/journal.ts";
 import type { EmbeddingPriceOverride, EmbeddingPriceSource } from "./embeddings/pricing.ts";
 import type { DegreePredicate } from "./property-filter.ts";
@@ -45,6 +46,20 @@ export {
   type SearchErrorCode,
   type SearchErrorOptions,
 } from "./search-error.ts";
+
+/**
+ * Gap-driven rounds the iterative recall loop (recall-quality wave) may
+ * run when the config names no cap, and the hard ceiling the resolver
+ * clamps an explicit cap to. These live on this module - the leaf every
+ * config consumer already reads - rather than beside the loop driver, so
+ * `resolveSearchConfig` never imports a pipeline module: the resolver is
+ * loaded by nearly every entry point, and dragging the driver's brain
+ * graph behind it flipped a fragile module-init order (the load failure
+ * this move fixed is recorded in the wave report).
+ */
+export const ITERATIVE_RECALL_MAX_ROUNDS_DEFAULT = 2;
+/** Hard ceiling the config resolver clamps the round cap to. */
+export const ITERATIVE_RECALL_MAX_ROUNDS_CAP = 8;
 
 /**
  * Structural query intent (v0.20.0). Derived purely from query shape -
@@ -1005,6 +1020,31 @@ export interface SearchOptions {
   /** Opt-in verified evidence pack diagnostics. Omitted preserves the legacy search outcome shape. */
   readonly evidencePack?: boolean;
   /**
+   * Opt-in iterative recall loop (recall-quality wave). When true AND the
+   * operator's `iterativeRecallEnabled` knob is on, gap-driven rounds run
+   * after the (single) second pass, bounded by the round cap and the
+   * composite deadline. Absent or false leaves the pipeline byte-identical;
+   * with the knob off the flag is inert rather than an error - the knob is
+   * the operator's master switch, the flag the caller's per-query one.
+   */
+  readonly iterative?: boolean;
+  /**
+   * The round token a plan-phase response minted, submitted on the
+   * commit call of the iterative round-trip (recall-quality wave).
+   * Present only with `iterative: true`; a token without the flag, or a
+   * token without its payload, is a named refusal rather than a
+   * silently ignored argument.
+   */
+  readonly iterativeToken?: string;
+  /**
+   * The caller-executed decider payload ({@link ./decider-step.ts}
+   * shape: selected evidence ids plus follow-up sub-queries), submitted
+   * beside {@link SearchOptions.iterativeToken} on the commit call. The
+   * commit validates it - shape, registered semantic rules, token single
+   * use, evidence in the round's pool - before any pull runs.
+   */
+  readonly iterativePayload?: unknown;
+  /**
    * Access recording (Time-Aware Recall & Activation Suite). When true,
    * the surfaced result paths are recorded as one activation access
    * event AFTER ranking completes - the current query's own ranking is
@@ -1085,6 +1125,87 @@ export interface SearchOptions {
    * returns the heuristic order and is never written to the query cache.
    */
   readonly skipDecisionModelRerank?: boolean;
+}
+
+/**
+ * Why the iterative recall loop stopped; recorded per query on the
+ * outcome's iterative marker (recall-quality wave). Lives on this leaf
+ * beside the marker it projects into, for the same module-graph reason
+ * as the knob bounds above.
+ */
+export type IterativeStopReason =
+  | "coverage_complete"
+  | "no_sub_query"
+  | "no_progress"
+  | "round_cap"
+  | "marginal_value"
+  | "deadline"
+  | "decider_round";
+
+/**
+ * One executed gap-driven round: what it pulled, what it recovered,
+ * what it cost. Deterministic-floor rounds carry the coverage-derived
+ * terms; decider rounds carry their committed sub-queries instead.
+ */
+export interface IterativeRoundRecord {
+  /** 1-based round number; 1 is the initial lanes, so rounds start at 2. */
+  readonly round: number;
+  readonly terms: ReadonlyArray<string>;
+  readonly groups: number;
+  readonly added: number;
+  readonly elapsedMs: number;
+  /** Who authored the sub-queries: the deterministic floor, or the decider. */
+  readonly author: "deterministic" | "decider";
+  /** The decider-authored sub-queries, present on decider rounds only. */
+  readonly subQueries?: ReadonlyArray<string>;
+}
+
+/**
+ * The iterative recall round-trip's phase marker (recall-quality wave),
+ * present on an outcome ONLY under the opt-in mode - the plan phase that
+ * pauses for the caller's decider step, or a call whose loop ran at
+ * least one gap-driven round. A call that never enters the mode, and a
+ * mode-on call the loop finalized within zero rounds, carry no marker at
+ * all, so the serialized outcome is byte-identical whenever the mode did
+ * nothing.
+ */
+export type SearchOutcomeIterative = SearchOutcomeIterativePlan | SearchOutcomeIterativeFinal;
+
+/** The plan phase: measurable gaps survived the deterministic budget. */
+export interface SearchOutcomeIterativePlan {
+  readonly phase: "needs-llm-step";
+  /** The round a committed payload will run. */
+  readonly round: number;
+  /** The opaque single-use token the commit call must echo. */
+  readonly token: string;
+  /** The needs-llm-step envelope describing what to answer. */
+  readonly llmStep: NeedsLlmStep;
+  /** The candidate chunk ids the decider selects evidence from. */
+  readonly poolIds: ReadonlyArray<number>;
+  /** The uncovered rare terms the committed sub-queries aim at. */
+  readonly gaps: ReadonlyArray<string>;
+  /** Every gap-driven round the loop already ran. */
+  readonly rounds: ReadonlyArray<IterativeRoundRecord>;
+  /** Why the deterministic budget stopped while gaps remain. */
+  readonly stopReason: IterativeStopReason;
+}
+
+/** A call whose loop ran: the committed round-trip leg, or a plain final. */
+export interface SearchOutcomeIterativeFinal {
+  readonly phase: "final";
+  /** Every gap-driven round the loop ran, in execution order. */
+  readonly rounds: ReadonlyArray<IterativeRoundRecord>;
+  /** Why the loop stopped. */
+  readonly stopReason: IterativeStopReason;
+  /**
+   * The pool-validated evidence ids the caller's committed decider
+   * payload pinned as core evidence, present on the committed leg only.
+   * The final window gives them a deterministic preference (a committed
+   * id that would rank outside the `limit` still lands in the results),
+   * so the decider's selection reaches the answer instead of being
+   * validated and discarded.
+   */
+  readonly evidenceIds?: ReadonlyArray<number>;
 }
 
 export interface SearchOutcome {
@@ -1181,6 +1302,15 @@ export interface SearchOutcome {
     /** The uncovered rare terms re-queried by a `"targeted"` retry. */
     readonly targetedTerms?: ReadonlyArray<string>;
   };
+  /**
+   * Iterative recall round-trip marker (recall-quality wave). Present
+   * only in the opt-in mode: the plan phase when the loop paused with
+   * measurable gaps, the final marker on a call whose loop ran - the
+   * committed round-trip leg, or a plain finalize (see
+   * {@link SearchOutcomeIterativeFinal}). Absent - never null - otherwise,
+   * keeping the outcome byte-identical whenever the mode did nothing.
+   */
+  readonly iterative?: SearchOutcomeIterative;
   /**
    * Normalized-confidence chain-stop (t_23c1b929). Present only when
    * `searchAcrossVaults` ran with `chainStopEnabled` and a completed origin's
@@ -1519,6 +1649,25 @@ export interface ResolvedRecallConfig {
    * (non-evidence-pack) searches never retry either way.
    */
   readonly twoPassEnabled: boolean;
+  /**
+   * Bounded iterative recall loop (recall-quality wave). Off by default.
+   * When true, gap-proposal rounds may run past the single second pass:
+   * each round re-measures pool coverage, emits up to k follow-up
+   * sub-query groups (the generalized targeted-retry planner) and merges
+   * the recovered candidates, until coverage completes, a round stops
+   * paying (the extracted marginal-value stop), the round cap or the
+   * composite deadline is reached, or a round recovers nothing. Off keeps
+   * the pipeline byte-identical; the documented "at most one retry"
+   * contract of `twoPassEnabled` is untouched - the loop owns the rounds
+   * AFTER it.
+   */
+  readonly iterativeRecallEnabled?: boolean;
+  /**
+   * Round cap for the iterative recall loop: the number of gap-driven
+   * rounds it may run per query, regardless of remaining coverage gaps.
+   * Absent reads as {@link ITERATIVE_RECALL_MAX_ROUNDS_DEFAULT}.
+   */
+  readonly iterativeRecallMaxRounds?: number;
   /**
    * Keyword candidate-pool width as a multiple of the requested limit
    * (link-recall-intelligence, t_ae973491). Default 3 preserves the

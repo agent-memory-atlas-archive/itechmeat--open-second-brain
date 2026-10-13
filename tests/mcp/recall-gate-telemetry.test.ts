@@ -148,7 +148,10 @@ test("with the opt-in on, a negative verdict lands as a continuity record", asyn
   expect(JSON.stringify(records[0]!.payload)).not.toContain("reactor coolant");
   expect(typeof records[0]!.payload["prompt_hash"]).toBe("string");
   // A host filesystem path is not vault content and must not replicate.
-  expect(JSON.stringify(records[0]!.payload)).not.toContain(tmp);
+  // Judge the JSON-escaped form: on win32 hosts a leaked path serializes
+  // with doubled backslashes, so the raw tmp string can never match and
+  // the invariant would silently stop being enforced.
+  expect(JSON.stringify(records[0]!.payload)).not.toContain(JSON.stringify(tmp).slice(1, -1));
 });
 
 test("a usable-score call writes no negative record even with the opt-in on", async () => {
@@ -159,4 +162,146 @@ test("a usable-score call writes no negative record even with the opt-in on", as
     match_quality: 0.9,
   });
   expect(negativeRecallRecords()).toHaveLength(0);
+});
+
+// ----- graded surfacing telemetry (t_107a3249, lane C Task 14) ---------------
+
+test("a measured call grades the verdict: below_floor refuses and records a skip", async () => {
+  writeFileSync(configPath, `vault: "${vault}"\nrecall_gate_telemetry: "true"\n`);
+  const out = (await tool("brain_recall_gate").handler(ctx(), {
+    prompt: "what did we decide about the index?",
+    scores: [0.9],
+    match_quality: 0.2,
+  })) as Record<string, unknown>;
+  // The graded admission decides the binary verdict when a measurement
+  // rides the call: a below-floor quality is a refusal, so `retrieve`
+  // and `admit` agree with the tier instead of contradicting it.
+  expect(out["retrieve"]).toBe(false);
+  expect(out["admit"]).toBe(false);
+  expect(out["key"]).toBe(0.2);
+  expect(out["tier"]).toBe("below_floor");
+  const records = listGateTelemetry(vault);
+  expect(records).toHaveLength(1);
+  // The record's decision agrees with the admission: a below-floor call
+  // is a skip, never a retrieved one.
+  expect(records[0]!.payload["decision"]).toBe("skip");
+  expect(records[0]!.payload["key"]).toBe(0.2);
+  expect(records[0]!.payload["tier"]).toBe("below_floor");
+  expect(records[0]!.payload["channel"]).toBe("mcp");
+  // The privacy invariant holds for the graded payload: numbers land, the
+  // prompt never does.
+  expect(JSON.stringify(records[0]!.payload)).not.toContain("what did we decide");
+  // The summary agrees: a below-floor measured call is not counted as
+  // retrieved.
+  const summary = (await tool("brain_recall_telemetry").handler(ctx(), {
+    operation: "gate_summary",
+  })) as { retrieved: number; skipped: number };
+  expect(summary.retrieved).toBe(0);
+  expect(summary.skipped).toBe(1);
+});
+
+test("a measured admitted call retrieves, admits and records a retrieve", async () => {
+  writeFileSync(configPath, `vault: "${vault}"\nrecall_gate_telemetry: "true"\n`);
+  const out = (await tool("brain_recall_gate").handler(ctx(), {
+    prompt: "what did we decide about the index?",
+    scores: [0.9],
+    match_quality: 0.8,
+  })) as Record<string, unknown>;
+  expect(out["retrieve"]).toBe(true);
+  expect(out["admit"]).toBe(true);
+  expect(out["tier"]).toBe("admitted");
+  const records = listGateTelemetry(vault);
+  expect(records[0]!.payload["decision"]).toBe("retrieve");
+});
+
+test("an unmeasured call records no key or tier and keeps the structural verdict", async () => {
+  writeFileSync(configPath, `vault: "${vault}"\nrecall_gate_telemetry: "true"\n`);
+  const out = (await tool("brain_recall_gate").handler(ctx(), {
+    prompt: "what did we decide about the index?",
+  })) as Record<string, unknown>;
+  expect("key" in out).toBe(false);
+  expect("tier" in out).toBe(false);
+  // Without a measurement the structural fail-open stands and `admit`
+  // names it: the binary verdict is the structural one, unchanged.
+  expect(out["retrieve"]).toBe(true);
+  expect(out["admit"]).toBe(true);
+  const records = listGateTelemetry(vault);
+  expect(records).toHaveLength(1);
+  expect("key" in records[0]!.payload).toBe(false);
+  expect("tier" in records[0]!.payload).toBe(false);
+  expect(records[0]!.payload["decision"]).toBe("retrieve");
+  // The transport is recorded only on measured decisions: an unmeasured
+  // structural verdict is already described by decision and reason.
+  expect("channel" in records[0]!.payload).toBe(false);
+});
+
+test("a boundary quality grades admitted through the mcp channel constant", async () => {
+  writeFileSync(configPath, `vault: "${vault}"\nrecall_gate_telemetry: "true"\n`);
+  await tool("brain_recall_gate").handler(ctx(), {
+    prompt: "what did we decide about the index?",
+    scores: [0.5],
+    match_quality: 0.35,
+  });
+  const records = listGateTelemetry(vault);
+  expect(records[0]!.payload["tier"]).toBe("admitted");
+});
+
+test("a suppressed prompt grades suppressed with a null key, never a measured one", async () => {
+  writeFileSync(configPath, `vault: "${vault}"\nrecall_gate_telemetry: "true"\n`);
+  await tool("brain_recall_gate").handler(ctx(), {
+    prompt: "git status",
+    scores: [0.9],
+    match_quality: 0.9,
+  });
+  const records = listGateTelemetry(vault);
+  expect(records[0]!.payload["tier"]).toBe("suppressed");
+  expect(records[0]!.payload["key"]).toBeNull();
+  expect(records[0]!.payload["decision"]).toBe("skip");
+});
+
+test("gate_summary summarizes counts by tier", async () => {
+  writeFileSync(configPath, `vault: "${vault}"\nrecall_gate_telemetry: "true"\n`);
+  await tool("brain_recall_gate").handler(ctx(), {
+    prompt: "what did we decide about the index?",
+    scores: [0.9],
+    match_quality: 0.2,
+  });
+  await tool("brain_recall_gate").handler(ctx(), {
+    prompt: "what did we decide about the index?",
+    scores: [0.9],
+    match_quality: 0.8,
+  });
+  // Unmeasured: counted in by_reason as always, absent from by_tier.
+  await tool("brain_recall_gate").handler(ctx(), { prompt: "/help" });
+  const summary = (await tool("brain_recall_telemetry").handler(ctx(), {
+    operation: "gate_summary",
+  })) as {
+    total: number;
+    retrieved: number;
+    skipped: number;
+    by_reason: Record<string, number>;
+    by_tier: Record<string, number>;
+  };
+  expect(summary.total).toBe(3);
+  expect(summary.by_tier).toEqual({ below_floor: 1, admitted: 1 });
+  expect(summary.by_reason["slash_command"]).toBe(1);
+  // The below-floor measured call is a skip under the graded verdict:
+  // only the admitted call counts as retrieved.
+  expect(summary.retrieved).toBe(1);
+  expect(summary.skipped).toBe(2);
+});
+
+test("fail-open: a broken store never breaks the graded response", async () => {
+  writeFileSync(configPath, `vault: "${vault}"\nrecall_gate_telemetry: "true"\n`);
+  mkdirSync(join(vault, "Brain", "log"), { recursive: true });
+  writeFileSync(join(vault, "Brain", "log", "continuity"), "not a directory");
+  const decision = (await tool("brain_recall_gate").handler(ctx(), {
+    prompt: "what did we decide about the index?",
+    scores: [0.9],
+    match_quality: 0.2,
+  })) as Record<string, unknown>;
+  expect(typeof decision["retrieve"]).toBe("boolean");
+  expect(decision["admit"]).toBe(false);
+  expect(decision["key"]).toBe(0.2);
+  expect(decision["tier"]).toBe("below_floor");
 });
