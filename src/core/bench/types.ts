@@ -45,6 +45,11 @@ export const BENCH_CATEGORIES = [
   "proactive_recall",
   "write_fidelity",
   "source_isolation",
+  // The standing-instruction facet suite (recall-lane-latency). Like the
+  // failure-mode categories it drives a seam the search pipeline never
+  // touches: the `standing_query` attention action, run with the opt-in
+  // provenance facet on, so the join ships measured rather than assumed.
+  "standing_instruction",
 ] as const;
 export type BenchCategory = (typeof BENCH_CATEGORIES)[number];
 
@@ -105,6 +110,14 @@ export interface BenchQuestion {
   /** session_handoff: which session's turns must be readable. */
   readonly session_id?: string;
   readonly expected_turns?: number;
+  /**
+   * standing_instruction: the full earliest-cited annotation that must
+   * close the item of `expected_ids[0]`, compared exactly with the
+   * closing bracket included - a near-miss origin cannot satisfy the
+   * expectation as a substring. (session_handoff reads the same field
+   * as an in-turns substring, so the exact-match rule is
+   * category-specific.)
+   */
   readonly expected_text?: string;
   /**
    * Official-prompt judge glue (longmemeval), absent for suites that
@@ -250,6 +263,20 @@ export type BenchPinnedKnobs = Partial<
   readonly scopeRules?: VaultScopeRules;
   readonly semantic?: Partial<ResolvedEmbeddingConfig>;
   readonly rerank?: Partial<ResolvedRerankConfig>;
+  /**
+   * The standing-instruction facet lane's arm (recall-lane-latency), read
+   * by the retrieve branch: absent or true, the `standing_instruction`
+   * category evaluates with the provenance facet on; false runs the plain
+   * lane, which emits the legacy strings so the category's facet
+   * assertions fail by name - the off arm of the measured A/B, and the
+   * reason the pin changes what a run measures instead of only naming it.
+   * The value folds into the checkpoint hash either way, so a resumed run
+   * that would mix a facet-gate arm with a plain one fails the guard
+   * loudly instead of comparing them. Absent on every other run, so
+   * `DEFAULT_BENCH_KNOB_PIN` and the existing run identities serialize
+   * byte-identically.
+   */
+  readonly standingInstructionFacets?: boolean;
 };
 
 /**
@@ -349,6 +376,13 @@ export interface BenchQuestionResult {
   /** One-line reason when pass is false. */
   readonly failure?: string;
   readonly latency_ms: number;
+  /**
+   * Overlapped lane milliseconds (recall-lane-latency): how much of this
+   * question's embed round trip the keyword lanes hid, present only when
+   * the semantic lane attempted the embed - a keyword-only run adds no
+   * key, keeping its report bytes identical.
+   */
+  readonly overlapped_ms?: number;
   /** Characters of context this question injected, when it injected any. */
   readonly context_chars?: number;
   /** {@link estimateTokens} over the same string `context_chars` measured. */
@@ -372,12 +406,32 @@ export interface BenchReport {
   readonly fixture_hash: string;
   readonly created_at: string;
   readonly quality: {
+    /**
+     * Headline pass count over every category EXCEPT
+     * `standing_instruction` (recall-lane-latency): the facet lane's
+     * rate stays the named line of its own in `by_category`, so adding
+     * facet questions to a fixture never shifts the headline a baseline
+     * compares.
+     */
     readonly passed: number;
+    /** Question count behind {@link BenchReport.quality.passed}, same exclusion. */
     readonly total: number;
+    /** `passed / total` at report precision; `0` when nothing counts. */
     readonly pass_rate: number;
+    /** Per-category passed/total, every category including the excluded one. */
     readonly by_category: Readonly<Record<string, { passed: number; total: number }>>;
   };
-  readonly latency_ms: { readonly avg: number; readonly max: number };
+  readonly latency_ms: {
+    readonly avg: number;
+    readonly max: number;
+    /**
+     * Mean overlapped lane milliseconds (recall-lane-latency) over the
+     * questions that attempted the semantic lane. Present only when at
+     * least one did, so the default (keyword-only) report serializes
+     * byte-identically without it.
+     */
+    readonly overlapped_ms?: number;
+  };
   /**
    * Cost, kept apart from quality on purpose (the MemScore lesson stated
    * at the top of this file). `avg_injected_tokens` is the fourth

@@ -20,6 +20,7 @@ import { loadReplayBenchFixture } from "../../../core/bench/replay.ts";
 import { runMemoryBench } from "../../../core/bench/phases.ts";
 import type {
   BenchPinnedKnobs,
+  BenchReport,
   BenchSampleRequest,
   BenchSuiteLoad,
   BenchSuiteRegistration,
@@ -35,8 +36,40 @@ const USAGE =
 const DEFAULT_RUNS_DIR = join(".open-second-brain", "bench-runs");
 const REPO_FIXTURE_DIR = join("tests", "fixtures", "bench");
 
+/**
+ * The overlapped-lane human line (recall-lane-latency), printed only when
+ * the aggregate latency family carries the figure - a keyword-only run
+ * keeps its stdout byte-identical.
+ */
+const OVERLAPPED_LINE_PREFIX = "overlapped_ms";
+
+/**
+ * The standing-instruction human line (recall-lane-latency), printed only
+ * when the report's quality buckets carry the category - a run without
+ * standing_instruction questions keeps its stdout byte-identical. The
+ * headline passed/total/pass_rate excludes the category (buildReport), so
+ * the category rates stay this named line of their own, never a fold into
+ * the overall pass rate.
+ */
+const STANDING_INSTRUCTION_LINE_PREFIX = "standing_instruction";
+
 /** A suite name must be safe to echo into errors, reports and run ids. */
 const SUITE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+
+/**
+ * The run's all-pass gate. The headline excludes the standing_instruction
+ * category (its rate is the named line of its own, never a fold into the
+ * overall pass rate), so the gate reads the category's own bucket beside
+ * the headline: a failing facet question still exits nonzero, while a
+ * passing one never shifts the headline rate a baseline compares.
+ */
+function runAllPass(report: BenchReport): boolean {
+  const standing = report.quality.by_category["standing_instruction"];
+  return (
+    report.quality.passed === report.quality.total &&
+    (standing === undefined || standing.passed === standing.total)
+  );
+}
 
 /**
  * The path with no `--suite`: a native fixture loads directly. Not a
@@ -128,6 +161,10 @@ const BENCH_PIN_KNOBS = [
   "scopeRules",
   "semantic",
   "rerank",
+  // The standing-instruction facet lane's arm (recall-lane-latency):
+  // listing it is what makes the lane-off arm reachable from the CLI
+  // (`--pin '{"standingInstructionFacets":false}'`), not only the API.
+  "standingInstructionFacets",
 ] as const satisfies ReadonlyArray<keyof BenchPinnedKnobs>;
 
 /**
@@ -422,13 +459,16 @@ export async function cmdBrainBench(argv: string[]): Promise<number> {
 
   if (flags["json"] === true) {
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-    return report.quality.passed === report.quality.total ? 0 : 1;
+    return runAllPass(report) ? 0 : 1;
   }
   process.stdout.write(`bench ${report.fixture} run ${report.run_id}\n`);
   process.stdout.write(
     `quality: ${report.quality.passed}/${report.quality.total} (pass rate ${report.quality.pass_rate})\n`,
   );
   process.stdout.write(`latency_ms: avg ${report.latency_ms.avg} max ${report.latency_ms.max}\n`);
+  if (report.latency_ms.overlapped_ms !== undefined) {
+    process.stdout.write(`${OVERLAPPED_LINE_PREFIX}: avg ${report.latency_ms.overlapped_ms}\n`);
+  }
   process.stdout.write(
     `context_cost: avg_chars ${report.context_cost.avg_chars} avg_injected_tokens ${report.context_cost.avg_injected_tokens}\n`,
   );
@@ -452,13 +492,20 @@ export async function cmdBrainBench(argv: string[]): Promise<number> {
         "\n",
     );
   }
+  if (report.quality.by_category["standing_instruction"] !== undefined) {
+    const standing = report.quality.by_category["standing_instruction"];
+    process.stdout.write(
+      `${STANDING_INSTRUCTION_LINE_PREFIX}: ${standing.passed}/${standing.total} ` +
+        `(pass rate ${round3(standing.passed / standing.total)})\n`,
+    );
+  }
   process.stdout.write(`judge: ${report.judge.status}\n`);
   for (const question of report.questions) {
     process.stdout.write(
       `  ${question.pass ? "PASS" : "FAIL"}  ${question.id} (${question.category})${question.failure ? ` - ${question.failure}` : ""}\n`,
     );
   }
-  return report.quality.passed === report.quality.total ? 0 : 1;
+  return runAllPass(report) ? 0 : 1;
 }
 
 function resolveFixturePath(flag: string): string | null {
@@ -466,4 +513,13 @@ function resolveFixturePath(flag: string): string | null {
   const repoLocal = join(REPO_FIXTURE_DIR, `${flag}.json`);
   if (existsSync(repoLocal)) return repoLocal;
   return null;
+}
+
+/**
+ * Round to three decimals, the same figure the core bench reports carry
+ * (`round3` in core/bench/phases.ts); the human standing_instruction line
+ * prints the category rate at the same precision as the overall pass rate.
+ */
+function round3(value: number): number {
+  return Math.round(value * 1000) / 1000;
 }

@@ -53,6 +53,7 @@ import { ResponseShapeError } from "../brain/response-shape.ts";
 import { resolveKindFilter } from "./property-pushdown.ts";
 import { noSecondPass, runSecondPassRecall } from "./pipeline/second-pass.ts";
 import { runSemanticLane, type SemanticLaneOutcome } from "./pipeline/semantic-lane.ts";
+import type { SemanticEmbedTiming } from "./semantic-phase.ts";
 import { openReadOrSelfHeal } from "./pipeline/store-open.ts";
 import { resolveEffectiveWeights } from "./pipeline/weights.ts";
 import { detectHybridDegrade } from "./enrich.ts";
@@ -125,12 +126,17 @@ const ABANDONED_LANE_FAILURE_PREFIX = "hybrid deadline: an abandoned lane failed
  * fires, the search completes keyword-only and names it with
  * `RETRIEVAL_DEGRADATION.hybridDeadlineExceeded` - never a stall, never a
  * silent partial.
+ *
+ * Exported for the overlap seam's tests, which build a real clock and pin
+ * the abandoned-lane sentence byte for byte.
  */
-interface CompositeDeadline {
+export interface CompositeDeadline {
   /** The configured budget, as resolved onto the request. */
   readonly budgetMs: number;
   /** Absolute fire time, on the request's clock so one clock rules the call. */
   readonly expiresAt: number;
+  /** The request's clock, readable: every expiry check reads through it. */
+  readonly clock: () => number;
   /**
    * Note the expiry once: the human warning sentence and the typed
    * degradation (with the elapsed/budget detail), plus the same
@@ -154,13 +160,15 @@ interface CompositeDeadline {
 }
 
 function deadlineExpired(deadline: CompositeDeadline | null): boolean {
-  return deadline !== null && Date.now() >= deadline.expiresAt;
+  return deadline !== null && deadline.clock() >= deadline.expiresAt;
 }
 
-function createCompositeDeadline(input: {
+export function createCompositeDeadline(input: {
   readonly budgetMs: number | null;
   /** The request's clock: the one `nowMs` every timed decision shares. */
   readonly startMs: number;
+  /** The request's clock, readable: every check below reads through it. */
+  readonly clock: () => number;
   readonly warnings: string[];
   readonly degraded: RetrievalDegradationSink;
   readonly wantSemantic: boolean;
@@ -175,7 +183,7 @@ function createCompositeDeadline(input: {
     if (fired) return;
     fired = true;
     controller.abort();
-    const elapsedMs = Date.now() - input.startMs;
+    const elapsedMs = input.clock() - input.startMs;
     input.warnings.push(
       `hybrid deadline ${budgetMs}ms exceeded after ${elapsedMs}ms; returning keyword-only results`,
     );
@@ -202,11 +210,32 @@ function createCompositeDeadline(input: {
   return {
     budgetMs,
     expiresAt: input.startMs + budgetMs,
+    clock: input.clock,
     fire,
     hasFired: () => fired,
     signal: controller.signal,
     noteAbandonedFailure,
   };
+}
+
+/**
+ * The clock members the deadline-bounded lanes read. The full
+ * {@link CompositeDeadline} satisfies it; the narrow shape keeps the
+ * lane seams honest about what they touch and unit-testable without the
+ * whole machinery.
+ */
+export interface LaneDeadline {
+  /** Absolute fire time, on the request's clock. */
+  readonly expiresAt: number;
+  /**
+   * Read the request's clock: the port the resolved request hands the
+   * call, so a lane seam never reads the wall clock for itself.
+   */
+  readonly clock: () => number;
+  /** Note the expiry (once) and abort the signal the lanes carry. */
+  fire(): void;
+  /** Name an abandoned lane's late, non-abort failure. */
+  noteAbandonedFailure(error: unknown): void;
 }
 
 /**
@@ -219,10 +248,11 @@ function createCompositeDeadline(input: {
  */
 async function awaitWithinDeadline<T>(
   start: () => Promise<T>,
-  deadline: CompositeDeadline,
+  deadline: LaneDeadline,
   fallback: () => T,
+  hooks?: { readonly onRaceArmed?: () => void },
 ): Promise<T> {
-  const remainingMs = deadline.expiresAt - Date.now();
+  const remainingMs = deadline.expiresAt - deadline.clock();
   if (remainingMs <= 0) {
     deadline.fire();
     return fallback();
@@ -234,6 +264,9 @@ async function awaitWithinDeadline<T>(
   void work.catch((error: unknown) => {
     if (abandoned) deadline.noteAbandonedFailure(error);
   });
+  // From here the race owns the lane's rejection: a join seam that also
+  // attached a handler at start time defuses it (never a double note).
+  hooks?.onRaceArmed?.();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadlineWon = new Promise<T>((resolve) => {
     timer = setTimeout(() => {
@@ -254,6 +287,105 @@ function emptySemanticLane(): SemanticLaneOutcome {
   return { hits: [], attempted: false, warnings: [], degraded: [] };
 }
 
+/**
+ * The hidden window: the intersection of the embed interval and the
+ * keyword interval, floored at 0. Extracted as a pure function because a
+ * real overlapped run can legitimately measure zero - a small corpus lets
+ * the synchronous FTS lane finish inside the wall clock's resolution - so
+ * no integration run can pin the arithmetic itself. The unit tests over
+ * this function are the exactness pin (swapped bounds, inverted order);
+ * the integration suite only pins that the wiring carries a sane value.
+ */
+export function overlappedEmbedMs(
+  embedStartMs: number,
+  embedEndMs: number,
+  keywordStartMs: number,
+  keywordEndMs: number,
+): number {
+  return Math.max(0, Math.min(embedEndMs, keywordEndMs) - Math.max(embedStartMs, keywordStartMs));
+}
+
+/**
+ * A lane started BEFORE the keyword lanes (recall-lane-latency): the
+ * query embed is the one caller wait the keyword work can hide, so it is
+ * put in flight here and joined where the serial await stood. The embed
+ * request leaves in the caller's own tick; the keyword lanes then run to
+ * completion synchronously while the round trip is outstanding.
+ *
+ * Two rules travel with the seam:
+ *
+ *   - The never-start rule moves to the start site: a clock that has
+ *     already run out starts no embed at all. The FIRE waits for the
+ *     join: at the start site the keyword lanes have not run, and a fire
+ *     there would snapshot the empty keyword pool into the degrade
+ *     decision, losing the umbrella sentence the serial contract emits.
+ *     The join's never-start arm (inside {@link awaitWithinDeadline})
+ *     runs after the keyword lanes merged, so the same rule fires there
+ *     against the real pool - the snapshot point the serial pipeline had.
+ *   - The rejection handler attaches at START, not at join. Between the
+ *     two stand the synchronous keyword lanes, and a throw there unwinds
+ *     the call with the embed still in flight. With a deadline the
+ *     stranded lane's failure is the deadline's to name; without one the
+ *     keyword step's own error is what the caller sees, and the handler
+ *     only keeps the stranded rejection from crashing the process. Once
+ *     the race inside {@link awaitWithinDeadline} arms its own catch it
+ *     owns the rejection (rethrow before the fire, note after it) and
+ *     this handler defuses - but only then: a failure landing in the
+ *     start-to-join window, including after a join-time fire, stays the
+ *     deadline's to name.
+ */
+export interface SemanticLaneJoin<T> {
+  /** Resolve the lane: its outcome, the fallback, or the lane's own error. */
+  join(): Promise<T>;
+}
+
+export function startSemanticLane<T>(input: {
+  /** Starts the lane; called in the caller's tick unless the clock ran out. */
+  readonly start: () => Promise<T>;
+  /** The composite clock; null runs the lane unbounded. */
+  readonly deadline: LaneDeadline | null;
+  /** The empty lane the deadline serves when it consumed the lane. */
+  readonly fallback: () => T;
+}): SemanticLaneJoin<T> {
+  const deadline = input.deadline;
+  if (deadline !== null && deadline.expiresAt - deadline.clock() <= 0) {
+    // Never start the embed - but never fire here either: the keyword
+    // lanes have not run, and the degrade decision must read the pool
+    // they populated. Leave the fire to the join's never-start arm.
+    return {
+      join: () =>
+        awaitWithinDeadline(
+          () => {
+            throw new Error(
+              "the semantic lane never started: the hybrid deadline had already expired",
+            );
+          },
+          deadline,
+          input.fallback,
+        ),
+    };
+  }
+  const work = input.start();
+  let raced = false;
+  void work.catch((error: unknown) => {
+    if (raced || deadline === null) return;
+    deadline.noteAbandonedFailure(error);
+  });
+  return {
+    join: async (): Promise<T> => {
+      if (deadline === null) {
+        raced = true;
+        return await work;
+      }
+      return await awaitWithinDeadline(() => work, deadline, input.fallback, {
+        onRaceArmed: () => {
+          raced = true;
+        },
+      });
+    },
+  };
+}
+
 export async function search(
   config: ResolvedSearchConfig,
   opts: SearchOptions,
@@ -270,6 +402,7 @@ export async function search(
     policy,
     sessionFocus,
     nowMs,
+    clock,
     timeRange,
     temporalIntent,
     hybridDeadlineMs,
@@ -323,6 +456,7 @@ export async function search(
     const deadline = createCompositeDeadline({
       budgetMs: hybridDeadlineMs,
       startMs: nowMs,
+      clock,
       warnings,
       degraded,
       wantSemantic: policy.wantSemantic,
@@ -409,7 +543,53 @@ export async function search(
       return outcome;
     };
 
+    // Semantic candidates (may be skipped). The lane starts BEFORE the
+    // keyword lanes (recall-lane-latency): its query embed is the one
+    // caller wait the keyword work can hide, so it is put in flight here,
+    // in this tick, and joined where the serial await stood below. The
+    // keyword pool size rides the lane's lazy supplier - at start time the
+    // keyword lanes have not run yet, and the lane reads the pool they
+    // produced when it completes, the same snapshot the serial pipeline
+    // captured at the join. Under the composite deadline the lane races
+    // the clock from the join (the remaining budget is computed there, so
+    // an early start neither starts the clock sooner nor extends it), the
+    // deadline's signal rides in the lane input so a fire aborts the
+    // in-flight embed, and a clock that already ran out starts nothing.
+    let keywordHits: ReturnType<typeof runKeywordLane>["hits"] = [];
+    // Per-call lane timing (recall-lane-latency): the record is owned
+    // here, stamped by the phase around the embed, and folded into one
+    // sink call at the join. Never an outcome field - the query cache
+    // persists whole outcomes, so a field there would freeze this call's
+    // timings into every cached row served afterwards.
+    const laneTimingSink = opts.laneTiming;
+    const embedTiming: SemanticEmbedTiming = { clock };
+    const semanticLaneInput = {
+      store,
+      config: effectiveConfig,
+      policy,
+      query,
+      semanticLaneQuery: shape.semanticLaneQuery,
+      limit,
+      pathPrefix,
+      ...(kind !== undefined ? { kind } : {}),
+      ...(pushdown !== null ? { pushdown } : {}),
+      keywordHitCount: () => keywordHits.length,
+      ...(opts.transportReach !== undefined ? { transportReach: opts.transportReach } : {}),
+      ...(laneTimingSink !== undefined ? { timing: embedTiming } : {}),
+    };
+    const semanticLaneJoin = startSemanticLane({
+      deadline,
+      fallback: emptySemanticLane,
+      start: () =>
+        runSemanticLane(
+          deadline === null ? semanticLaneInput : { ...semanticLaneInput, signal: deadline.signal },
+        ),
+    });
+
     // Keyword candidates, with the plan the synonym step may have re-built.
+    // The interval stamps read the request's clock port, never the wall
+    // clock directly - the rank-clock census pins the read site.
+    const keywordStartMs = clock();
     const keywordLane = runKeywordLane({
       store,
       recall: effectiveConfig.recall,
@@ -426,7 +606,7 @@ export async function search(
       ...(pushdown !== null ? { pushdown } : {}),
       matchMode: request.matchMode,
     });
-    let keywordHits = keywordLane.hits;
+    keywordHits = keywordLane.hits;
     for (const w of keywordLane.warnings) warnings.push(w);
     for (const d of keywordLane.degraded) degraded.push(d);
 
@@ -434,31 +614,37 @@ export async function search(
       effectiveConfig,
       keywordLane.plan,
     );
+    // The hidden window the join waits through includes the weights
+    // resolution, so the keyword interval ends here, not at the lane return.
+    const keywordEndMs = clock();
 
-    // Semantic candidates (may be skipped). Under the composite deadline
-    // the lane races the clock and is abandoned past it, serving the empty
-    // lane outcome - the fire note explains the keyword-only answer.
-    const semanticLaneInput = {
-      store,
-      config: effectiveConfig,
-      policy,
-      query,
-      semanticLaneQuery: shape.semanticLaneQuery,
-      limit,
-      pathPrefix,
-      ...(kind !== undefined ? { kind } : {}),
-      ...(pushdown !== null ? { pushdown } : {}),
-      keywordHitCount: keywordHits.length,
-      ...(opts.transportReach !== undefined ? { transportReach: opts.transportReach } : {}),
-    };
-    const semanticLane =
-      deadline === null
-        ? await runSemanticLane(semanticLaneInput)
-        : await awaitWithinDeadline(
-            () => runSemanticLane({ ...semanticLaneInput, signal: deadline.signal }),
-            deadline,
-            emptySemanticLane,
-          );
+    // The join, where the serial await stood: the keyword lanes ran to
+    // completion above while the embed round trip was outstanding. Their
+    // warnings merged first, and the lane's merge here keeps the same
+    // keyword-before-semantic order the serial pipeline emitted.
+    const semanticLane = await semanticLaneJoin.join();
+    // One sink call at the join, on both deadline arms: the intervals and
+    // their intersection, zero whenever no embed interval was stamped
+    // (keyword-only, or a pre-flight refusal left no stamps). The start
+    // is the dispatch report when the provider gave one, and the pre-call
+    // fallback otherwise (a provider that never reports dispatches keeps
+    // its whole-awaited-call interval). An embed that ran and was
+    // discarded still reports its real interval.
+    if (laneTimingSink !== undefined) {
+      const embedStartMs = embedTiming.embedStartMs ?? embedTiming.preCallStartMs;
+      const embedEndMs = embedTiming.embedEndMs;
+      laneTimingSink({
+        ...(embedStartMs !== undefined ? { embedStartMs } : {}),
+        ...(embedEndMs !== undefined ? { embedEndMs } : {}),
+        keywordStartMs,
+        keywordEndMs,
+        overlappedMs:
+          embedStartMs !== undefined && embedEndMs !== undefined
+            ? overlappedEmbedMs(embedStartMs, embedEndMs, keywordStartMs, keywordEndMs)
+            : 0,
+        attempted: semanticLane.attempted,
+      });
+    }
     let semanticHits = semanticLane.hits;
     let semanticAttempted = semanticLane.attempted;
     for (const w of semanticLane.warnings) warnings.push(w);

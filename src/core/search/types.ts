@@ -861,6 +861,66 @@ export interface EvidencePack {
   readonly completeness?: CompletenessReport;
 }
 
+/**
+ * Per-call lane timing (recall-lane-latency): when the embed round trip
+ * ran relative to the keyword lanes, and how much of it they hid - the
+ * intersection of the embed's dispatch-to-resolution interval with the
+ * keyword interval, `max(0, min(embedEnd, keywordEnd) -
+ * max(embedStart, keywordStart))`, zero whenever no embed interval was
+ * stamped.
+ *
+ * This record rides a per-call sink and NEVER lands on
+ * {@link SearchOutcome}: the query cache persists whole outcomes, so an
+ * outcome field would freeze one call's timings into every cached row
+ * served afterwards. Absent embed stamps mean the embed never ran.
+ */
+export interface SearchLaneTiming {
+  /**
+   * Absolute `Date.now()` stamp of the query embed's start - the moment
+   * the provider put the request on the wire, as reported through the
+   * provider's dispatch callback. A provider that does not report
+   * dispatches falls back to the instant the phase called into it, so
+   * its interval stays the whole awaited call. Absent when the embed
+   * never ran.
+   */
+  readonly embedStartMs?: number;
+  /**
+   * Absolute `Date.now()` stamp of the query embed's RESOLUTION: when
+   * the phase's continuation around the provider promise ran, i.e. the
+   * answer (or the failure) came back - never a claim about any wire
+   * event past that return. Absent when the embed never ran.
+   */
+  readonly embedEndMs?: number;
+  /** Absolute `Date.now()` stamp taken when the keyword lanes started. */
+  readonly keywordStartMs: number;
+  /** Absolute `Date.now()` stamp taken when the keyword lanes and the weights resolution completed. */
+  readonly keywordEndMs: number;
+  /**
+   * The overlapped milliseconds, an integer >= 0; 0 when no embed
+   * interval was stamped. This key answers HOW MUCH of the keyword
+   * interval the embed's dispatch-to-resolution hid, and it is reported
+   * whenever both embed stamps exist - the interval was measured, even
+   * if the lane's hits were discarded afterwards.
+   */
+  readonly overlappedMs: number;
+  /**
+   * Whether the semantic lane delivered a result to the join. An embed
+   * that never ran or failed before the join reports false; an embed the
+   * deadline's post-join void then discarded can still report true - the
+   * sink is read at the join, and the void past it is the deadline's,
+   * not this flag's.
+   *
+   * This key answers a different question than `overlappedMs` - whether
+   * the lane's hits joined the answer, not whether embed time was
+   * measured - so the two can legitimately disagree: a deadline fallback
+   * that wins after the embed ran reports measured overlap alongside
+   * `attempted: false`. Consumers pick per question; the bench reports
+   * `overlapped_ms` only for questions that attempted, `--explain`
+   * prints both as measured.
+   */
+  readonly attempted: boolean;
+}
+
 export interface SearchOptions {
   readonly query: string;
   readonly limit?: number;
@@ -1129,6 +1189,15 @@ export interface SearchOptions {
    * it unset.
    */
   readonly freshenSpawn?: (argv: string[]) => void;
+  /**
+   * Per-call lane-timing sink (recall-lane-latency), in the
+   * {@link SearchOptions.freshenSpawn} mold: invoked once at the
+   * semantic-lane join with the embed and keyword intervals and their
+   * overlap. Nothing timing-shaped reaches the outcome or the query
+   * cache - surfaces that want the figure project it themselves
+   * (`search --explain`, the bench). Omitted records nothing.
+   */
+  readonly laneTiming?: (timing: SearchLaneTiming) => void;
   /**
    * Skip rerank kind `decision-model` for this call. Set by the hook
    * surfaces (recall inject), whose time budget is shorter than a decision

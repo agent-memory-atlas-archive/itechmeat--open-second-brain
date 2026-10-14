@@ -16,6 +16,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { evaluateAttentionFlow, listAttentionFlows } from "../brain/attention-flows.ts";
 import { packContext } from "../brain/context-pack.ts";
 import { TRANSPORT_REACH } from "../graph/transport-reach.ts";
 import { loadNormalizedContinuityRecords } from "../brain/continuity/read-model.ts";
@@ -27,6 +28,7 @@ import {
   type RecallInjectDecision,
 } from "../brain/recall-inject.ts";
 import { resolveSearchConfig, search } from "../search/index.ts";
+import type { SearchLaneTiming } from "../search/index.ts";
 import { evaluateSurfacingGate } from "../search/surfacing-gate.ts";
 import {
   BENCH_EMBEDDING_RECEIPT_FILENAME,
@@ -77,6 +79,12 @@ import {
  * a smaller vault than the one under test.
  */
 const BENCH_REACH = TRANSPORT_REACH.local;
+/**
+ * The standing-instruction facet category (recall-lane-latency). It is
+ * the ONE category the headline quality family excludes: its rate stays
+ * the named line of its own in `by_category`.
+ */
+const STANDING_INSTRUCTION_CATEGORY = "standing_instruction";
 
 export interface BenchRunOptions {
   readonly fixture: BenchFixture;
@@ -134,6 +142,11 @@ export interface BenchRunOptions {
 interface RetrievedQuestion {
   readonly id: string;
   readonly latency_ms: number;
+  /**
+   * Overlapped lane milliseconds (recall-lane-latency), present only when
+   * the semantic lane attempted the embed for this question.
+   */
+  readonly overlapped_ms?: number;
   /** Result paths in rank order (retrieval categories). */
   readonly paths?: ReadonlyArray<string>;
   /** Normalized turn texts (session_handoff). */
@@ -152,6 +165,18 @@ interface RetrievedQuestion {
   readonly provenance_keys?: ReadonlyArray<string>;
   /** Whether a second identical extraction produced the same record ids. */
   readonly dedup_stable?: boolean;
+  /**
+   * The item strings the standing_query sections rendered, annotations
+   * included (standing_instruction). The evaluator asserts the expected
+   * earliest-cited coordinates against these.
+   */
+  readonly standing_items?: ReadonlyArray<string>;
+  /**
+   * Facet keys (`pref:<preference id>`) whose provenance join resolved
+   * (standing_instruction). A preference the lane surfaced but could not
+   * resolve is honestly absent - never an implied origin.
+   */
+  readonly facet_ids?: ReadonlyArray<string>;
 }
 
 /**
@@ -310,7 +335,13 @@ export async function runMemoryBench(opts: BenchRunOptions): Promise<BenchReport
     // oxlint-disable-next-line no-await-in-loop
     for (const question of opts.fixture.questions) {
       // oxlint-disable-next-line no-await-in-loop
-      const retrieved = await retrieveQuestion(vault, config, question, opts.recallFloor);
+      const retrieved = await retrieveQuestion(
+        vault,
+        config,
+        question,
+        pinnedKnobs,
+        opts.recallFloor,
+      );
       writeFileSync(
         join(benchResultsDir(run.runDir), `${question.id}.json`),
         `${JSON.stringify(retrieved, null, 2)}\n`,
@@ -400,18 +431,28 @@ async function retrieveQuestion(
   vault: string,
   config: ReturnType<typeof resolveSearchConfig>,
   question: BenchQuestion,
+  pinnedKnobs: BenchPinnedKnobs,
   recallFloor?: number,
 ): Promise<RetrievedQuestion> {
   const startedAt = Date.now();
   if (RETRIEVAL_CATEGORIES.has(question.category)) {
+    // Overlapped lane accounting (recall-lane-latency): the per-call sink
+    // rides this question's search and the figure is persisted only when
+    // the semantic lane attempted the embed, so a keyword-only suite
+    // keeps its report bytes.
+    let laneTiming: SearchLaneTiming | undefined;
     const outcome = await search(config, {
       query: question.query ?? "",
       limit: question.top_k ?? 5,
       transportReach: BENCH_REACH,
+      laneTiming: (timing) => {
+        laneTiming = timing;
+      },
     });
     return {
       id: question.id,
       latency_ms: Date.now() - startedAt,
+      ...(laneTiming?.attempted === true ? { overlapped_ms: laneTiming.overlappedMs } : {}),
       paths: outcome.results.map((result) => result.path),
     };
   }
@@ -476,6 +517,9 @@ async function retrieveQuestion(
       context_chars: brief.length,
       injected_tokens: injectedTokens(brief),
     };
+  }
+  if (question.category === STANDING_INSTRUCTION_CATEGORY) {
+    return retrieveStandingInstruction(vault, question, startedAt, pinnedKnobs);
   }
   if (question.category === "write_fidelity") {
     return retrieveWriteFidelity(vault, question, startedAt);
@@ -556,6 +600,51 @@ function provenanceKeys(record: ContinuityRecord): ReadonlyArray<string> {
 }
 
 /**
+ * Run the shipped standing_query surfacing lane over the fixture's
+ * attention flows (standing_instruction, recall-lane-latency).
+ *
+ * The lane's arm follows the run's knob pin: absent or true, the facet
+ * option is on - the category exists to measure the provenance join.
+ * Pinned false, the plain lane runs and emits the legacy strings, so the
+ * category's facet assertions fail by name: the off arm of the A/B the
+ * design promises, which is what makes the pin change what a run
+ * measures instead of only naming it. Every flow that declares the
+ * `standing_query` action is evaluated and its surfaced items and
+ * resolved facet keys persisted; a preference the lane surfaces but
+ * whose join does not resolve contributes its plain string and no facet,
+ * exactly as the option contract renders it.
+ */
+function retrieveStandingInstruction(
+  vault: string,
+  question: BenchQuestion,
+  startedAt: number,
+  pinnedKnobs: BenchPinnedKnobs,
+): RetrievedQuestion {
+  // Absent keeps the lane on, so existing runs and the default pin
+  // measure the facet lane exactly as before the pin was wired.
+  const facetsOn = pinnedKnobs.standingInstructionFacets !== false;
+  const items: string[] = [];
+  const facetIds: string[] = [];
+  for (const flow of listAttentionFlows(vault)) {
+    if (!flow.actions.includes("standing_query")) continue;
+    const evaluation = facetsOn
+      ? evaluateAttentionFlow(vault, flow.id, { standingInstructionFacets: true })
+      : evaluateAttentionFlow(vault, flow.id, { standingInstructionFacets: false });
+    for (const section of evaluation.sections) {
+      if (section.action !== "standing_query") continue;
+      items.push(...section.items);
+      for (const facet of section.facets ?? []) facetIds.push(facet.key);
+    }
+  }
+  return {
+    id: question.id,
+    latency_ms: Date.now() - startedAt,
+    standing_items: items,
+    facet_ids: facetIds,
+  };
+}
+
+/**
  * Fixed authoring instant for write-fidelity extraction. Extraction
  * defaults `createdAt` to wall clock, which would make the record ids -
  * and therefore the whole report - differ on every run.
@@ -578,6 +667,7 @@ function evaluateQuestion(
     id: question.id,
     category: question.category,
     latency_ms: retrieved.latency_ms,
+    ...(retrieved.overlapped_ms !== undefined ? { overlapped_ms: retrieved.overlapped_ms } : {}),
     ...(retrieved.context_chars !== undefined ? { context_chars: retrieved.context_chars } : {}),
     ...(retrieved.injected_tokens !== undefined
       ? { injected_tokens: retrieved.injected_tokens }
@@ -637,6 +727,9 @@ function evaluateQuestion(
       });
     }
     return Object.freeze({ ...base, pass: true });
+  }
+  if (question.category === STANDING_INSTRUCTION_CATEGORY) {
+    return evaluateStandingInstruction(question, retrieved, base);
   }
   // budget
   const ids = retrieved.item_ids ?? [];
@@ -724,6 +817,64 @@ function evaluateWriteFidelity(
   return Object.freeze({ ...base, pass: true });
 }
 
+/**
+ * Assert the standing-instruction facet lane delivered what the fixture
+ * named (standing_instruction, recall-lane-latency).
+ *
+ * `expected_ids` are facet keys - `pref:<preference id>`, so the
+ * preference id itself is what is asserted delivered. `expected_text`
+ * is the full earliest-cited annotation that must CLOSE the first named
+ * preference's item: the assertion finds the item for `expected_ids[0]`
+ * and compares the annotation exactly, closing bracket included, so a
+ * near-miss origin (`...#t1`) cannot satisfy an expectation about
+ * another (`...#t10`) and an origin cannot pass by sitting on a
+ * different preference's item. A fixture states the kind word ("earliest
+ * cited turn ..."/"earliest cited session ...") so a session-annotated
+ * origin cannot satisfy a turn expectation. A preference the lane
+ * surfaced but could not resolve is a named failure, never an implied
+ * provenance.
+ */
+function evaluateStandingInstruction(
+  question: BenchQuestion,
+  retrieved: RetrievedQuestion,
+  base: ResultBase,
+): BenchQuestionResult {
+  const facetIds = retrieved.facet_ids ?? [];
+  const missingFacets = (question.expected_ids ?? []).filter((id) => !facetIds.includes(id));
+  if (missingFacets.length > 0) {
+    return Object.freeze({
+      ...base,
+      pass: false,
+      failure: `expected facet missing from the surfaced standing instructions: ${missingFacets.join(", ")}`,
+    });
+  }
+  const expectedOrigin = question.expected_text;
+  if (expectedOrigin !== undefined) {
+    // Tie the annotation to the expected preference's own item: the
+    // first expected facet key names the preference, and its item is the
+    // `id (scope)` string the lane renders for it.
+    const expectedKey = question.expected_ids?.[0];
+    const expectedId =
+      expectedKey !== undefined && expectedKey.startsWith("pref:")
+        ? expectedKey.slice("pref:".length)
+        : undefined;
+    const item =
+      expectedId === undefined
+        ? undefined
+        : (retrieved.standing_items ?? []).find((candidate) =>
+            candidate.startsWith(`${expectedId} (`),
+          );
+    if (item === undefined || !item.endsWith(expectedOrigin)) {
+      return Object.freeze({
+        ...base,
+        pass: false,
+        failure: `expected origin annotation not found on the item for ${expectedKey ?? "(no facet named)"}: ${expectedOrigin}`,
+      });
+    }
+  }
+  return Object.freeze({ ...base, pass: true });
+}
+
 function evaluateSourceIsolation(
   question: BenchQuestion,
   retrieved: RetrievedQuestion,
@@ -764,15 +915,29 @@ function buildReport(
 ): BenchReport {
   const byCategory: Record<string, { passed: number; total: number }> = {};
   let passed = 0;
+  let total = 0;
   for (const result of results) {
     const bucket = (byCategory[result.category] ??= { passed: 0, total: 0 });
     bucket.total += 1;
     if (result.pass) {
       bucket.passed += 1;
-      passed += 1;
+    }
+    // The standing_instruction category never folds into the headline
+    // (recall-lane-latency): its rate stays the named line of its own in
+    // `by_category`, so adding facet questions to a fixture cannot shift
+    // the headline pass rate a baseline compares.
+    if (result.category !== STANDING_INSTRUCTION_CATEGORY) {
+      total += 1;
+      if (result.pass) passed += 1;
     }
   }
   const latencies = results.map((result) => result.latency_ms);
+  // The latency family's overlap figure (recall-lane-latency): averaged
+  // over the questions that attempted the semantic lane, present only
+  // when at least one did - a keyword-only report keeps its bytes.
+  const overlappedMsValues = results
+    .map((result) => result.overlapped_ms)
+    .filter((value): value is number => value !== undefined);
   const avgChars = mean(results.map((result) => result.context_chars));
   // The suite's ONE token number, from the ONE estimator. The inline
   // `ceil(avg_chars / 4)` that stood here was a sixth formula in a repo
@@ -796,8 +961,8 @@ function buildReport(
     created_at: run.checkpoint.created_at,
     quality: Object.freeze({
       passed,
-      total: results.length,
-      pass_rate: results.length > 0 ? round3(passed / results.length) : 0,
+      total,
+      pass_rate: total > 0 ? round3(passed / total) : 0,
       by_category: Object.freeze(
         Object.fromEntries(Object.entries(byCategory).toSorted(([a], [b]) => (a < b ? -1 : 1))),
       ),
@@ -808,6 +973,13 @@ function buildReport(
           ? Math.round(latencies.reduce((sum, value) => sum + value, 0) / latencies.length)
           : 0,
       max: latencies.length > 0 ? Math.max(...latencies) : 0,
+      ...(overlappedMsValues.length > 0
+        ? {
+            overlapped_ms: Math.round(
+              overlappedMsValues.reduce((sum, value) => sum + value, 0) / overlappedMsValues.length,
+            ),
+          }
+        : {}),
     }),
     context_cost: Object.freeze({
       avg_chars: avgChars,
