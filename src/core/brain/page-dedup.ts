@@ -573,6 +573,59 @@ export function retargetWikilinks(
 }
 
 /**
+ * True when a page OTHER than `excludeRel` carries `basename` under the
+ * retarget root: the bare-basename link spelling `[[basename]]` then
+ * resolves to more than one page, and a retarget keyed on the spelling
+ * alone would repoint links that meant the other page - silent
+ * mis-linking of pages the caller never considered.
+ *
+ * The population is the retarget's own - same default root, same scope
+ * rules - so a page whose links the pass would never touch cannot
+ * manufacture a collision, and a page whose links it WOULD touch cannot
+ * hide from one. A caller's `readable` predicate is deliberately not
+ * applied: a withheld page still exists on disk, and existence is what
+ * makes the spelling ambiguous.
+ */
+export function basenameCollides(
+  vault: string,
+  basename: string,
+  excludeRel: string,
+  opts: Pick<RetargetWikilinksOptions, "root"> = {},
+): boolean {
+  const root = opts.root === undefined ? BRAIN_ROOT_REL : opts.root;
+  const abs = root === "" ? vault : join(vault, root);
+  if (!existsSync(abs)) return false;
+  const rules = resolveVaultScope(vault).rules;
+  for (const file of markdownFilesUnder(vault, abs, rules)) {
+    if (file.rel === excludeRel) continue;
+    const name = file.rel.split("/").at(-1) ?? "";
+    if (name.replace(/\.md$/, "") === basename) return true;
+  }
+  return false;
+}
+
+/**
+ * A wikilink rewrite that gave up partway: `rewritten` files were
+ * repointed before the write that refused.
+ *
+ * Carrying the count on the error is what lets the merge's fail-soft
+ * caller report how far the pass got - the rewrite half landed, so a
+ * bare message would leave the reader unable to tell how much of the
+ * repoint the vault actually took.
+ */
+export class PatchWikilinksError extends Error {
+  /** Files the pass rewrote before the one it could not. */
+  readonly rewritten: number;
+  constructor(rewritten: number, path: string, reason: string) {
+    super(
+      `patchWikilinks: rewrote ${rewritten} file(s), then could not write ` + `${path}: ${reason}`,
+    );
+    this.name = "PatchWikilinksError";
+    this.rewritten = rewritten;
+  }
+}
+
+/**
  * Rewrite every `[[<oldTarget>]]` reference inside `<vault>/Brain/`
  * to `[[<newTarget>]]`. Returns the number of files touched.
  *
@@ -582,10 +635,11 @@ export function retargetWikilinks(
  * basename spelling - and widening the merge's call site would have made
  * it answer questions it does not ask.
  *
- * Raises on a write failure rather than reporting it. The merge's caller
- * counts files and has nowhere to put the identity of one that did not
- * take, so for THIS spelling a failure has to be an error; the note-file
- * lifecycle, which does have somewhere to put it, reads `failed`.
+ * Raises a {@link PatchWikilinksError} on a write failure rather than
+ * reporting it. The merge's caller counts files and has nowhere to put
+ * the identity of one that did not take, so for THIS spelling a failure
+ * has to be an error; the note-file lifecycle, which does have somewhere
+ * to put it, reads `failed`.
  */
 export function patchWikilinks(vault: string, oldTarget: string, newTarget: string): number {
   if (oldTarget === newTarget) {
@@ -598,10 +652,7 @@ export function patchWikilinks(vault: string, oldTarget: string, newTarget: stri
   const report = retargetWikilinks(vault, [{ from: oldTarget, to: newTarget }]);
   const first = report.failed[0];
   if (first !== undefined) {
-    throw new Error(
-      `patchWikilinks: rewrote ${report.rewritten.length} file(s), then could not write ` +
-        `${first.path}: ${first.reason}`,
-    );
+    throw new PatchWikilinksError(report.rewritten.length, first.path, first.reason);
   }
   return report.rewritten.length;
 }

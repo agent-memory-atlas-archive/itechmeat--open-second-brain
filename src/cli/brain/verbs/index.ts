@@ -86,6 +86,8 @@ export { cmdBrainLinks } from "./links.ts";
 export { cmdBrainProfile } from "./profile.ts";
 export { cmdBrainSgrep } from "./sgrep.ts";
 export { cmdBrainContinuity } from "./continuity.ts";
+export { cmdBrainReceipts } from "./receipts.ts";
+export { cmdBrainStorage } from "./storage.ts";
 export { cmdBrainPayload } from "./payload.ts";
 export { cmdBrainSessionSummary } from "./session-summary.ts";
 export { cmdBrainIdeaLineage } from "./idea-lineage.ts";

@@ -252,6 +252,10 @@ describe("tool listing", () => {
         "brain_context_receipts",
         "brain_event_trace",
         "brain_recall_telemetry",
+        // Receipt compaction over the receipt ledgers (storage-lifecycle).
+        "brain_receipts",
+        // The vault storage report (storage-lifecycle).
+        "brain_storage",
         // Observed-use verdict feeding recall ranking (Retrieval & Ranking Quality).
         "brain_observed_use",
         "brain_knowledge_gaps",

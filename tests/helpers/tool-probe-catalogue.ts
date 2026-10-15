@@ -296,8 +296,8 @@ export const REASONS_REACHING_OWNER_CONTENT: ReadonlySet<string> = new Set([REAS
  * `docs/mcp.md` and the release notes. Equalities, not floors - see the
  * test that reads them.
  */
-export const PROBE_ENTRY_COUNT = 101;
-export const PROBE_RECIPE_COUNT = 235;
+export const PROBE_ENTRY_COUNT = 103;
+export const PROBE_RECIPE_COUNT = 238;
 export const PROBE_TWO_SIDED_COUNT = 32;
 
 /**
@@ -924,6 +924,21 @@ export const NON_CONTENT: ReadonlyArray<ProbeEntry> = [
     ],
   },
   {
+    name: "brain_receipts",
+    calls: [
+      // Default mode is the scan: counts, byte sizes and vault-relative
+      // shard paths over the receipt ledgers, which carry no `owner:`
+      // field to filter on - the same lane as the telemetry above.
+      { args: {}, reason: REASON.ownerlessLane },
+      // A dry-run compact over an absent shard: the fold plan and the
+      // collected unreadable-shard failure, no write and no record body.
+      {
+        args: { mode: "compact", shards: ["continuity:receipt-probe-absent.jsonl"] },
+        reason: REASON.ownerlessLane,
+      },
+    ],
+  },
+  {
     name: "brain_recurrence",
     calls: [
       { args: { operation: "list" }, reason: REASON.ownerlessLane },
@@ -996,6 +1011,13 @@ export const NON_CONTENT: ReadonlyArray<ProbeEntry> = [
   { name: "brain_sources", calls: one({}, REASON.signalAuthorship) },
   { name: "brain_stale_scan", calls: one({}, REASON.ownerFiltered) },
   { name: "brain_status", calls: one({}, REASON.aggregateOnly) },
+  {
+    // The storage report is an aggregate like brain_status beside it:
+    // per-surface byte counts and a forecast tier over the whole vault,
+    // nothing an owner field could filter and nothing the probe wrote.
+    name: "brain_storage",
+    calls: one({}, REASON.aggregateOnly),
+  },
   { name: "brain_switch_vault", calls: one({ name: "probe-profile" }, REASON.writerEcho) },
   {
     name: "brain_tension",

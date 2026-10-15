@@ -43,6 +43,8 @@ import { LIFECYCLE_TOOLS } from "./brain/lifecycle-tools.ts";
 import { LIFECYCLE_FILE_TOOLS } from "./brain/lifecycle-file-tools.ts";
 import { DECISIONS_TOOLS } from "./brain/decisions-tools.ts";
 import { TENSION_TOOLS } from "./brain/tension-tools.ts";
+import { STORAGE_TOOLS } from "./brain/storage-tools.ts";
+import { RECEIPT_TOOLS } from "./brain/receipt-tools.ts";
 import type { ToolDefinition } from "./tool-contract.ts";
 
 export { vaultRelativeSafe } from "./brain/shared.ts";
@@ -81,4 +83,9 @@ export const BRAIN_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   ...LIFECYCLE_FILE_TOOLS,
   ...DECISIONS_TOOLS,
   ...TENSION_TOOLS,
+  // Storage lifecycle: the measured-or-refused storage report, then the
+  // receipt-compaction scan / compact surface over the continuity and
+  // metrics receipt ledgers.
+  ...STORAGE_TOOLS,
+  ...RECEIPT_TOOLS,
 ]);

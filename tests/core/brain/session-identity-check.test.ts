@@ -355,6 +355,7 @@ const KIND_WRITERS: ReadonlyArray<{
     sessionScoped: false,
     writers: [
       "core/brain/continuity/store.ts",
+      "core/brain/document-retire.ts",
       "core/brain/source-cleanup.ts",
       "core/brain/portability/knowledge-pack.ts",
     ],
@@ -370,6 +371,11 @@ const KIND_WRITERS: ReadonlyArray<{
     kind: "session_entity_mention",
     sessionScoped: false,
     writers: ["core/brain/link-graph/session-mining.ts"],
+  },
+  {
+    kind: "receipt_compaction",
+    sessionScoped: false,
+    writers: ["core/brain/receipts/compact.ts"],
   },
 ]);
 

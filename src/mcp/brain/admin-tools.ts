@@ -32,7 +32,11 @@ import type { ProgressSink } from "../../core/brain/progress.ts";
 import { readableAtContextReach, readableAtContextReachOrUndefined } from "./reach-readable.ts";
 import { requiredStringArg, toolSafeguard } from "./shared.ts";
 import { currentLease } from "../../core/brain/maintenance/lease.ts";
-import { listJournal, MAINTENANCE_JOURNAL_CAP } from "../../core/brain/maintenance/journal.ts";
+import {
+  journalEntryWithoutCapacityReading,
+  listJournal,
+  MAINTENANCE_JOURNAL_CAP,
+} from "../../core/brain/maintenance/journal.ts";
 import {
   CUSTOM_TASK_MAX,
   customTasksOffNotice,
@@ -374,11 +378,18 @@ async function toolBrainMaintenance(
     // The journal depth is the caller's, as it is on the CLI. It was
     // hardcoded at ten here, so an agent reading a lane that had refused
     // a task days ago could not see far enough back to find the failures
-    // behind the streak - the one thing the journal is kept for.
+    // behind the streak - the one thing the journal is kept for. Below
+    // local reach the rows lose their capacity reading: the whole-vault
+    // byte figures are the same local-reach facts `brain_storage` gates
+    // (`journalEntryWithoutCapacityReading`), and status - unlike run -
+    // answers at every reach.
+    const local = contextReach(ctx) === TRANSPORT_REACH.local;
     const notice = customTasksOffNotice(resolveCustomTasks(ctx.configPath ?? undefined));
     return {
       lease: currentLease(ctx.vault, { now }),
-      journal: listJournal(ctx.vault, coerceInt(args, "limit", 10, 1, MAINTENANCE_JOURNAL_CAP)),
+      journal: listJournal(ctx.vault, coerceInt(args, "limit", 10, 1, MAINTENANCE_JOURNAL_CAP)).map(
+        (entry) => (local ? entry : journalEntryWithoutCapacityReading(entry)),
+      ),
       ...(notice !== null ? { notice } : {}),
     };
   }
@@ -495,6 +506,10 @@ async function toolBrainMaintenance(
   return {
     verdict: result.verdict,
     tasks: result.tasks,
+    // The capacity gate's report on a skipped:capacity run: the tier and
+    // the remedy, attached verbatim from the lane so the two front doors
+    // cannot disagree about what a skip says.
+    ...(result.capacity !== undefined ? { capacity: result.capacity } : {}),
     ...(spend !== undefined ? { spend } : {}),
     // Named, never dropped: a refused declaration journals nothing, and
     // the valid tasks still ran.
@@ -580,7 +595,7 @@ export const ADMIN_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: "brain_maintenance",
     description:
-      "Quiet-window, lease-guarded maintenance lane: run executes dream, reindex, bridges, clusters and declared custom:<name> tasks behind window, busy, pressure and streak gates; status renders lease and journal. Reindex embeds only with config maintenance_embeddings.",
+      "Quiet-window, lease-guarded maintenance lane: run executes dream, reindex, bridges, clusters and declared custom:<name> tasks behind window, busy, pressure, capacity and streak gates; status renders lease and journal. Reindex embeds only with config maintenance_embeddings.",
     inputSchema: {
       type: "object",
       properties: {
@@ -592,7 +607,7 @@ export const ADMIN_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           // A caller reaching for the widest escape has to be told what
           // it actually switches off.
           description:
-            "Bypass the window, busy and host-pressure gates and every streak refusal - never the lease (run). retry_tasks passes one task's streak with the gates kept.",
+            "Bypass the window, busy, host-pressure and storage-capacity gates and every streak refusal; never the lease (run). retry_tasks passes one streak, gates kept.",
         },
         retry_tasks: {
           type: "array",

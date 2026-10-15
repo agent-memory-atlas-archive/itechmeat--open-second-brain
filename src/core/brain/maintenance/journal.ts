@@ -24,6 +24,7 @@ import {
 } from "../ledger-shards.ts";
 import { DERIVED_STORE_DIR } from "../path-constants.ts";
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
+import type { StorageForecastTier } from "../storage/forecast.ts";
 import type { HostPressureUnmeasurableReason } from "./host-pressure.ts";
 import { isCustomLaneTask } from "./custom-task-id.ts";
 import { renameWithRetry } from "../../fs-atomic.ts";
@@ -39,11 +40,11 @@ export const MAINTENANCE_JOURNAL_CAP = 500;
  * that wrote them. The guard is the boundary for a row this build does
  * not understand.
  *
- * Two of the members are not decisions about whether to run:
- * `pressure:unmeasurable` is a NOTICE that a gate could not evaluate, and
- * it is emitted on its own line beside the decision, never instead of it.
- * `refused:streak` is a per-task refusal, so it appears among the task
- * rows rather than in place of them.
+ * Three of the members are not decisions about whether to run:
+ * `pressure:unmeasurable` and `capacity:unmeasurable` are NOTICES that a
+ * gate could not evaluate, and each is emitted on its own line beside the
+ * decision, never instead of it. `refused:streak` is a per-task refusal,
+ * so it appears among the task rows rather than in place of them.
  */
 export const MAINTENANCE_VERDICT = Object.freeze({
   /** The gates were open; the row's task ran (or the lane ran). */
@@ -52,11 +53,15 @@ export const MAINTENANCE_VERDICT = Object.freeze({
   skippedBusy: "skipped:busy",
   /** Host pressure was measured and stood at or above the configured percentage. */
   skippedPressure: "skipped:pressure",
+  /** The storage-capacity gate measured the vault at the critical tier. */
+  skippedCapacity: "skipped:capacity",
   skippedLease: "skipped:lease",
   /** This task has failed too many times in a row to retry unforced. */
   refusedStreak: "refused:streak",
   /** The host-pressure gate could not evaluate; it was left open. */
   pressureUnmeasurable: "pressure:unmeasurable",
+  /** The storage-capacity gate could not evaluate; it was left open. */
+  capacityUnmeasurable: "capacity:unmeasurable",
 });
 
 export const MAINTENANCE_VERDICTS: ReadonlyArray<string> = Object.freeze(
@@ -91,6 +96,19 @@ export interface MaintenanceJournalEntry {
   readonly pressure_percent?: number;
   /** Why the gate could not read one, on a `pressure:unmeasurable` row. */
   readonly pressure_reason?: HostPressureUnmeasurableReason;
+  /** Storage tier the capacity gate read, on a `skipped:capacity` row. */
+  readonly capacity_tier?: StorageForecastTier;
+  /**
+   * The reading behind that tier, on a `skipped:capacity` row, riding the
+   * way `pressure_percent` does: the percent of the configured cap, and
+   * the measured bytes and cap it is a percent of. Written together,
+   * only when the gate decision carried a reading.
+   */
+  readonly capacity_percent?: number;
+  readonly capacity_measured_bytes?: number;
+  readonly capacity_cap_bytes?: number;
+  /** Why the capacity gate could not read a tier, on a `capacity:unmeasurable` row. */
+  readonly capacity_reason?: string;
   /** Consecutive journaled failures behind a `refused:streak` row. */
   readonly streak?: number;
   /**
@@ -144,6 +162,30 @@ export function recordedPriceSource(
   return isEmbeddingPriceSource(receipt.priceSource)
     ? receipt.priceSource
     : PRICE_SOURCE_UNRECORDED;
+}
+
+/**
+ * The row a surface below local reach may render. A `skipped:capacity`
+ * row carries the reading behind the skip - the whole-vault measured
+ * bytes, the configured cap and the percent of one against the other -
+ * and those are the same local-reach facts the storage report refuses to
+ * take below local reach: totals that move when a page the caller may
+ * not read appears or goes. The journal itself keeps them (the
+ * operator's own record); this drops exactly the three reading fields
+ * and keeps the tier word and the unmeasurable reason, which name a
+ * verdict, never a size. A surface at local reach renders the row
+ * unchanged.
+ */
+export function journalEntryWithoutCapacityReading(
+  entry: MaintenanceJournalEntry,
+): MaintenanceJournalEntry {
+  const {
+    capacity_percent: _percent,
+    capacity_measured_bytes: _measured,
+    capacity_cap_bytes: _cap,
+    ...rest
+  } = entry;
+  return rest;
 }
 
 /**

@@ -11,7 +11,11 @@
  *   - `recompile` -> the targeted-recompile executor, scoped to the
  *                    finding's page;
  *   - `archive` / `forget` -> move the page into a dated
- *                    `Brain/.snapshots/` directory - never delete.
+ *                    `Brain/.snapshots/` directory - never delete;
+ *   - `retire`    -> the document retirement core: a near-duplicate
+ *                    copy is deleted, its manifest entry dropped and
+ *                    its removal audited (destructive by design, so
+ *                    the plan builder only selects it attended).
  *
  * Dry-run previews the routed actions with zero writes. Per-finding
  * fail-soft; one audit record per non-dry run.
@@ -21,11 +25,13 @@ import { join } from "node:path";
 
 import { appendAuditRecord } from "../../reliability/audit.ts";
 import { HYGIENE_AUDIT_DIR } from "../audit-dirs.ts";
+import { retireDocumentCopies } from "../document-retire.ts";
 import { mergePreferences } from "../merge.ts";
 import { brainDirsForWrite } from "../paths.ts";
 import { archivePage, executeRecompile, planRecompile } from "../recompile.ts";
 import { appendClaimEvent } from "../truth/store.ts";
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
+import type { WriteSubject } from "../write-disposition.ts";
 import type { HygienePlan } from "./plan.ts";
 import type { HygieneFinding } from "./types.ts";
 
@@ -33,6 +39,15 @@ export interface HygieneApplyOptions {
   readonly dryRun?: boolean;
   readonly agent: string;
   readonly now: Date;
+  /**
+   * Credential subject for the destructive routes' deny consult. Only
+   * the `retire` executor consults a permissions document today (through
+   * the retirement core, the same ladder deleteBySource climbs); with no
+   * subject the consult falls back to the ambient agent, so a surface
+   * holding a request identity must pass it here or a rule naming that
+   * identity is silently bypassed on this route.
+   */
+  readonly subject?: WriteSubject;
 }
 
 export interface HygieneAppliedAction {
@@ -128,6 +143,45 @@ async function executeFinding(
         finding_id: finding.id,
         action: finding.proposed_action,
         detail: `archived to ${target}`,
+      });
+    }
+    case "retire": {
+      // The evidence contract is the document-dedup detector's: the
+      // canonical page lives in `evidence.canonical`, and every other
+      // target is a stale copy to retire into it. Re-derived here so a
+      // hand-built plan answers to the same shape a scan produced.
+      const canonical = finding.evidence["canonical"];
+      if (typeof canonical !== "string" || canonical.length === 0) {
+        throw new Error("retire finding lacks a canonical page in its evidence");
+      }
+      const copies = finding.targets
+        .filter((target) => target !== canonical)
+        .map((path) => ({ path, canonical }));
+      if (copies.length === 0) {
+        throw new Error("retire finding names no retired copy besides the canonical");
+      }
+      const result = retireDocumentCopies(vault, copies, {
+        agent: opts.agent,
+        now: opts.now,
+        ...(opts.subject !== undefined ? { subject: opts.subject } : {}),
+      });
+      // A per-copy failure BEFORE the removal leaves the copy on disk;
+      // one after it reports the page as removed in its own message.
+      // Surfacing the first failure through the finding's error keeps
+      // the applied/errors split honest (the recompile executor's rule).
+      if (result.failed.length > 0) {
+        const first = result.failed[0]!;
+        throw new Error(
+          `retired ${result.retired.length}, failed ${result.failed.length}: ` +
+            `${first.path}: ${first.message}`,
+        );
+      }
+      return Object.freeze({
+        finding_id: finding.id,
+        action: "retire",
+        detail: `retired ${result.retired.length} near-duplicate cop${
+          result.retired.length === 1 ? "y" : "ies"
+        } into ${canonical}`,
       });
     }
     default:

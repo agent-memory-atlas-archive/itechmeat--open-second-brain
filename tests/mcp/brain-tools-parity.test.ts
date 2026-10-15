@@ -63,7 +63,15 @@
  * validated answer as speculative `source_type: auto_extract` inbox
  * signals), and `brain_design_note` (the one-shot sibling of the panel
  * lane: a read-only grounding pass over tension, decision and truth
- * records, one envelope, and a committed note under `Brain/decisions/`).
+ * records, one envelope, and a committed note under `Brain/decisions/`);
+ * the storage-lifecycle release added `brain_receipts` (receipt
+ * compaction: a read-only per-shard scan of the continuity and metrics
+ * receipt ledgers, and the explicit-shard fold behind a count guard and
+ * a recovery point - deliberately disjoint from the context-compaction
+ * vocabulary) and `brain_storage` (the storage report: the per-surface
+ * measured-or-refused byte census, the forecast and tier against the
+ * configured cap, and the usage sample each invocation records; the
+ * vault-wide measurement answers measured: false below local reach).
  */
 
 import { describe, expect, test } from "bun:test";
@@ -137,6 +145,7 @@ const FROZEN_BRAIN_TOOL_NAMES = [
   "brain_procedural_memory",
   "brain_query",
   "brain_recall_telemetry",
+  "brain_receipts",
   "brain_recurrence",
   "brain_research_report",
   "brain_retention",
@@ -155,6 +164,7 @@ const FROZEN_BRAIN_TOOL_NAMES = [
   "brain_sources",
   "brain_stale_scan",
   "brain_status",
+  "brain_storage",
   "brain_switch_vault",
   "brain_tension",
   "brain_tiers",

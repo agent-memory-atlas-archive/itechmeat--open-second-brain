@@ -96,7 +96,67 @@ export type ContinuityRecordKind =
    * externalization; turns carrying a private region are withheld whole.
    * Additive kind, no schema bump.
    */
-  | "session_entity_mention";
+  | "session_entity_mention"
+  /**
+   * One operator-applied receipt compaction run (storage-lifecycle
+   * wave): the per-run audit of a confirmed fold of the receipt ledgers,
+   * carrying the folded and kept counts, the shard outcomes and the
+   * recovery point that preceded the rewrite. Written once per confirmed
+   * run by the fold engine, never on a dry run.
+   *
+   * NAMING HAZARD, decided here: this is the STORAGE compaction audit.
+   * It is deliberately disjoint from the Hermes context-compaction kinds
+   * above (`pre_compact_extract`, `post_compact_audit`), which audit
+   * context-window compaction; the two vocabularies share no surface
+   * name, and a receipt_compaction record never describes a context
+   * operation.
+   */
+  | "receipt_compaction";
+
+/**
+ * Every {@link ContinuityRecordKind} member as a runtime list, in union
+ * declaration order. The union is compile-time only, but a reader that
+ * must distinguish "a kind this build knows" from "a kind a newer build
+ * minted" needs the members as values - the receipts scan classifies an
+ * unknown kind fail-closed as never-foldable, and a runtime guard is how
+ * it asks. Add a new union member and this list in the same edit; the
+ * membership guard below is derived from the list, so the two cannot
+ * disagree.
+ */
+export const CONTINUITY_RECORD_KINDS: ReadonlyArray<ContinuityRecordKind> = Object.freeze([
+  "context_receipt",
+  "recall_telemetry",
+  "gate_telemetry",
+  "pre_compact_extract",
+  "post_compact_audit",
+  "session_turn",
+  "recent_turn",
+  "session_summary_node",
+  "session_summary_digest",
+  "generation_report",
+  "ingest_dedup",
+  "mcp_route_latency",
+  "token_impact",
+  "token_impact_outcome",
+  "context_pack_outcome",
+  "context_pack_evidence",
+  "host_memory_write",
+  "recall_observed_use",
+  "skill_invoked",
+  "source_invalidation",
+  "negative_recall",
+  "decision_model_call",
+  "decision_model_extract_commit",
+  "session_entity_mention",
+  "receipt_compaction",
+]);
+
+/** Narrow an unvalidated record's `kind` to a {@link ContinuityRecordKind}. */
+export function isContinuityRecordKind(value: unknown): value is ContinuityRecordKind {
+  return (
+    typeof value === "string" && (CONTINUITY_RECORD_KINDS as ReadonlyArray<string>).includes(value)
+  );
+}
 
 export type ContinuityPayload = Readonly<Record<string, unknown>>;
 
