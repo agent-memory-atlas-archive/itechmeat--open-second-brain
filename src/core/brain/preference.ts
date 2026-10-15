@@ -44,7 +44,7 @@ import {
   slugify,
   writeFrontmatterAtomic,
 } from "../vault.ts";
-import { requireObsidianTagValue } from "./tag-syntax.ts";
+import { requireObsidianTagValue, scopeTagValues } from "./tag-syntax.ts";
 import { BrainParseError } from "./parse-error.ts";
 import { FrontmatterTierConflictError, mergeFrontmatterTiered } from "./frontmatter-tiers.ts";
 import { loadSchemaPack } from "./schema-pack.ts";
@@ -151,6 +151,16 @@ export interface WritePreferenceInput {
   readonly evidenced_by: ReadonlyArray<string>;
   readonly confirmed_at?: string | null;
   readonly scope?: string;
+  /**
+   * Compose the `brain/scope/...` tags leniently: a scope segment that
+   * fails the shared tag rule is slugified (or dropped when the slug
+   * fails too) instead of refusing the write. Set only when the scope is
+   * re-read from a persisted record - the dream pass rewriting a stored
+   * preference or promoting stored signals - so a legacy value written
+   * before v1.78.0 cannot abort it. The `scope` field stays verbatim
+   * either way; new caller input leaves this unset and stays strict.
+   */
+  readonly lenientScopeTags?: boolean;
   /**
    * Optional owner token (Knowledge Provenance suite, v1.7). When set, the
    * fact is owner-private: owner-scoped recall returns it only to its owner,
@@ -931,12 +941,18 @@ function composePreferenceTags(input: WritePreferenceInput): string[] {
   // `tag-syntax.ts`), with the same polarity as the signal composer: the
   // topic segment is slugified then validated; scope segments and
   // `extraTags` entries are caller-controlled input, refused unrewritten
-  // with the field named.
+  // with the field named. A comma-separated scope composes one tag per
+  // segment (`scopeTagValues`); `lenientScopeTags` relaxes the scope
+  // refusal for rewrites of persisted records.
   push("brain");
   push("brain/preference");
   push(`brain/topic/${requireObsidianTagValue(slugify(input.topic.trim()), "topic")}`);
-  if (input.scope?.trim())
-    push(`brain/scope/${requireObsidianTagValue(input.scope.trim(), "scope")}`);
+  for (const scope of scopeTagValues(input.scope ?? "", {
+    record: `pref-${input.slug}`,
+    lenient: input.lenientScopeTags === true,
+  })) {
+    push(`brain/scope/${scope}`);
+  }
   for (const t of input.extraTags ?? []) {
     if (t.trim()) push(requireObsidianTagValue(t.trim(), "extraTags"));
   }
