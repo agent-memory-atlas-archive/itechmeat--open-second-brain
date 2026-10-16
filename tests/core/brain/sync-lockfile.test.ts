@@ -8,11 +8,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
+  unlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,7 +29,9 @@ import {
   LOCK_WAIT_BUDGET_MS,
   LOCK_WAIT_INTERACTIVE_MS,
   lockScanRoots,
+  removeStaleLockSync,
   scanStaleLocks,
+  TAKEOVER_CLAIM_STALE_MS,
 } from "../../../src/core/brain/sync-lockfile.ts";
 
 let tmpRoot: string;
@@ -103,6 +108,45 @@ describe("acquireLockSync", () => {
     } finally {
       handle.release();
     }
+  });
+
+  test("release leaves a lock file it no longer owns in place", () => {
+    // A takeover removed this holder's lock and another process acquired the
+    // name; the first holder's release must not delete the second's lock.
+    const target = join(tmpRoot, "pref-owned.md");
+    const first = acquireLockSync(target);
+    unlinkSync(target + ".lock");
+    const second = acquireLockSync(target);
+    try {
+      first.release();
+      expect(existsSync(target + ".lock")).toBe(true);
+      expect(() => acquireLockSync(target)).toThrow(/lock busy/);
+    } finally {
+      second.release();
+    }
+    expect(existsSync(target + ".lock")).toBe(false);
+  });
+});
+
+describe("exit sweep after a stale handle's release", () => {
+  test("a newer handle's lock is still removed at exit after an older handle released", () => {
+    // The older handle lost its lock to a takeover; the newer handle in the
+    // same process re-registered the path. The older release must not drop
+    // that registration, or the exit sweep would leave the newer lock behind.
+    const target = join(tmpRoot, "pref-exit.md");
+    const module = resolve(import.meta.dir, "../../../src/core/brain/sync-lockfile.ts");
+    const script = `
+      const { unlinkSync } = await import("node:fs");
+      const { acquireLockSync } = await import(${JSON.stringify(module)});
+      const target = ${JSON.stringify(target)};
+      const first = acquireLockSync(target);
+      unlinkSync(target + ".lock");
+      acquireLockSync(target);
+      first.release();
+    `;
+    const child = Bun.spawnSync([process.execPath, "-e", script]);
+    expect(child.exitCode).toBe(0);
+    expect(existsSync(target + ".lock")).toBe(false);
   });
 });
 
@@ -388,5 +432,62 @@ describe("acquireLockSyncWithRetry — what the caller gives up while it waits",
     // An interactive pass with a progress stream and a Ctrl-C behind it
     // must not park the terminal for the fan-out's budget.
     expect(generate).toContain("acquireLockSyncWithRetry(dir, LOCK_WAIT_INTERACTIVE_MS)");
+  });
+});
+
+describe("removeStaleLockSync takeover claims", () => {
+  const abandoned = () => true;
+
+  function plantLock(name: string): { lock: string; claim: string } {
+    const lock = join(tmpRoot, `${name}.lock`);
+    writeFileSync(lock, "left behind by a killed holder\n");
+    const st = lstatSync(lock, { bigint: true });
+    return { lock, claim: `${lock}.takeover-${st.ino}-${st.mtimeNs}` };
+  }
+
+  function age(path: string, ms: number): void {
+    const at = (Date.now() - ms) / 1000;
+    utimesSync(path, at, at);
+  }
+
+  test("a fresh claim on the same lock file turns a late contender away", () => {
+    const { lock, claim } = plantLock("fresh-claim");
+    writeFileSync(claim, "");
+    expect(removeStaleLockSync(lock, abandoned)).toBe(false);
+    expect(existsSync(lock)).toBe(true);
+  });
+
+  test("a stale claim left by a dead winner does not make the lock unbreakable", () => {
+    const { lock, claim } = plantLock("dead-winner");
+    writeFileSync(claim, "");
+    age(claim, TAKEOVER_CLAIM_STALE_MS + 5_000);
+    expect(removeStaleLockSync(lock, abandoned)).toBe(true);
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  test("a lock whose every claim generation is stale is cleared for the next attempt", () => {
+    const { lock, claim } = plantLock("exhausted");
+    const generations = [claim, `${claim}-1`, `${claim}-2`, `${claim}-3`];
+    for (const path of generations) {
+      writeFileSync(path, "");
+      age(path, TAKEOVER_CLAIM_STALE_MS + 5_000);
+    }
+    expect(removeStaleLockSync(lock, abandoned)).toBe(false);
+    expect(generations.some((path) => existsSync(path))).toBe(false);
+    expect(removeStaleLockSync(lock, abandoned)).toBe(true);
+  });
+
+  test("a successful takeover sweeps this lock's stale claims and keeps fresh ones", () => {
+    const { lock } = plantLock("sweep");
+    const oldClaim = `${lock}.takeover-1-2`;
+    const freshClaim = `${lock}.takeover-3-4`;
+    const otherLockClaim = join(tmpRoot, "other.lock.takeover-5-6");
+    for (const path of [oldClaim, freshClaim, otherLockClaim]) writeFileSync(path, "");
+    age(oldClaim, TAKEOVER_CLAIM_STALE_MS + 5_000);
+    age(otherLockClaim, TAKEOVER_CLAIM_STALE_MS + 5_000);
+    expect(removeStaleLockSync(lock, abandoned)).toBe(true);
+    expect(existsSync(oldClaim)).toBe(false);
+    expect(existsSync(freshClaim)).toBe(true);
+    expect(existsSync(otherLockClaim)).toBe(true);
   });
 });
