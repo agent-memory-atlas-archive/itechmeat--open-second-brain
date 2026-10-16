@@ -152,13 +152,23 @@ describe("applyHygienePlan dispatches retire to the retirement core", () => {
     expect(result.applied[0]!.action).toBe("retire");
     expect(result.applied[0]!.finding_id).toBe(finding.id);
     expect(result.applied[0]!.detail).toContain(canonical);
+    // The per-copy link counts ride the detail (review M7): the executor
+    // used to report only "retired N", dropping what the link pass did.
+    expect(result.applied[0]!.detail).toMatch(/links: \d+ rewritten, \d+ failed/);
+    // The disk accounting rides it too (review M6): snapshot bytes,
+    // removed bytes, and the signed net between them.
+    expect(result.applied[0]!.detail).toMatch(
+      /disk: snapshot \d+ bytes, removed \d+ bytes, net [+-]\d+ bytes/,
+    );
 
     expect(existsSync(join(vault, retired))).toBe(false);
     expect(existsSync(join(vault, canonical))).toBe(true);
-    // The manifest entry dropped is the RETIRED copy's source; the
-    // canonical copy's source stays recorded.
-    expect(readManifest(vault).entries["imports/a.md"]).toBeUndefined();
+    // The manifest entry MARKED retired is the RETIRED copy's source; the
+    // canonical copy's source stays recorded without the marker (H3: the
+    // marker, not a drop, is what keeps the next batch plan honest).
+    expect(readManifest(vault).entries["imports/a.md"]?.retired_into).toBe(canonical);
     expect(readManifest(vault).entries["imports/b.md"]).toBeDefined();
+    expect(readManifest(vault).entries["imports/b.md"]?.retired_into).toBeUndefined();
     expect(
       listContinuityRecords(vault, { kind: "source_invalidation" }).some((r) => r.id !== null),
     ).toBe(true);

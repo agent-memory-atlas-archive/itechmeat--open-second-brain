@@ -79,12 +79,19 @@ const STORE_DIR_IDENTIFIER = "DERIVED_STORE_DIR";
  */
 // 24: the bootstrap receipt writer joins the population with its row
 // (write-side-trust Task 14), the same join install.lock.json made.
-const SWEPT_POPULATION_SIZE = 24;
+// 24 -> 25: the session mining ledger joins the population with its row
+// (session-mining-economy), the same join the session import ledger made.
+// 25 -> 26: the storage usage meter joins, excused (storage lifecycle
+// external review, M3): it joins the directory to MEASURE the store and the
+// state beside it as census surfaces, and writes nothing.
+const SWEPT_POPULATION_SIZE = 26;
 
 /** Declared surfaces today. Pinned for the same reason. */
 // 50: the source-archives row (answer-trust Task C1) joins the population,
 // the same join the decisions ledger and the bootstrap receipt made.
-const DECLARED_SURFACE_COUNT = 50;
+// 50 -> 51: the session mining ledger joins the population with its row
+// (session-mining-economy), the same join the session import ledger made.
+const DECLARED_SURFACE_COUNT = 51;
 
 /** An exclusion reason has to be an argument, not a label. */
 const MIN_REASON_LENGTH = 80;

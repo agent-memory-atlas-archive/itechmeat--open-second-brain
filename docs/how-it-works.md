@@ -216,6 +216,8 @@ trail, and `move` retires the chain into `Brain/intentions/history/`.
 
 All four paths share a normalised payload hash so the same rule captured twice from different surfaces dedups automatically. Pinned preferences are exempt from automatic retire (`stale-no-evidence`, `expired-unconfirmed`, `rebutted`); only `o2b brain reject` can retire them.
 
+Session mining has a memory of its own (since v1.86.0). When `o2b brain extract-signals` (or the `brain_extract_signals` tool) commits a mine that ends with nothing written and nothing staged - an empty answer, every item already deduped, every item refused by the durability gate, or any mix - it records a zero-yield tombstone for the session in a mining ledger beside the import ledger, keyed on a SHA-256 of the mined turn material (turn id, text, timestamp). The next plan over that session returns the recorded breakdown instead of an envelope, so an unchanged transcript is never re-offered to the model; a re-import that changes the turns changes the hash and re-opens the session with no clearing step. Because removing a downstream preference does not change a session's turns, the tombstone never lifts on its own: `--force` (MCP `force`) bypasses the gate for exactly one plan call when the session should be re-proposed. A commit that succeeds but cannot record its tombstone still succeeds and names the failure, so a ledger that stopped being written is never a silent fact.
+
 `o2b brain watchdog` is the recovery surface for this layout. It checks the
 Brain config, required directories, and rebuildable search index, emits
 exponential backoff metadata for schedulers, and writes an audit record. By
@@ -1619,7 +1621,7 @@ Until now almost nothing about a write into the Brain was declared: any frontmat
 
 **The keyfile can be wrapped under a passphrase.** `o2b brain secret unlock` verifies a passphrase (read from stdin or `--passphrase-from-env`, never argv) and - on a store whose keyfile is still raw - wraps the 32-byte key into a versioned scrypt envelope at the same path, then holds the unwrapped key in memory for that one process only; `lock` overwrites and drops it. There is no daemon: every other CLI invocation and the MCP server stay locked, and a key-bearing operation over a locked store refuses with a named error whose remedy is the unlock command (the refusal's prose carries no paths - the structured field does, for the surfaces allowed to name them). Every unlock and lock lands a no-values custody record. A credential reference, `$secret:NAME`, resolves store-first with environment fallback at the use sites that already name it (the exec allowlist, the embedding and rerank keys, the decision-model key, the Telegram capture token, the research keys); a locked store surfaces the named refusal rather than silently answering from the environment. `secret export` writes every entry as one passphrase-encrypted bundle to an operator-named file - the values re-encrypted under a key the passphrase derives, the names, env-var mappings and allowlists traveling in the clear past the shared egress redactor - and `secret import` decrypts and validates every entry (names, env-var mappings, allow patterns, all under the store's own rules) before writing anything. The honesty clause is the same for the keyfile envelope and for bundles: the passphrase is never persisted, logged or audited, and a lost one is unrecoverable - every stored value and every exported bundle stays unreadable forever, and nothing recovers them.
 
-**Heavy work waits its turn.** The maintenance lane runs dream and reindex behind five gates: a tz-aware local-time window, a busy gate over recent recall telemetry, an optional host-pressure gate, and - since v1.85.0, when a storage cap is configured - a capacity gate that skips a vault measuring at its critical tier before the failure-streak limit refuses a task that keeps failing; under them all sits an expiring SQLite lease in its own database so holding it never contends with the search index writer lock. Force bypasses the soft gates but never the lease, tasks run stale-first, and every attempt - including each gate refusal - lands in a bounded journal, because a lane you cannot audit is a lane you cannot trust.
+**Heavy work waits its turn.** The maintenance lane runs dream and reindex behind five gates: a tz-aware local-time window, a busy gate over recent recall telemetry, an optional host-pressure gate, and - since v1.85.0, when a storage cap is configured - a capacity gate that skips a vault past its `storage.pause_percent` line (since v1.86.0; the line defaults to the warn band, and interactive ingest keeps working until the critical tier refuses it outright) or measuring at its critical tier, before the failure-streak limit refuses a task that keeps failing; under them all sits an expiring SQLite lease in its own database so holding it never contends with the search index writer lock. Force bypasses the soft gates but never the lease, tasks run stale-first, and every attempt - including each gate refusal - lands in a bounded journal, because a lane you cannot audit is a lane you cannot trust.
 
 ## Link and recall intelligence (since v0.45.0)
 
@@ -1706,8 +1708,9 @@ a `warning` finding with `proposed_action: review`. A local source that
 was deleted therefore surfaces as `url-only`, a `bounded-local` page counts
 as backed only while its excerpt still matches its digest, and quarantined
 pages are skipped: they already carry the `untrusted_source` marker, which
-names the same condition (and which the retrieval trust gate excludes when
-`search_trust_gate_enabled` is on).
+names the same condition (and which the retrieval trust gate excludes
+under `search_trust_gate_mode: enforce` - the bare
+`search_trust_gate_enabled` alone measures in `shadow`).
 
 ## Non-Markdown sources (since v1.69.0)
 

@@ -17,6 +17,7 @@ import { join } from "node:path";
 
 import {
   continuityLogDir,
+  continuityLogPath,
   listContinuityRecords,
 } from "../../../../src/core/brain/continuity/store.ts";
 import { metricsDir } from "../../../../src/core/brain/metrics.ts";
@@ -188,6 +189,40 @@ describe("o2b brain receipts", () => {
     );
     expect(unknownFamily.returncode).toBe(1);
     expect(unknownFamily.stderr).toContain("unknown ledger family");
+  });
+
+  test("a confirmed run's text report names the net byte effect beside the recovery point", async () => {
+    // M6 (confirm half): the recovery point is a whole-Brain archive in a
+    // surface the storage census counts, so the report shows the ledger
+    // shrink beside what the archive added - the net figure an operator
+    // at a capacity tier decides on.
+    seedLedger();
+    const out = await runCli(
+      ["brain", "receipts", "compact", "--shard", `continuity:${LEDGER_MONTH}.jsonl`, "--apply"],
+      { env: env() },
+    );
+    expect(out.returncode).toBe(0);
+    expect(out.stdout).toContain("recovery point:");
+    expect(out.stdout).toMatch(/net: -?\d+ bytes \(ledger shrank \d+, recovery point added \d+\)/);
+  });
+
+  test("a confirmed run whose audit record cannot be appended fails loudly in text mode", async () => {
+    // L10: the audit outcome rode only the JSON view, so a text-mode
+    // `--apply` whose receipt_compaction record did not land exited 0
+    // with no trace of the failure. A directory parked at the run month's
+    // shard path makes the audit append fail after the shards are
+    // durable - the run must print the named outcome and exit 1.
+    seedLedger();
+    const runMonth = new Date().toISOString().slice(0, 7);
+    mkdirSync(continuityLogPath(vault, runMonth), { recursive: true });
+    const out = await runCli(
+      ["brain", "receipts", "compact", "--shard", `continuity:${LEDGER_MONTH}.jsonl`, "--apply"],
+      { env: env() },
+    );
+    expect(out.returncode).toBe(1);
+    expect(out.stdout).toContain("receipt_compaction audit record could not be appended");
+    // The fold itself landed - the failure is only the audit trail's.
+    expect(listContinuityRecords(vault, { kind: "receipt_compaction" })).toHaveLength(0);
   });
 
   test("the surface vocabulary derives from one source on both surfaces", () => {

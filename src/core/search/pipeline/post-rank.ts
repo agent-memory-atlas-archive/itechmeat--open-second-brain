@@ -24,7 +24,8 @@ import {
   buildMemoryTrustAssessment,
   buildRetrievalDecisionTrace,
 } from "../../brain/trust/retrieval-receipts.ts";
-import { trustGateAdjuster } from "../../brain/trust/retrieval-gate.ts";
+import type { RetrievalTrustRefusal } from "../../brain/trust/retrieval-receipts.ts";
+import { collectTrustGateRefusals, trustGateAdjuster } from "../../brain/trust/retrieval-gate.ts";
 import { applyRelationPolarityPhase } from "../graph-phases.ts";
 import { clamp01 } from "../../math.ts";
 import { isVisible, pageVisibility } from "../../graph/visibility.ts";
@@ -88,6 +89,17 @@ export interface PostRankInput {
   readonly signal?: AbortSignal;
   /** The request's clock, for the rerank sunset decision. */
   readonly nowMs: number;
+  /**
+   * The relational arm's lane-tagged eligibility refusals (session-mining-
+   * economy, t_05a0eaa4), threaded from the arm outcome so the receipts
+   * carry the arm lane end to end. Present only when the arm ran and its
+   * resolved gate mode was active. Under `shadow` they ride the shadow
+   * section beside the pool's; under `enforce` they are the arm lane's
+   * drops - removed before the pool, where no exclusion can name them -
+   * and ride the receipts' enforce section, so the gate's
+   * never-silently-dropped posture holds on both lanes.
+   */
+  readonly armRefusals?: ReadonlyArray<RetrievalTrustRefusal>;
 }
 
 /** Start `work` under a budget; serve `fallback()` when the budget wins. */
@@ -595,11 +607,36 @@ export async function applyPostRankPhases(input: PostRankInput): Promise<PostRan
   // registered the pool is returned unchanged, so the default path is
   // byte-identical. Runs BEFORE the slice so a gate exclusion lets a
   // deeper survivor backfill the window rather than shrinking it.
+  //
+  // The trust gate's resolved mode (session-mining-economy, t_05a0eaa4)
+  // decides how it runs: off registers nothing and builds no receipts
+  // (byte-identical); enforce registers the excluding adjuster; shadow
+  // registers the mode-aware keep-only adjuster and collects the
+  // would-be refusals from the same pool the adjusters see, feeding the
+  // receipt build below. The kernel's verdict contract is untouched.
+  const trustGateMode = config.recall.searchTrustGateMode ?? "off";
+  const readGateFrontmatter = (path: string): FrontmatterMap =>
+    readCachedFrontmatter(frontmatterCache, config.vault, path);
   const rankAdjusters: RankAdjuster[] = [];
-  if (config.recall.retrievalTrustGateEnabled) {
-    rankAdjusters.push(
-      trustGateAdjuster((path) => readCachedFrontmatter(frontmatterCache, config.vault, path)),
-    );
+  let shadowRefusals: ReadonlyArray<RetrievalTrustRefusal> = [];
+  let enforcedArmRefusals: ReadonlyArray<RetrievalTrustRefusal> = [];
+  if (trustGateMode !== "off") {
+    rankAdjusters.push(trustGateAdjuster(readGateFrontmatter, trustGateMode));
+    if (trustGateMode === "shadow") {
+      // The pool lane first, then the arm lane appended after it: the
+      // arm's own eligibility refusals arrive lane-tagged from the arm
+      // outcome and are reported beside the pool's, never folded into it.
+      shadowRefusals = [
+        ...collectTrustGateRefusals(pinnedReranked, readGateFrontmatter),
+        ...(input.armRefusals ?? []),
+      ];
+    } else {
+      // Enforce: the pool's drops ARE the exclusions, but the arm's drops
+      // happen before the pool, where no exclusion can ever name them -
+      // they ride the receipts' enforce section instead, so a
+      // quarantined candidate is never silently dropped on either lane.
+      enforcedArmRefusals = input.armRefusals ?? [];
+    }
   }
   if (config.recall.supersedeFadeEnabled) {
     // Relation-only supersede fade (t_c4a9cef8): fetch the pool's typed
@@ -613,18 +650,29 @@ export async function applyPostRankPhases(input: PostRankInput): Promise<PostRan
   // Per-pack retrieval trust receipts (t_5f61130a): compact references
   // consistent with the context-receipt model. Built only when the gate
   // ran, so the outcome shape stays byte-identical on the default path.
-  const trustReceipts = config.recall.retrievalTrustGateEnabled
-    ? {
-        retrievalDecisionTrace: buildRetrievalDecisionTrace({
-          surfaced: adjusted.results.length,
-          excluded: adjusted.excluded,
-        }),
-        memoryTrustAssessment: buildMemoryTrustAssessment({
-          surfaced: adjusted.results.length,
-          excluded: adjusted.excluded,
-        }),
-      }
-    : null;
+  // Under shadow the would-be refusals ride beside an untouched
+  // `excluded`; under enforce the receipts keep the pre-mode shape.
+  const trustReceipts =
+    trustGateMode === "off"
+      ? null
+      : {
+          retrievalDecisionTrace: buildRetrievalDecisionTrace({
+            surfaced: adjusted.results.length,
+            excluded: adjusted.excluded,
+            ...(trustGateMode === "shadow" ? { shadow: { refusals: shadowRefusals } } : {}),
+            ...(enforcedArmRefusals.length > 0
+              ? { enforce: { refusals: enforcedArmRefusals } }
+              : {}),
+          }),
+          memoryTrustAssessment: buildMemoryTrustAssessment({
+            surfaced: adjusted.results.length,
+            excluded: adjusted.excluded,
+            ...(trustGateMode === "shadow" ? { shadow: { refusals: shadowRefusals } } : {}),
+            ...(enforcedArmRefusals.length > 0
+              ? { enforce: { refusals: enforcedArmRefusals } }
+              : {}),
+          }),
+        };
 
   return {
     results: adjusted.results,

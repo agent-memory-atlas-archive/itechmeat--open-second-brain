@@ -19,15 +19,13 @@
  *     delta covers nothing (`toByte === fromByte`) - and what happens to
  *     the watermark then is the CALLER's decision, not this module's.
  *     The production caller ({@link ./ingest.ts}) stamps the extraction
- *     watermark at the file's FULL size on every trusted run, so an
- *     empty delta still advances it past the unterminated fragment:
- *     that fragment is announced by no delta, and the next append's
- *     delta starts PAST it rather than stitching it in. Only a caller
- *     that leaves the watermark at `fromByte` gets the
- *     stitch-the-fragment-later behavior this boundary cut was shaped
- *     for. The ingest lane accepts the trade because extraction itself
- *     stays whole-source - the fragment is extracted, just never
- *     announced as a delta.
+ *     watermark at the announced delta's `toByte`, so an empty delta
+ *     leaves the watermark at `fromByte`: the unterminated trailing
+ *     fragment stays unstamped, and the next append's delta starts AT it
+ *     rather than past it - the fragment is stitched into the series the
+ *     first time an append ends with a newline. The ingest lane accepts
+ *     the trade because extraction itself stays whole-source - the
+ *     fragment is extracted, just never announced as a delta on its own.
  *   - A file that SHRANK below the offset (rotated, truncated, rewritten)
  *     falls back to the full current content with the shrink NAMED - the
  *     full-reprocess direction, never a bogus negative slice.
@@ -130,9 +128,20 @@ export function readTail(
 /**
  * Cut the appended bytes into an honest delta: decode from the first
  * UTF-8-safe boundary, through the last complete newline, and report the
- * exact byte range the text covers.
+ * exact byte range the text covers. Exported so the single-pass append
+ * snapshot ({@link ./ingest.ts}) cuts the tail bytes it already read with
+ * the same discipline {@link readTail} applies, never a second cut rule.
  */
-function appendedDelta(bytes: Uint8Array, fromByte: number): TailReadResult {
+export interface AppendedCut {
+  /** The decoded delta text; empty when no complete line exists yet. */
+  readonly text: string;
+  /** First byte of the source the returned text was decoded from. */
+  readonly fromByte: number;
+  /** One past the last byte the text covers - the watermark position. */
+  readonly toByte: number;
+}
+
+export function cutAppendedDelta(bytes: Uint8Array, fromByte: number): AppendedCut {
   let start = 0;
   while (start < bytes.length && isContinuationByte(bytes[start]!)) start++;
   // One past the last complete newline; `start` when the range holds no
@@ -140,11 +149,17 @@ function appendedDelta(bytes: Uint8Array, fromByte: number): TailReadResult {
   let end = bytes.length;
   while (end > start && bytes[end - 1] !== 0x0a) end--;
   return {
-    kind: "appended",
     text: Buffer.from(bytes.subarray(0, end).subarray(start)).toString("utf8"),
     fromByte: fromByte + start,
     toByte: fromByte + end,
   };
+}
+
+/**
+ * Shape {@link cutAppendedDelta} into a full tail-read answer.
+ */
+function appendedDelta(bytes: Uint8Array, fromByte: number): TailReadResult {
+  return { kind: "appended", ...cutAppendedDelta(bytes, fromByte) };
 }
 
 /**

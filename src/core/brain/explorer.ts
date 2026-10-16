@@ -36,6 +36,8 @@ import {
   type BrainPreference,
   type BrainRetired,
 } from "./types.ts";
+import { collectExplorerConsole } from "./explorer-console.ts";
+import { buildOperatorSnapshot } from "./operator-snapshot.ts";
 
 export const EXPLORER_SCHEMA_VERSION = 1 as const;
 
@@ -335,6 +337,36 @@ export function __resetExplorerTemplateCacheForTests(): void {
 
 // ---- Live server -------------------------------------------------------
 
+/**
+ * The Host names this server answers to, compared case-insensitively and
+ * with any port (or none). Everything else - an attacker-chosen rebinding
+ * name above all - is refused before any route runs.
+ */
+const LOOPBACK_HOST_NAMES: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/**
+ * The Host header's name part, lowercased, with any port suffix removed:
+ * `127.0.0.1:7777` → `127.0.0.1`, `[::1]:7777` → `[::1]`, `LOCALHOST` →
+ * `localhost`. Answers null for a missing header (required on HTTP/1.1
+ * and this server's contract regardless) or a value whose name part is
+ * not one plain host token - several unbracketed colons, a malformed
+ * bracket form - none of which a loopback client sends.
+ */
+function loopbackHostOf(header: string | null): string | null {
+  if (header === null) return null;
+  const value = header.trim().toLowerCase();
+  if (value === "") return null;
+  if (value.startsWith("[")) {
+    const end = value.indexOf("]");
+    if (end === -1) return null;
+    const name = value.slice(0, end + 1);
+    const rest = value.slice(end + 1);
+    return rest === "" || rest.startsWith(":") ? name : null;
+  }
+  const colon = value.indexOf(":");
+  return colon === -1 ? value : value.slice(0, colon);
+}
+
 export interface LiveServerHandle {
   readonly url: string;
   readonly port: number;
@@ -342,20 +374,63 @@ export interface LiveServerHandle {
 }
 
 /**
- * Boot a loopback-only HTTP server that serves the explorer template
- * and a JSON endpoint. Each GET re-reads the vault — no caches, no
- * watchers, no write endpoints. Binding to `127.0.0.1` is non-optional;
- * the explorer is single-user observability and should not be
- * reachable across the network.
+ * Additive options for the live server. `configPath` reaches the
+ * operator snapshot's search-index and profile lookups; a caller that
+ * passes nothing behaves exactly as before.
+ */
+export interface LiveServerOptions {
+  readonly configPath?: string;
+}
+
+/**
+ * Boot a loopback-only HTTP server that serves the explorer template,
+ * the graph JSON, the console counts (`/counts.json`, from
+ * {@link collectExplorerConsole}) and the operator snapshot
+ * (`/status.json`, from `buildOperatorSnapshot`). Each GET re-reads the
+ * vault — no caches, no watchers, no write endpoints. That includes the
+ * snapshot route: every GET re-runs the dry-run dream inside
+ * `buildOperatorSnapshot`, the most expensive read it composes, and
+ * that bounded read-only cost is accepted rather than papered over with
+ * a cache that would go stale silently. Binding to `127.0.0.1` is
+ * non-optional, and the bind alone is not a browser boundary - a
+ * DNS-rebinding page can resolve an attacker-chosen hostname to
+ * `127.0.0.1` and reach the routes same-origin - so every request whose
+ * `Host` header is not a loopback name (127.0.0.1, localhost, [::1],
+ * any port) is refused with a named 403 before any route runs.
+ *
+ * The JSON routes surface a failed read by name: a 500 whose body
+ * carries the error message, never an empty payload that could read as
+ * "no records".
  *
  * Throws when the port is unavailable; the CLI catches `EADDRINUSE`
  * and turns it into a friendly exit message.
  */
-export function buildLiveServer(vault: string, port: number): LiveServerHandle {
+export function buildLiveServer(
+  vault: string,
+  port: number,
+  options: LiveServerOptions = {},
+): LiveServerHandle {
+  const configPath = options.configPath;
+  const snapshotOptions = configPath === undefined ? {} : { configPath };
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port,
-    fetch(req) {
+    async fetch(req) {
+      // Host allowlist (security review, finding 2): the loopback bind
+      // does not stop a rebinding browser, whose request arrives with an
+      // attacker-chosen Host. Loopback names only, any port; the Host
+      // header is required.
+      const hostName = loopbackHostOf(req.headers.get("host"));
+      if (hostName === null || !LOOPBACK_HOST_NAMES.has(hostName)) {
+        return jsonResponse(
+          JSON.stringify({
+            error:
+              "explorer: refusing a request whose Host header is not a loopback name " +
+              "(127.0.0.1, localhost, [::1], any port)",
+          }),
+          403,
+        );
+      }
       const url = new URL(req.url);
       if (url.pathname === "/" || url.pathname === "/index.html") {
         const graph = collectExplorerData(vault);
@@ -369,6 +444,22 @@ export function buildLiveServer(vault: string, port: number): LiveServerHandle {
         return new Response(JSON.stringify(graph), {
           headers: { "content-type": "application/json; charset=utf-8" },
         });
+      }
+      if (url.pathname === "/counts.json") {
+        try {
+          const counts = collectExplorerConsole(vault, snapshotOptions);
+          return jsonResponse(JSON.stringify(counts));
+        } catch (err) {
+          return errorResponse("/counts.json", err);
+        }
+      }
+      if (url.pathname === "/status.json") {
+        try {
+          const snapshot = await buildOperatorSnapshot(vault, snapshotOptions);
+          return jsonResponse(JSON.stringify(snapshot));
+        } catch (err) {
+          return errorResponse("/status.json", err);
+        }
       }
       return new Response("not found", { status: 404 });
     },
@@ -392,6 +483,23 @@ export function buildLiveServer(vault: string, port: number): LiveServerHandle {
 }
 
 // ---- Helpers ------------------------------------------------------------
+
+function jsonResponse(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+/**
+ * A route's failure surfaces by name: the failing route and the error
+ * message travel in the body, so a broken section can never read as a
+ * healthy one that simply has no records.
+ */
+function errorResponse(route: string, err: unknown): Response {
+  const message = err instanceof Error ? err.message : String(err);
+  return jsonResponse(JSON.stringify({ error: `${route}: ${message}` }), 500);
+}
 
 function deriveEdges(index: BacklinkIndex, knownIds: ReadonlySet<string>): ExplorerEdge[] {
   const edges: ExplorerEdge[] = [];

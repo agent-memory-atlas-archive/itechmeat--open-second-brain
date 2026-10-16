@@ -8,6 +8,20 @@
  * that answer and writes the accepted items as speculative inbox signals.
  * OSB runs no model on either path.
  *
+ * A commit that answers a plan passes that plan's `surveyed_turns_hash`
+ * back with `--surveyed-turns-hash`: it is what the zero-yield mining
+ * tombstone keys on, so the record describes the material the verdict was
+ * earned over rather than whatever the session holds by commit time. A
+ * commit without it records nothing - without surveyed material there is
+ * nothing honest to key a tombstone on.
+ *
+ * A session already mined at its current content that yielded nothing
+ * accepted carries a tombstone in the session mining ledger; its plan phase
+ * returns the recorded breakdown instead of an envelope (reason
+ * `mining_tombstone`), and `--force` bypasses that gate for the one plan
+ * call it is given to. A commit that succeeds but cannot record its
+ * zero-yield tombstone still succeeds, and names the ledger failure.
+ *
  * Exit codes: 0 on success, 1 on an operational failure or a refused
  * payload, 2 on usage errors.
  */
@@ -20,6 +34,7 @@ import {
   ExtractSignalsError,
 } from "../../../core/brain/extract-signals.ts";
 import {
+  EXTRACT_MINING_TOMBSTONE_SKIP_REASON,
   planExtractSignalsPrefiltered,
   recordExtractPrefilterCommit,
   resolveExtractPrefilterConfig,
@@ -36,6 +51,7 @@ import {
 import {
   brainVerbContext,
   fail,
+  normalizeFlagString,
   ok,
   okJson,
   parse,
@@ -45,7 +61,7 @@ import {
 
 const USAGE =
   "usage: o2b brain extract-signals <session-ref> [--payload <json> | --payload-file <path>] " +
-  "[--agent <name>] [--vault <path>] [--json]";
+  "[--surveyed-turns-hash <sha256>] [--force] [--agent <name>] [--vault <path>] [--json]";
 
 /** Refusals the operator caused, reported without a stack. */
 const NAMED_REFUSALS = [ExtractSignalsError, ResponseShapeError, ResponseCheckError] as const;
@@ -60,11 +76,19 @@ export async function cmdBrainExtractSignals(argv: string[]): Promise<number> {
     agent: { type: "string" },
     payload: { type: "string" },
     "payload-file": { type: "string" },
+    "surveyed-turns-hash": { type: "string" },
+    force: { type: "boolean" },
     json: { type: "boolean" },
   });
   const sessionRef = positional[0];
   if (!sessionRef || sessionRef.trim() === "") return usageError(USAGE);
   const asJson = flags["json"] === true;
+  const surveyedTurnsHashRaw = normalizeFlagString(flags["surveyed-turns-hash"]);
+  if (flags["surveyed-turns-hash"] !== undefined && surveyedTurnsHashRaw === null) {
+    return usageError(
+      `${USAGE}\nerror: --surveyed-turns-hash must be a non-empty string when provided`,
+    );
+  }
 
   try {
     const { config, vault } = brainVerbContext(flags);
@@ -81,6 +105,9 @@ export async function cmdBrainExtractSignals(argv: string[]): Promise<number> {
         now: new Date(),
         decisionModel,
         tokenImpactEnabled: decisionModel !== null && resolveTokenImpactLedgerEnabled(config),
+        // The re-mine escape: bypass the zero-yield tombstone for this one
+        // plan call (no payload here, so this IS the plan call).
+        force: flags["force"] === true,
       });
       if (asJson) {
         okJson({
@@ -94,6 +121,10 @@ export async function cmdBrainExtractSignals(argv: string[]): Promise<number> {
             text: t.text,
             timestamp: t.timestamp,
           })),
+          // The hash of the material this plan offered; the commit that
+          // answers it passes it back with --surveyed-turns-hash so the
+          // mining tombstone keys on the surveyed material.
+          surveyed_turns_hash: plan.surveyedTurnsHash,
           cap: plan.cap,
           confidence_floor: plan.confidenceFloor,
           llm_step: plan.llmStep,
@@ -103,7 +134,19 @@ export async function cmdBrainExtractSignals(argv: string[]): Promise<number> {
             ? {
                 skipped: {
                   reason: plan.skipped.reason,
-                  turns_dropped: plan.skipped.turnsDropped,
+                  ...(plan.skipped.turnsDropped !== undefined
+                    ? { turns_dropped: plan.skipped.turnsDropped }
+                    : {}),
+                  ...(plan.skipped.miningOutcome !== undefined
+                    ? {
+                        mining_outcome: {
+                          written: plan.skipped.miningOutcome.written,
+                          staged: plan.skipped.miningOutcome.staged,
+                          deduped: plan.skipped.miningOutcome.deduped,
+                          durability_rejected: plan.skipped.miningOutcome.durabilityRejected,
+                        },
+                      }
+                    : {}),
                 },
               }
             : {}),
@@ -115,6 +158,21 @@ export async function cmdBrainExtractSignals(argv: string[]): Promise<number> {
       }
       ok(`session: ${plan.sessionId} (${plan.turnsScanned} imported turn(s))`);
       if (plan.skipped !== undefined) {
+        if (plan.skipped.reason === EXTRACT_MINING_TOMBSTONE_SKIP_REASON) {
+          const outcome = plan.skipped.miningOutcome!;
+          // The recorded breakdown is the evidence, so every field is
+          // rendered from the record, never asserted from a hardcoded
+          // zero: a hand-restored or future-written entry must read the
+          // same in text as the --json surface prints it.
+          ok(
+            `nothing to mine: this session was already mined at its current content and ` +
+              `yielded nothing (written ${outcome.written}, staged ${outcome.staged}, ` +
+              `deduped ${outcome.deduped}, ` +
+              `durability-rejected ${outcome.durabilityRejected}); ` +
+              `re-run with --force to re-mine it`,
+          );
+          return 0;
+        }
         ok(
           `nothing to mine: the decision-model pre-filter dropped all ` +
             `${plan.skipped.turnsDropped} user turn(s)`,
@@ -128,6 +186,7 @@ export async function cmdBrainExtractSignals(argv: string[]): Promise<number> {
       ok(`limits: at most ${plan.cap} items, confidence >= ${plan.confidenceFloor}`);
       if (plan.llmStep !== null) {
         ok(`needs-llm-step: ${plan.llmStep.step} -> ${plan.llmStep.target_path}`);
+        ok(`surveyed turns hash: ${plan.surveyedTurnsHash}`);
       }
       return 0;
     }
@@ -157,6 +216,10 @@ export async function cmdBrainExtractSignals(argv: string[]): Promise<number> {
       // Loaded with parallel I/O here, where the caller can await it; the
       // commit's own fallback is the synchronous walk.
       dedup: await loadDedupIndex(vault),
+      // The answered plan's surveyed hash, relayed by the calling agent:
+      // what the zero-yield tombstone keys on. Absent, the commit records
+      // nothing - there is no material the verdict was earned over.
+      ...(surveyedTurnsHashRaw !== null ? { surveyedTurnsHash: surveyedTurnsHashRaw } : {}),
     });
     recordExtractPrefilterCommit(vault, decisionModel, res, now);
     if (asJson) {
@@ -168,6 +231,11 @@ export async function cmdBrainExtractSignals(argv: string[]): Promise<number> {
         deduped: res.deduped,
         durability_rejected: res.durabilityRejected,
         rejected: res.rejected.map((r) => ({ topic: r.topic, reason: r.reason })),
+        // Present only when the commit succeeded but the zero-yield
+        // tombstone could not be recorded.
+        ...(res.miningLedgerFailure !== undefined
+          ? { mining_ledger_failure: res.miningLedgerFailure }
+          : {}),
         // Present only when a leading <think> block was stripped (t_dac8bf7e).
         ...(strip !== undefined ? { note: payloadStripNote(strip) } : {}),
       });
@@ -178,6 +246,9 @@ export async function cmdBrainExtractSignals(argv: string[]): Promise<number> {
         (res.staged > 0 ? ` (staged for approval)` : "") +
         `, deduped ${res.deduped}, durability-rejected ${res.durabilityRejected}`,
     );
+    if (res.miningLedgerFailure !== undefined) {
+      ok(`mining ledger not updated: ${res.miningLedgerFailure}`);
+    }
     if (strip !== undefined) ok(payloadStripNote(strip));
     for (const r of res.rejected) ok(`rejected: ${r.topic} (${r.reason})`);
     return 0;

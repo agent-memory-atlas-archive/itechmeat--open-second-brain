@@ -23,7 +23,7 @@
 
 import { resolveAgentName } from "../../core/config.ts";
 import { compactReceiptLedgers } from "../../core/brain/receipts/compact.ts";
-import { scanReceiptLedgers } from "../../core/brain/receipts/scan.ts";
+import { receiptShardNameError, scanReceiptLedgers } from "../../core/brain/receipts/scan.ts";
 import { compactView, scanView } from "../../core/brain/receipts/views.ts";
 import {
   isReceiptMode,
@@ -85,7 +85,14 @@ function readShards(args: Record<string, unknown>): ReceiptShardRef[] {
   }
   return (raw as string[]).map((value) => {
     try {
-      return parseReceiptShardRef(value);
+      const ref = parseReceiptShardRef(value);
+      // Up front, beside the family check: a name the family's grammar
+      // does not recognise is the caller's invalid argument - a plain
+      // error escaping the core's per-shard handling would surface as an
+      // internal error instead (L9).
+      const nameError = receiptShardNameError(ref);
+      if (nameError !== null) throw new Error(nameError);
+      return ref;
     } catch (exc) {
       throw new MCPError(INVALID_PARAMS, (exc as Error).message);
     }
@@ -106,12 +113,17 @@ async function toolBrainReceipts(
     return scanView(scanReceiptLedgers(ctx.vault, { olderThanDays, now: new Date() }));
   }
 
-  // The destructive half, gated like the storage report gates its
-  // whole-vault census (`./storage-tools.ts`): compact rewrites named
-  // ledger shards in place and reports whole-ledger byte totals, and a
-  // caller below local reach gets the named refusal instead of a plan -
-  // no shard list, no figures, no write lane entered. The scan above
-  // stays readable at any reach: it writes nothing.
+  // The destructive half: compact rewrites named ledger shards in place,
+  // and every guarantee the rewrite runs under - vault identity, the
+  // permissions-document consult, the recovery point, the per-file locks -
+  // is host-local. A caller below local reach gets the named refusal
+  // instead of a plan: no shard list, no figures, no write lane entered.
+  // The rationale names the write lane, not the byte figures (L11): the
+  // scan above reports the same per-shard figures at any reach by design,
+  // so figures were never the thing that stops at local reach - and the
+  // growth check that reads the same scan runs on the host, where the
+  // distinction has no meaning. The scan stays readable at any reach: it
+  // writes nothing.
   if (contextReach(ctx) !== TRANSPORT_REACH.local) {
     // Returned as the literal, `satisfies`-checked against the refusal
     // interface: the handler's wire type is Record<string, unknown>, and
@@ -122,8 +134,9 @@ async function toolBrainReceipts(
       measured: false,
       reason: RECEIPT_COMPACT_REACH_REASON satisfies ReceiptCompactRefusalReason,
       detail:
-        "receipt compaction folds records in named ledger shards and reports " +
-        "whole-ledger byte totals; it answers at local reach only",
+        "receipt compaction rewrites named ledger shards in place; its write lane and " +
+        "guards (vault identity, permissions document, recovery point) are host-local, " +
+        "so it answers at local reach only",
     } satisfies ReceiptCompactRefusal;
   }
 

@@ -117,6 +117,7 @@ export const STATE_SURFACE_ID = Object.freeze({
   sessionImportCheckpoints: "session_import_checkpoints",
   writeDeadLetters: "write_dead_letters",
   sessionImportLedger: "session_import_ledger",
+  sessionMiningLedger: "session_mining_ledger",
   installManifest: "install_manifest",
   protectManifest: "protect_manifest",
   bootstrapReceipt: "bootstrap_receipt",
@@ -284,6 +285,7 @@ const INGEST_CHECKPOINT_DIR = "ingest-checkpoints";
 const SESSION_CHECKPOINT_DIR = "session-import-checkpoints";
 const DEAD_LETTER_DIR = "dead-letters";
 const SESSION_LEDGER_FILE = "session-import-ledger.json";
+const SESSION_MINING_LEDGER_FILE = "session-mining-ledger.json";
 const INSTALL_MANIFEST_FILE = "install.lock.json";
 const PROTECT_MANIFEST_FILE = "protect.lock.json";
 const BOOTSTRAP_RECEIPT_FILE = "bootstrap.lock.json";
@@ -500,6 +502,22 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
       "what is outstanding without re-parsing anything. Deleting it reports every already- " +
       "imported log as a gap; re-importing them is safe but pays the full parse again.",
     sources: ["src/core/brain/sessions/discover.ts"],
+  },
+  {
+    id: STATE_SURFACE_ID.sessionMiningLedger,
+    label: "session mining ledger",
+    tier: STATE_TIER.derived,
+    derive: derivedStore(SESSION_MINING_LEDGER_FILE),
+    override_env: null,
+    override_config_key: null,
+    carries_memory: false,
+    reason:
+      "One tombstone per agent session whose mining commit ended barren, keyed by the portable " +
+      "session id and hashed on the mined turn material, so the plan gate suppresses an already-" +
+      "mined zero-yield session instead of re-offering it to the model on every re-scan. " +
+      "Deleting it reports no gap and loses nothing the vault holds; it only re-opens every " +
+      "barren session, paying the full model spend again on the next scan.",
+    sources: ["src/core/brain/session-mining-ledger.ts"],
   },
   {
     id: STATE_SURFACE_ID.installManifest,
@@ -1142,6 +1160,13 @@ export const STATE_SURFACE_SWEEP_EXCLUSIONS: ReadonlyMap<string, string> = new M
     "the directory is a member of its `SKIPPED_DIR_NAMES` set, beside `.git` and `node_modules`, " +
       "so the weekly walk does not read derived state as vault content. A skipped directory is " +
       "not a surface this module owns",
+  ],
+  [
+    "src/core/brain/storage/usage.ts",
+    "the capacity meter: it joins the store directory to MEASURE the store and the state beside " +
+      "it (the derived_store and derived_store_dir surfaces of the storage census), never to " +
+      "write one. It is the meter every row in this catalogue is charged by, and it creates " +
+      "nothing",
   ],
   [
     "src/cli/brain/verbs/bench.ts",

@@ -14,12 +14,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 import { buildBacklinkIndex, backlinkCount } from "../../../src/core/brain/backlinks.ts";
 import {
+  buildLiveServer,
   collectExplorerData,
   EXPLORER_SCHEMA_VERSION,
   renderExportedHtml,
@@ -29,6 +30,7 @@ import {
   writePreference,
   type WritePreferenceInput,
 } from "../../../src/core/brain/preference.ts";
+import { emitRecallTelemetry } from "../../../src/core/brain/recall-telemetry.ts";
 import {
   BRAIN_CONFIDENCE,
   BRAIN_PREFERENCE_STATUS,
@@ -360,5 +362,180 @@ describe("renderExportedHtml", () => {
     // because the handlers consume them.
     expect(html).toContain("visibleSortedCache");
     expect(html).toContain("selectedId");
+  });
+});
+
+describe("buildLiveServer JSON routes", () => {
+  const REPORT_SNAPSHOTS_ENV = "OPEN_SECOND_BRAIN_REPORT_SNAPSHOTS";
+  let previousEnv: string | undefined;
+
+  beforeEach(() => {
+    previousEnv = process.env[REPORT_SNAPSHOTS_ENV];
+    delete process.env[REPORT_SNAPSHOTS_ENV];
+  });
+  afterEach(() => {
+    if (previousEnv === undefined) delete process.env[REPORT_SNAPSHOTS_ENV];
+    else process.env[REPORT_SNAPSHOTS_ENV] = previousEnv;
+  });
+
+  test("serves /counts.json from the console collector, re-read per GET", async () => {
+    emitRecallTelemetry(vault, {
+      host: "unit-test",
+      channel: "cli",
+      mode: "search",
+      status: "ok",
+      durationMs: 1,
+      resultCount: 1,
+      topArtifacts: [{ id: "pref-seed" }],
+    });
+    const server = buildLiveServer(vault, 0);
+    try {
+      const first = await fetch(new URL("/counts.json", server.url));
+      expect(first.ok).toBe(true);
+      const body = JSON.parse(await first.text()) as {
+        schema_version: number;
+        telemetry: { total: number };
+        written_per_day: ReadonlyArray<unknown>;
+        report_snapshots: unknown;
+      };
+      expect(body.schema_version).toBe(1);
+      expect(body.telemetry.total).toBe(1);
+      expect(body.written_per_day.length).toBe(30);
+      expect(body.report_snapshots).toEqual({ status: "disabled" });
+      // A second GET re-reads: a record appended between requests is
+      // visible without restarting the server.
+      emitRecallTelemetry(vault, {
+        host: "unit-test",
+        channel: "cli",
+        mode: "query",
+        status: "empty",
+        durationMs: 1,
+        resultCount: 0,
+      });
+      const second = await fetch(new URL("/counts.json", server.url));
+      const again = JSON.parse(await second.text()) as { telemetry: { total: number } };
+      expect(again.telemetry.total).toBe(2);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("serves /status.json from the operator snapshot with configPath threaded through", async () => {
+    writePreference(vault, basePref("routed"));
+    // The active profile is read from the profiles registry beside the
+    // config path, so it is the observable for the additive options
+    // object reaching buildOperatorSnapshot.
+    const configPath = join(vault, "config.yaml");
+    writeFileSync(
+      join(vault, "profiles.json"),
+      JSON.stringify({ active: "work", profiles: { work: { vault } } }),
+    );
+    const server = buildLiveServer(vault, 0, { configPath });
+    try {
+      const res = await fetch(new URL("/status.json", server.url));
+      expect(res.ok).toBe(true);
+      const body = JSON.parse(await res.text()) as {
+        activeProfile: string | null;
+        healthy: boolean;
+        counts: { preferences: number };
+      };
+      expect(body.activeProfile).toBe("work");
+      expect(typeof body.healthy).toBe("boolean");
+      expect(body.counts.preferences).toBe(1);
+    } finally {
+      await server.close();
+    }
+    // Without the options object no config path reaches the snapshot,
+    // so the profile lookup reads as none.
+    const bare = buildLiveServer(vault, 0);
+    try {
+      const res = await fetch(new URL("/status.json", bare.url));
+      const body = JSON.parse(await res.text()) as { activeProfile: string | null };
+      expect(body.activeProfile).toBeNull();
+    } finally {
+      await bare.close();
+    }
+  });
+
+  test("unknown routes still answer 404", async () => {
+    const server = buildLiveServer(vault, 0);
+    try {
+      const res = await fetch(new URL("/nope.json", server.url));
+      expect(res.status).toBe(404);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("a broken counts section surfaces by name as a 500 JSON error", async () => {
+    // With snapshots enabled the collector lists Brain/reports; a FILE
+    // parked at that path makes the listing throw, and the route must
+    // answer with the error message rather than an empty payload.
+    process.env[REPORT_SNAPSHOTS_ENV] = "true";
+    mkdirSync(join(vault, "Brain"), { recursive: true });
+    writeFileSync(join(vault, "Brain", "reports"), "not a directory");
+    const server = buildLiveServer(vault, 0);
+    try {
+      const res = await fetch(new URL("/counts.json", server.url));
+      expect(res.status).toBe(500);
+      const body = JSON.parse(await res.text()) as { error: string };
+      expect(typeof body.error).toBe("string");
+      expect(body.error).toContain("reports");
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("a non-loopback Host header is refused with a named 403 on every route", async () => {
+    // The loopback BIND is not a browser boundary: a DNS-rebinding page
+    // resolves an attacker hostname to 127.0.0.1 and the request arrives
+    // carrying that hostname. The server itself must refuse it, on the
+    // graph route and the new JSON routes alike.
+    const server = buildLiveServer(vault, 0);
+    try {
+      const refusedOn = async (route: string): Promise<{ status: number; error: string }> => {
+        const res = await fetch(new URL(route, server.url), {
+          headers: { host: "attacker.example" },
+        });
+        const body = JSON.parse(await res.text()) as { error: string };
+        return { status: res.status, error: body.error };
+      };
+      const forHtml = await refusedOn("/");
+      expect(forHtml.status).toBe(403);
+      expect(forHtml.error).toContain("loopback");
+      const forGraph = await refusedOn("/data.json");
+      expect(forGraph.status).toBe(403);
+      expect(forGraph.error).toContain("loopback");
+      const forCounts = await refusedOn("/counts.json");
+      expect(forCounts.status).toBe(403);
+      expect(forCounts.error).toContain("loopback");
+      const forStatus = await refusedOn("/status.json");
+      expect(forStatus.status).toBe(403);
+      expect(forStatus.error).toContain("loopback");
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("a loopback Host name with any port is accepted", async () => {
+    writePreference(vault, basePref("hosted"));
+    const server = buildLiveServer(vault, 0);
+    try {
+      const servedWith = async (host: string): Promise<number> => {
+        const res = await fetch(new URL("/counts.json", server.url), {
+          headers: { host },
+        });
+        const body = JSON.parse(await res.text()) as { schema_version: number };
+        return res.ok ? body.schema_version : -1;
+      };
+      // The default request already carries 127.0.0.1:<port>.
+      const direct = await fetch(new URL("/counts.json", server.url));
+      expect(direct.ok).toBe(true);
+      // The other loopback spellings, port included, are the allowlist.
+      expect(await servedWith(`localhost:${server.port}`)).toBe(1);
+      expect(await servedWith(`[::1]:${server.port}`)).toBe(1);
+    } finally {
+      await server.close();
+    }
   });
 });

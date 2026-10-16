@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { writePreference } from "../../src/core/brain/preference.ts";
 import { REDACTION_PLACEHOLDER } from "../../src/core/redactor.ts";
@@ -126,6 +126,12 @@ describe("o2b brain explorer --export", () => {
     const parsed = JSON.parse(match![1]!);
     expect(parsed.nodes.length).toBe(1);
     expect(parsed.nodes[0].id).toBe("pref-explorer-seed");
+    // The console sections travel with the template; on a static export
+    // they state that the live routes are unreachable instead of firing
+    // fetches that can only fail against a file path.
+    expect(body).toContain('id="counts-body"');
+    expect(body).toContain('id="ops-body"');
+    expect(body).toContain("static export");
   });
 
   test("the exported graph goes through the shared egress guard", async () => {
@@ -216,7 +222,7 @@ describe("o2b brain explorer --export", () => {
 
 describe("o2b brain explorer (live)", () => {
   test(
-    "binds to 127.0.0.1, serves / and /data.json, shuts down on SIGINT",
+    "binds to 127.0.0.1, serves all four routes, shuts down on SIGINT",
     async () => {
       await bootstrap();
       seedOnePref();
@@ -265,6 +271,48 @@ describe("o2b brain explorer (live)", () => {
         expect(mainBody.includes("__GRAPH_JSON__")).toBe(false);
         const parsed = JSON.parse(dataBody);
         expect(parsed.nodes.length).toBe(1);
+        // The counts and ops sections fetch the two console routes
+        // client-side, in the page's own vanilla JS; the substituted
+        // graph payload remains the page's single inline JSON block.
+        expect(mainBody).toContain('id="counts-body"');
+        expect(mainBody).toContain('id="ops-body"');
+        expect(mainBody).toContain('fetchJson("/counts.json")');
+        expect(mainBody).toContain('fetchJson("/status.json")');
+        expect(mainBody.split('<script type="application/json" id="brain-data">').length).toBe(2);
+        // The live-counts console routes (session-mining-economy): both
+        // are loopback JSON re-read from the vault per GET.
+        const countsRes = await fetch(`http://127.0.0.1:${port}/counts.json`);
+        expect(countsRes.ok).toBe(true);
+        const counts = JSON.parse(await countsRes.text()) as {
+          schema_version: number;
+          telemetry: { total: number };
+          written_per_day: ReadonlyArray<unknown>;
+          report_snapshots: unknown;
+        };
+        expect(counts.schema_version).toBe(1);
+        expect(counts.telemetry.total).toBe(0);
+        expect(counts.written_per_day.length).toBe(30);
+        expect(counts.report_snapshots).toEqual({ status: "disabled" });
+        const statusRes = await fetch(`http://127.0.0.1:${port}/status.json`);
+        expect(statusRes.ok).toBe(true);
+        const status = JSON.parse(await statusRes.text()) as {
+          healthy: boolean;
+          counts: { preferences: number };
+          activeProfile: string | null;
+        };
+        expect(typeof status.healthy).toBe("boolean");
+        expect(status.counts.preferences).toBe(1);
+        // The verb threads its resolved config path into the server, so
+        // the operator snapshot sees this run's profile registry.
+        writeFileSync(
+          join(dirname(config), "profiles.json"),
+          JSON.stringify({ active: "test", profiles: { test: { vault } } }),
+        );
+        const profiled = await fetch(`http://127.0.0.1:${port}/status.json`);
+        const profileStatus = JSON.parse(await profiled.text()) as {
+          activeProfile: string | null;
+        };
+        expect(profileStatus.activeProfile).toBe("test");
       } finally {
         // Always tear the spawned CLI down so a failing assertion does
         // not leak the port into the next test on the same worker.

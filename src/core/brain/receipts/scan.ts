@@ -11,19 +11,27 @@
  *
  * Protected classes, never foldable whatever their age:
  *
- *   - `source_invalidation` - the deleteBySource audit trail;
- *   - `pre_compact_extract` / `post_compact_audit` - the Hermes
- *     context-compaction receipts, which a storage fold must not
- *     rewrite under a colliding name;
+ *   - every continuity kind outside the closed
+ *     {@link FOLDABLE_CONTINUITY_KINDS} allowlist - folding is opt-in
+ *     per kind, and the functional kinds (the session read models, the
+ *     by-id lookups, the entity index, the audit trails) are read back
+ *     as data, not aggregated as telemetry. Unknown kinds fail closed to
+ *     keep the same way: a newer build's records are not this build's to
+ *     fold;
  *   - any record whose payload carries one of
  *     {@link CLIP_PROTECTED_PAYLOAD_KEYS} - folding would destroy the
  *     session/agent correlation the clip rule guarantees survives;
- *   - any continuity kind this build does not know - a newer build's
- *     records are not this build's to fold (fail closed to keep);
  *   - any record whose timestamp cannot be compared (fail closed).
  *
  * Ledger rewrites happen only in `compact.ts`; this module never binds a
  * write primitive.
+ *
+ * The inventory is also per device: a shard is one device's file (the
+ * legacy un-sharded name is the empty shard id), and only the shards the
+ * LOCAL lock and compare-and-swap can guard are offered - this device's
+ * shard plus the legacy file. A peer's shard never appears here, so no
+ * surface can hand an operator a plan that would diverge another
+ * device's copy; compact refuses one named by hand with the same verdict.
  */
 
 import { readFileSync, statSync } from "node:fs";
@@ -35,12 +43,13 @@ import {
   JSONL_LEDGER_EXT,
   listShardedFiles,
   parseShardedName,
+  resolveAppendShardId,
   type LedgerShardGrammar,
 } from "../ledger-shards.ts";
 import { metricsDir } from "../metrics.ts";
 import { toPosix } from "../../path-safety.ts";
 import {
-  PROTECTED_CONTINUITY_KINDS,
+  FOLDABLE_CONTINUITY_KINDS,
   RECEIPT_FOLD_DEFAULT_AGE_DAYS,
   RECEIPT_FOLD_SCHEMA,
   RECEIPT_LEDGER_FAMILIES,
@@ -83,6 +92,17 @@ const MS_PER_DAY = 86_400_000;
  */
 export const RECEIPT_SHARD_UNREADABLE = "unreadable";
 
+/**
+ * The closed sentence a foreign shard is refused with. Shards are named
+ * per device so exactly one device ever writes a given file, while the
+ * fold's lock and compare-and-swap are local only - a rewrite here would
+ * diverge the copy the owning device is appending to, which is the
+ * sync-conflict class the shard layout exists to prevent. The refusal
+ * names the remedy: the fold belongs on the owning device.
+ */
+export const RECEIPT_SHARD_FOREIGN_DEVICE =
+  "another device's shard; compact it on the owning device";
+
 /** ISO-8601 UTC timestamp shape, the one the metrics ledger writes. */
 const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 
@@ -96,18 +116,20 @@ export function payloadCarriesProtectedKey(payload: unknown): boolean {
 }
 
 /**
- * Classify one continuity record against the cutoff. Unknown kinds,
- * protected kinds, protected-key carriers and uncompared timestamps are
- * protected (fail closed); canonical timestamps at or after the cutoff
- * are young; everything else is foldable. Every field is optional: a
- * line missing one classifies through the same guards and fails closed.
+ * Classify one continuity record against the cutoff. Folding is opt-in
+ * per kind: an unknown kind, or any kind outside the closed
+ * {@link FOLDABLE_CONTINUITY_KINDS} allowlist, a protected-key carrier
+ * and an uncompared timestamp are all protected (fail closed); canonical
+ * timestamps at or after the cutoff are young; a listed telemetry kind
+ * older than that is foldable. Every field is optional: a line missing
+ * one classifies through the same guards and fails closed.
  */
 export function classifyContinuityRecord(
   record: { readonly kind?: unknown; readonly createdAt?: unknown; readonly payload?: unknown },
   cutoffMs: number,
 ): ReceiptLineClass {
   if (!isContinuityRecordKind(record.kind)) return "protected";
-  if ((PROTECTED_CONTINUITY_KINDS as ReadonlyArray<string>).includes(record.kind)) {
+  if (!(FOLDABLE_CONTINUITY_KINDS as ReadonlyArray<string>).includes(record.kind)) {
     return "protected";
   }
   if (payloadCarriesProtectedKey(record.payload)) return "protected";
@@ -193,6 +215,19 @@ function familyGrammar(family: ReceiptLedgerFamily): LedgerShardGrammar {
 }
 
 /**
+ * The caller-error message for a shard ref whose name the family's name
+ * grammar does not recognise - a typo, a path traversal, a sync-conflict
+ * copy - or `null` when the name is a real shard of the family. The
+ * boundaries validate through this BEFORE anything runs, so a malformed
+ * shard id is the caller's invalid-params error, never an internal one.
+ */
+export function receiptShardNameError(ref: ReceiptShardRef): string | null {
+  return parseShardedName(ref.name, familyGrammar(ref.family)) === null
+    ? `'${ref.name}' is not a ${ref.family} shard name`
+    : null;
+}
+
+/**
  * Resolve one shard ref to its file through the family's name grammar.
  * A name the grammar does not recognise - a typo, a path traversal, a
  * sync-conflict copy - is a named caller error before anything is read
@@ -202,10 +237,10 @@ export function resolveReceiptShardPath(
   vault: string,
   ref: ReceiptShardRef,
 ): { readonly path: string; readonly base: string; readonly shardId: string } {
-  const parsed = parseShardedName(ref.name, familyGrammar(ref.family));
-  if (parsed === null) {
-    throw new Error(`'${ref.name}' is not a ${ref.family} shard name`);
-  }
+  const nameError = receiptShardNameError(ref);
+  if (nameError !== null) throw new Error(nameError);
+  // The name error is null exactly when the grammar accepts the name.
+  const parsed = parseShardedName(ref.name, familyGrammar(ref.family))!;
   return {
     path: join(receiptLedgerDir(vault, ref.family), ref.name),
     base: parsed.base,
@@ -332,10 +367,16 @@ export function scanReceiptLedgers(
   const nowMs = (opts.now ?? new Date()).getTime();
   const cutoffMs = nowMs - olderThanDays * MS_PER_DAY;
   const cutoff = canonicalSecond(cutoffMs);
+  const localShardId = resolveAppendShardId();
   const shards: ReceiptShardScan[] = [];
   const errors: ReceiptScanError[] = [];
   for (const family of RECEIPT_LEDGER_FAMILIES) {
     for (const shard of listShardedFiles(receiptLedgerDir(vault, family), familyGrammar(family))) {
+      // A shard is one device's file: this device's shard and the legacy
+      // un-sharded file are the only rewrites the local lock and
+      // compare-and-swap can guard, so they are the only shards the
+      // inventory offers. A peer's shard is its own device's to fold.
+      if (shard.shardId !== "" && shard.shardId !== localShardId) continue;
       const result = scanShard(vault, family, shard, cutoffMs);
       if ("error" in result) errors.push(result.error);
       else shards.push(result.row);

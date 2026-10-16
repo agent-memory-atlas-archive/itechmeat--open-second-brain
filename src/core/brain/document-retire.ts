@@ -8,18 +8,24 @@
  *
  *   1. retarget every inbound `[[stale-copy]]` wikilink to the
  *      canonical spelling (the report is carried, never swallowed);
+ *      a write that could not land refuses the copy before the
+ *      removal, so no retired page strands the link it could not
+ *      repoint (review M7);
  *   2. remove the stale page (per-file removal via the shared
  *      `removeFile`, so a failure is one copy's failure);
- *   3. drop the copy's content-manifest entry, round-tripping the
- *      contract the manifest was read under - the same t_586d5d8b rule
- *      deleteBySource applies: a removal never re-stamps the contract
- *      the surviving entries were recorded under. The drop is the
- *      resurrect guard: with the entry gone, the retired source
- *      classifies `new` again, so no later ingest can claim the
- *      retired page's records are current; the source can only return
- *      as a deliberate full re-ingest;
+ *   3. MARK the copy's source manifest entry `retired_into` the
+ *      canonical page, round-tripping the contract the manifest was
+ *      read under - the same t_586d5d8b rule deleteBySource applies: a
+ *      retirement never re-stamps the contract the surviving entries
+ *      were recorded under. The marker is the resurrect guard (review
+ *      H3): dropping the entry would classify the unchanged source
+ *      `new` again and the next batch plan would re-ingest it, quietly
+ *      undoing the retirement. With the marker, the unchanged source
+ *      classifies `retired` and no plan queues it; a real byte change
+ *      re-admits it as `modified`, and a deliberate re-ingest re-records
+ *      the entry without the marker;
  *   4. append one `source_invalidation` continuity record PER COPY
- *      naming canonical id, retired id, dropped manifest key and the
+ *      naming canonical id, retired id, marked manifest key and the
  *      retained source-archive hash - the audit the page-dedup merge
  *      never needed, because a merge keeps both pages and this
  *      operation deletes one.
@@ -36,18 +42,19 @@
  * collected as `{path, message}`, and the remaining copies still
  * retire. The message says WHERE the copy ended up: a failure BEFORE
  * the page's own removal (the existence, frontmatter or canonical
- * checks) leaves the copy on disk; a failure AFTER it - the manifest
- * drop, the continuity record - reports the page as REMOVED, because it
- * is, and names the step that lost it. Copy-level input mistakes (a
- * path equal to its own canonical) are caller bugs and refuse loudly
- * before any work.
+ * checks, the ambiguous-basename refusal, an inbound-link rewrite that
+ * could not land) leaves the copy on disk; a failure AFTER it - the
+ * manifest marker, the continuity record - reports the page as REMOVED,
+ * because it is, and names the step that lost it. Copy-level input
+ * mistakes (a path equal to its own canonical) are caller bugs and
+ * refuse loudly before any work.
  *
  * Dry runs never reach this module: the hygiene apply plan previews
  * retire findings without executing them, and the surfaces' count
  * guard runs on the selected findings before this applier is called.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { parseFrontmatter } from "../vault.ts";
@@ -82,16 +89,19 @@ function linkTarget(pagePath: string): string {
 }
 
 /**
- * Why a copy's inbound-link pass did not run: another page in the vault
+ * Why a copy whose inbound-link pass cannot run unambiguously is REFUSED
+ * (storage lifecycle, PR #257 review L5): another page in the vault
  * carries the retired copy's basename, so the bare `[[basename]]`
  * spelling resolves to more than one page and a retarget keyed on the
  * spelling alone would repoint links that meant the OTHER page - edits
  * to pages outside the detector's near-duplicate scope, made on a guess.
- * The copy still retires; the skipped pass leaves a stale link, which a
- * reader can discover, where a mis-pointed link misleads silently.
+ * Removing the page anyway is worse than skipping the rewrite: every
+ * leftover `[[basename]]` would then RESOLVE to the namesake, silently
+ * re-pointed by a deletion instead of left visibly stale. So the copy is
+ * refused and stays on disk; the finding comes back to the operator.
  */
-export const RETIRE_LINKS_SKIPPED_BASENAME_COLLISION =
-  "another page carries the same basename; the bare-basename link spelling is ambiguous";
+export const RETIRE_BASENAME_COLLISION_REFUSAL =
+  "another page carries the same basename, so the bare-basename link spelling is ambiguous";
 
 /** Frontmatter key carrying the digest of the archived source bytes. */
 const SOURCE_ARCHIVE_HASH_KEY = "source_archive_hash";
@@ -127,21 +137,43 @@ export interface RetiredDocumentCopy {
   readonly canonical: string;
   /** The source path whose manifest entry was targeted, or `null`. */
   readonly manifestKey: string | null;
-  /** True when the manifest was rewritten without the entry. */
-  readonly manifestDropped: boolean;
+  /** True when the manifest was rewritten to carry the `retired_into` marker. */
+  readonly manifestRetired: boolean;
   /**
-   * The full retarget report for this copy's inbound wikilinks, `null`
-   * when the pass was SKIPPED - {@link RetiredDocumentCopy.wikilinksSkipped}
-   * names why. `null` is never a silent zero: a skipped pass left every
-   * inbound link exactly as it was.
+   * The retired page's size in bytes, measured BEFORE its removal - the
+   * freed half of the run's disk accounting (review M6).
    */
-  readonly wikilinks: WikilinkRetargetReport | null;
-  /** Why the link pass did not run, `null` when it ran. */
-  readonly wikilinksSkipped: string | null;
+  readonly pageBytes: number;
+  /**
+   * The full retarget report for this copy's inbound wikilinks. A copy
+   * whose pass could not run unambiguously - the basename collision - is
+   * refused before any write and lands in {@link RetireDocumentsResult.failed}
+   * instead, so a report row always carries a pass that ran.
+   */
+  readonly wikilinks: WikilinkRetargetReport;
   /** Digest named in the audit; from the page's frontmatter, or `null`. */
   readonly sourceArchiveHash: string | null;
   /** The id of the `source_invalidation` continuity record this retirement appended. */
   readonly auditRecordId: string;
+}
+
+/**
+ * The run's disk accounting (review M6, retire half): the destructive span
+ * archives `Brain/` into `Brain/.snapshots/` - a surface the storage census
+ * counts - BEFORE it frees anything, so removal counts alone can read as a
+ * shrink on a run that actually grew the vault. The result carries both
+ * sides and the net between them.
+ */
+export interface RetireDiskAccounting {
+  /**
+   * Bytes of the snapshot archive the gate wrote for this run, or `null`
+   * when no snapshot was taken (a run with no copies).
+   */
+  readonly snapshotBytes: number | null;
+  /** Summed bytes of the pages the run removed, measured before removal. */
+  readonly removedBytes: number;
+  /** `snapshotBytes - removedBytes`; `null` beside a `null` snapshot size. */
+  readonly netBytes: number | null;
 }
 
 export interface RetireDocumentsResult {
@@ -153,6 +185,12 @@ export interface RetireDocumentsResult {
    * lost it.
    */
   readonly failed: ReadonlyArray<SourceCleanupFailure>;
+  /**
+   * The run's disk accounting (review M6): both sides and the net
+   * between them, as the module header promises. Per-copy bytes ride
+   * {@link RetiredDocumentCopy.pageBytes}; this carries the run totals.
+   */
+  readonly disk: RetireDiskAccounting;
   readonly snapshotRunId: string | null;
   readonly snapshotPath: string | null;
   readonly recoverability: RecoverabilityVerdict;
@@ -207,6 +245,7 @@ export function retireDocumentCopies(
     return Object.freeze({
       retired: Object.freeze([]),
       failed: Object.freeze([]),
+      disk: Object.freeze({ snapshotBytes: null, removedBytes: 0, netBytes: null }),
       snapshotRunId: null,
       snapshotPath: null,
       // Nothing to destroy, so the classifier says so - neither the
@@ -256,9 +295,21 @@ export function retireDocumentCopies(
     },
   );
 
+  // The disk accounting (review M6, retire half): the archive sits in a
+  // counted surface, so the result states what the snapshot cost beside
+  // what the removals freed.
+  const removedBytes = retired.reduce((sum, copy) => sum + copy.pageBytes, 0);
+  const snapshotBytes = existsSync(gated.snapshot.path) ? statSync(gated.snapshot.path).size : null;
+  const disk: RetireDiskAccounting = Object.freeze({
+    snapshotBytes,
+    removedBytes,
+    netBytes: snapshotBytes === null ? null : snapshotBytes - removedBytes,
+  });
+
   return Object.freeze({
     retired: Object.freeze(retired),
     failed: Object.freeze(failed),
+    disk,
     snapshotRunId: gated.snapshot.runId,
     snapshotPath: gated.snapshot.path,
     recoverability: gated.recoverability,
@@ -285,6 +336,9 @@ function retireOneCopy(
   if (!existsSync(abs)) {
     throw new Error(`retired copy not found on disk: ${copy.path}`);
   }
+  // Measured before anything acts: the freed half of the run's disk
+  // accounting (review M6).
+  const pageBytes = statSync(abs).size;
   const facts = readCopyFacts(vault, copy.path);
   if (facts === null) {
     throw new Error(`retired copy frontmatter does not parse: ${copy.path}`);
@@ -297,17 +351,37 @@ function retireOneCopy(
   }
 
   // 1. Links first, so no reader between steps ever sees a stranded
-  // `[[stale-copy]]`. Failure to write a file is collected in the
-  // report, not thrown - the pass has already rewritten the files
-  // before it (the retargetWikilinks argument, verbatim). The pass
-  // keys on the bare basename, so when another page carries the same
-  // basename the spelling is ambiguous: rewriting it would repoint
-  // links that meant the other page. The copy then retires without its
-  // link pass and the report names why - a stale link is discoverable,
-  // a mis-pointed one misleads silently.
-  const wikilinks = basenameCollides(vault, linkTarget(copy.path), copy.path)
-    ? null
-    : retargetWikilinks(vault, [{ from: linkTarget(copy.path), to: linkTarget(copy.canonical) }]);
+  // `[[stale-copy]]`. The pass keys on the bare basename, so when another
+  // page carries the same basename the spelling is ambiguous: rewriting it
+  // would repoint links that meant the other page, and removing the page
+  // anyway would leave every leftover spelling resolving to the namesake
+  // silently (review L5). The copy is refused BEFORE any write and stays
+  // on disk - a refusal is one copy's collected failure.
+  if (basenameCollides(vault, linkTarget(copy.path), copy.path)) {
+    throw new Error(
+      `retirement refused, the copy stays in place: ${RETIRE_BASENAME_COLLISION_REFUSAL}: ${copy.path}`,
+    );
+  }
+  // Failure to write a file is collected in the report, not thrown - the
+  // pass has already rewritten the files before it (the retargetWikilinks
+  // argument, verbatim).
+  const wikilinks = retargetWikilinks(vault, [
+    { from: linkTarget(copy.path), to: linkTarget(copy.canonical) },
+  ]);
+  // A retarget write that failed refuses the copy (review M7): retiring
+  // the page over an unreplicable link would strand exactly the inbound
+  // reference the pass could not repoint - the design's "a copy whose
+  // retarget fails stays in place". The refusal is BEFORE the removal, so
+  // the copy stays on disk as one collected per-copy failure; the files
+  // the pass DID rewrite now point at the canonical, which exists, so no
+  // link is stranded by the partial rewrite either.
+  if (wikilinks.failed.length > 0) {
+    throw new Error(
+      `inbound wikilink retarget left ${wikilinks.failed.length} file(s) unwritten; ` +
+        `the copy stays in place: ` +
+        wikilinks.failed.map((f) => `${f.path} (${f.reason})`).join("; "),
+    );
+  }
 
   // 2. Remove the stale page. `false` here means the page vanished
   // between the existence check and the unlink - that is a failure to
@@ -320,39 +394,39 @@ function retireOneCopy(
   // leave the copy on disk, so it is rethrown AS that fact - the report
   // must never send an operator looking for a page that is not there.
   try {
-    // 3. Drop the manifest entry for the copy's source, round-tripping
-    // the read contract (t_586d5d8b): the surviving entries keep the
-    // fingerprint they were recorded under, so the owed one-time
-    // reprocess is never forfeited by a removal. The per-copy reason is
-    // worded from what actually happened - a drop, a refusal, an entry
-    // already absent, or nothing to drop at all - never from the key's
-    // existence alone.
-    let manifestDropped = false;
+    // 3. Mark the manifest entry for the copy's source `retired_into` the
+    // canonical page, round-tripping the read contract (t_586d5d8b): the
+    // surviving entries keep the fingerprint they were recorded under, so
+    // the owed one-time reprocess is never forfeited by a retirement. The
+    // per-copy reason is worded from what actually happened - a mark, a
+    // refusal, an entry already marked, an entry absent, or no key
+    // recorded at all - never from the key's existence alone.
+    let manifestRetired = false;
     let manifestClause: string;
     if (facts.sourcePath === null) {
       manifestClause = "no manifest key recorded";
     } else if (!existsSync(manifestPath(vault))) {
-      manifestClause = `manifest absent, nothing to drop for ${facts.sourcePath}`;
+      manifestClause = `manifest absent, nothing to mark for ${facts.sourcePath}`;
     } else {
       const manifest = readManifest(vault);
       const entries = { ...manifest.entries };
-      if (entries[facts.sourcePath] === undefined) {
-        manifestClause = `manifest key ${facts.sourcePath} already absent`;
+      const existing = entries[facts.sourcePath];
+      if (existing === undefined) {
+        manifestClause = `manifest key ${facts.sourcePath} absent, nothing to mark`;
+      } else if (existing.retired_into === copy.canonical) {
+        // The entry already carries THIS retirement's marker: the serialized
+        // bytes below would be identical, and the clause names that
+        // success-shaped fact - a concurrent retirer got there first.
+        manifestClause = `manifest key ${facts.sourcePath} already marked retired`;
       } else {
-        delete entries[facts.sourcePath];
-        manifestDropped = writeManifestAtomic(vault, entries, manifest.contract);
-        // A `false` from the atomic write after deleting a PRESENT key means
-        // the serialized bytes were already identical - the key was already
-        // gone on disk, i.e. a concurrent retirer got there first. The
-        // reason names that success-shaped fact, not a failure to drop.
-        manifestClause = manifestDropped
-          ? `dropped manifest key ${facts.sourcePath}`
-          : `manifest already without key ${facts.sourcePath}`;
+        entries[facts.sourcePath] = { ...existing, retired_into: copy.canonical };
+        manifestRetired = writeManifestAtomic(vault, entries, manifest.contract);
+        manifestClause = `marked manifest key ${facts.sourcePath} retired into ${copy.canonical}`;
       }
     }
 
     // 4. The provenance record: one per copy, naming what survives, what
-    // went, what was dropped and what evidence is retained.
+    // went, what was marked and what evidence is retained.
     const agent = opts.agent?.trim() ? opts.agent.trim() : DEFAULT_AGENT;
     const record = appendContinuitySourceInvalidation(vault, {
       createdAt: isoSecond(opts.now ?? new Date()),
@@ -371,9 +445,9 @@ function retireOneCopy(
       path: copy.path,
       canonical: copy.canonical,
       manifestKey: facts.sourcePath,
-      manifestDropped,
+      manifestRetired,
+      pageBytes,
       wikilinks,
-      wikilinksSkipped: wikilinks === null ? RETIRE_LINKS_SKIPPED_BASENAME_COLLISION : null,
       sourceArchiveHash: facts.archiveHash,
       auditRecordId: record.id,
     });
@@ -382,6 +456,7 @@ function retireOneCopy(
     throw new Error(
       `retirement removed ${copy.path}, then a post-removal step failed ` +
         `(the copy is not on disk): ${detail}`,
+      { cause: error },
     );
   }
 }

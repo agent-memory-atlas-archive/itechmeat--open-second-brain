@@ -110,17 +110,35 @@ export interface ManifestEntry {
    * Absent together with the byte count on unwatermarked entries.
    */
   readonly extracted_at?: string;
+  /**
+   * The resurrect guard (storage lifecycle, PR #257 review H3): the vault
+   * path of the canonical summary page this source's near-duplicate copy
+   * was retired into. Set by the retirement core INSTEAD of dropping the
+   * entry - a dropped entry would classify the unchanged source `new`
+   * again and the next batch plan would re-ingest it, quietly undoing the
+   * retirement. While the marker stands and the bytes are unchanged the
+   * source classifies `retired` ({@link classifyPaths}) and no batch plan
+   * queues it; a real content change re-admits it as `modified`, and a
+   * deliberate re-ingest re-records the entry without the marker. ADDITIVE
+   * by design - schema_version stays 3, and a malformed shape on disk
+   * drops the FIELD, never the entry.
+   */
+  readonly retired_into?: string;
 }
 
 /**
  * The entry's extraction watermark, degraded the lazy way: an entry recorded
- * before watermarks existed - or with a malformed one on disk - answers
- * byte 0, "never extracted", so the source reprocesses fully instead of
- * skipping. Never an eager mass reprocess: the absence costs one pass, once,
- * per source that actually grows again.
+ * before watermarks existed - one with a malformed shape on disk - or a
+ * path with NO entry at all answers byte 0, "never extracted", so the
+ * source reprocesses fully instead of skipping. Never an eager mass
+ * reprocess: the absence costs one pass, once, per source that actually
+ * grows again. The `undefined` acceptance is deliberate: every caller reads
+ * the entry straight out of a manifest lookup (`entries[path]`), where a
+ * source that was never ingested is undefined and "never extracted" is the
+ * honest answer, not a crash.
  */
-export function extractedBytesOf(entry: ManifestEntry): number {
-  return entry.extracted_bytes ?? 0;
+export function extractedBytesOf(entry: ManifestEntry | undefined): number {
+  return entry?.extracted_bytes ?? 0;
 }
 
 /**
@@ -166,6 +184,8 @@ export interface PathClassification {
   readonly modified: string[];
   /** On disk, present in the manifest, bytes identical. */
   readonly unchanged: string[];
+  /** On disk, bytes identical, and the entry is marked retired into a canonical page. */
+  readonly retired: string[];
   /** In the manifest (or requested) but no longer on disk. */
   readonly missing: string[];
 }
@@ -301,14 +321,19 @@ function parseEntryValue(value: unknown): ManifestEntry | null {
   // a malformed one drops JUST the field, which answers byte 0 and
   // reprocesses lazily - dropping the whole entry would forfeit the
   // fingerprint and force the eager contract-changed reprocess instead.
+  // The retired marker follows the same per-field rule (H3).
   const extractedBytes = record["extracted_bytes"];
   const extractedAt = record["extracted_at"];
+  const retiredInto = record["retired_into"];
   return {
     sha256: record["sha256"],
     ...(typeof fingerprint === "string" ? { fingerprint } : {}),
     ...(isByteOffset(extractedBytes) ? { extracted_bytes: extractedBytes } : {}),
     ...(typeof extractedAt === "string" && extractedAt.length > 0
       ? { extracted_at: extractedAt }
+      : {}),
+    ...(typeof retiredInto === "string" && retiredInto.length > 0
+      ? { retired_into: retiredInto }
       : {}),
   };
 }
@@ -320,12 +345,16 @@ function isByteOffset(value: unknown): value is number {
 
 /**
  * Does the entry carry recorded state the bare v1 digest shape cannot hold -
- * a per-entry fingerprint or an extraction watermark? Such an entry never
- * serializes down to v1: data a write could read back is data the write
- * must keep.
+ * a per-entry fingerprint, an extraction watermark, or the retired marker?
+ * Such an entry never serializes down to v1: data a write could read back is
+ * data the write must keep.
  */
 function hasRecordedState(entry: ManifestEntry): boolean {
-  return entry.fingerprint !== undefined || entry.extracted_bytes !== undefined;
+  return (
+    entry.fingerprint !== undefined ||
+    entry.extracted_bytes !== undefined ||
+    entry.retired_into !== undefined
+  );
 }
 
 /**
@@ -445,7 +474,15 @@ export function writeManifestAtomic(
  *   - not on disk            → `missing`,
  *   - on disk, not recorded  → `new`,
  *   - on disk, hash matches  → `unchanged`,
+ *   - on disk, hash matches and the entry is marked retired → `retired`,
  *   - on disk, hash differs  → `modified`.
+ * The `retired` bucket is the resurrect guard (storage lifecycle, review
+ * H3): a near-duplicate retirement marks the entry `retired_into` a
+ * canonical page instead of dropping it, and an unchanged source behind
+ * that marker classifies `retired` - never `new` - so no batch plan
+ * re-queues it. A hash DIFFERENCE still classifies `modified` whatever
+ * the marker says: the marker describes the bytes it was recorded under,
+ * and changed bytes are a real source again.
  * The buckets answer the BYTES question only - the extraction-contract
  * question is the manifest's derived `contract` field, kept deliberately
  * separate so a bytes-based read-back (the import census) is never affected
@@ -458,7 +495,13 @@ export function classifyPaths(
   paths: readonly string[],
   manifest: ContentManifest,
 ): PathClassification {
-  const result: PathClassification = { new: [], modified: [], unchanged: [], missing: [] };
+  const result: PathClassification = {
+    new: [],
+    modified: [],
+    unchanged: [],
+    retired: [],
+    missing: [],
+  };
   for (const path of paths) {
     const canonical = canonicalNotePath(path);
     const abs = join(vault, canonical);
@@ -470,13 +513,39 @@ export function classifyPaths(
     const live = hashPath(abs);
     if (recorded === undefined) {
       result.new.push(canonical);
-    } else if (recorded.sha256 === live) {
-      result.unchanged.push(canonical);
-    } else {
+    } else if (recorded.sha256 !== live) {
       result.modified.push(canonical);
+    } else if (recorded.retired_into !== undefined) {
+      result.retired.push(canonical);
+    } else {
+      result.unchanged.push(canonical);
     }
   }
   return result;
+}
+
+/** One path's watermark request: the stamp the caller wants recorded. */
+export interface ManifestWatermarkRequest {
+  /** ISO-8601 `extracted_at` stamp, from the caller's injected clock. */
+  readonly at: string;
+}
+
+export interface UpdateManifestOptions {
+  /**
+   * Request an extraction watermark per path (review L1): updateManifest
+   * stats and hashes the source ITSELF, INSIDE the manifest lock, and
+   * records the full entry - the live digest, the live contract
+   * fingerprint, the byte count of the file it hashed and the caller's
+   * stamp. A request supersedes any pinned record for the same path: the
+   * pinned form carries a digest computed OUTSIDE the lock, and two
+   * concurrent runs over an appended source can then land the older
+   * digest-and-watermark pair last - the race L1 names. With the request
+   * there is no precomputed pair to go stale. A source that cannot be
+   * stat'ed or hashed throws by name after the lock is released and
+   * nothing is written; a caller that wants the vanished-source skip
+   * guards the call the way the ingest pipeline already does.
+   */
+  readonly watermarks?: Readonly<Record<string, ManifestWatermarkRequest>>;
 }
 
 /**
@@ -509,6 +578,7 @@ export function updateManifest(
   vault: string,
   paths: readonly string[],
   records: Readonly<Record<string, ManifestEntry>> = {},
+  opts: UpdateManifestOptions = {},
 ): boolean {
   const handle = acquireLockSyncWithRetry(manifestPath(vault), undefined, {
     remedy: ingestLockRemedy,
@@ -521,6 +591,20 @@ export function updateManifest(
       const abs = join(vault, canonical);
       if (!existsSync(abs)) {
         delete entries[canonical];
+        continue;
+      }
+      // The in-lock watermark request (L1): one stat, one hash, of the
+      // file as it exists UNDER the lock - never a caller-precomputed
+      // pair that a concurrent append can stale out.
+      const watermark = opts.watermarks?.[canonical];
+      if (watermark !== undefined) {
+        const size = statSync(abs).size;
+        entries[canonical] = {
+          sha256: hashPath(abs),
+          fingerprint: live,
+          extracted_bytes: size,
+          extracted_at: watermark.at,
+        };
         continue;
       }
       const pinned = records[canonical];

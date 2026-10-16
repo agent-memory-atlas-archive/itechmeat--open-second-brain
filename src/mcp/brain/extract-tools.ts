@@ -51,6 +51,10 @@ async function toolBrainExtractSignals(
         decisionModel,
         tokenImpactEnabled:
           decisionModel !== null && resolveTokenImpactLedgerEnabled(ctx.configPath ?? undefined),
+        // The re-mine escape: bypass the zero-yield tombstone for this one
+        // plan call, for "I removed the downstream item and want it
+        // re-proposed".
+        force: args["force"] === true,
       });
       return {
         phase: "plan",
@@ -63,17 +67,34 @@ async function toolBrainExtractSignals(
           text: t.text,
           timestamp: t.timestamp,
         })),
+        // The hash of the material this plan offered; the commit that
+        // answers it passes it back as `surveyed_turns_hash` so the mining
+        // tombstone keys on the surveyed material.
+        surveyed_turns_hash: plan.surveyedTurnsHash,
         cap: plan.cap,
         confidence_floor: plan.confidenceFloor,
         llm_step: plan.llmStep,
         // Optional fields, present only while the decision-model turn
-        // pre-filter is on (never with the use `off`).
+        // pre-filter is on (never with the use `off`) or when the session
+        // carries a zero-yield mining tombstone.
         ...(plan.turnsDropped !== undefined ? { turns_dropped: plan.turnsDropped } : {}),
         ...(plan.skipped !== undefined
           ? {
               skipped: {
                 reason: plan.skipped.reason,
-                turns_dropped: plan.skipped.turnsDropped,
+                ...(plan.skipped.turnsDropped !== undefined
+                  ? { turns_dropped: plan.skipped.turnsDropped }
+                  : {}),
+                ...(plan.skipped.miningOutcome !== undefined
+                  ? {
+                      mining_outcome: {
+                        written: plan.skipped.miningOutcome.written,
+                        staged: plan.skipped.miningOutcome.staged,
+                        deduped: plan.skipped.miningOutcome.deduped,
+                        durability_rejected: plan.skipped.miningOutcome.durabilityRejected,
+                      },
+                    }
+                  : {}),
               },
             }
           : {}),
@@ -83,12 +104,22 @@ async function toolBrainExtractSignals(
       };
     }
     const now = new Date();
+    const surveyedTurnsHash = coerceStr(args, "surveyed_turns_hash", false);
     const res = commitExtractedSignals(
       ctx.vault,
       session,
       { items: args["items"] },
       // Loaded with parallel I/O here, where the tool can await it.
-      { agent, now, dedup: await loadDedupIndex(ctx.vault) },
+      {
+        agent,
+        now,
+        dedup: await loadDedupIndex(ctx.vault),
+        // The answered plan's surveyed hash, echoed back by the caller:
+        // what the zero-yield tombstone keys on. Absent, the commit
+        // records nothing - there is no material the verdict was earned
+        // over.
+        ...(surveyedTurnsHash ? { surveyedTurnsHash } : {}),
+      },
     );
     recordExtractPrefilterCommit(ctx.vault, decisionModel, res, now);
     return {
@@ -106,6 +137,11 @@ async function toolBrainExtractSignals(
       deduped: res.deduped,
       durability_rejected: res.durabilityRejected,
       rejected: res.rejected.map((r) => ({ topic: r.topic, reason: r.reason })),
+      // Present only when the commit succeeded but the zero-yield mining
+      // tombstone could not be recorded - named, never thrown.
+      ...(res.miningLedgerFailure !== undefined
+        ? { mining_ledger_failure: res.miningLedgerFailure }
+        : {}),
     };
   });
 }
@@ -114,13 +150,18 @@ export const EXTRACT_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: TOOL,
     description:
-      "Mine taste signals from an imported session's USER turns; runs no model. Without `items` returns the turns plus one needs-llm-step envelope. With `items` writes them to Brain/inbox/ as speculative `source_type: auto_extract` signals. Refuses over-cap, under-floor or repeated-topic payloads.",
+      "Mine taste signals from an imported session's USER turns; runs no model. Omit `items` for the plan; with `items` pass the plan's `surveyed_turns_hash` back so a barren commit records its tombstone. Barren sessions skip as 'mining_tombstone'; `force` re-mines once. Refuses caps, floors, repeats.",
     inputSchema: {
       type: "object",
       properties: {
         session: {
           type: "string",
           description: "Recall session id of an already-imported session.",
+        },
+        surveyed_turns_hash: {
+          type: "string",
+          description:
+            "Commit phase only: the `surveyed_turns_hash` from the plan response this payload answers. Omit it and a barren commit records nothing.",
         },
         items: {
           type: "array",
@@ -161,6 +202,11 @@ export const EXTRACT_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
         agent: {
           type: "string",
           description: "Optional agent identity override; defaults to the server-resolved name.",
+        },
+        force: {
+          type: "boolean",
+          description:
+            "Plan phase only: bypass the zero-yield mining tombstone for this one call and re-propose the session.",
         },
       },
       required: ["session"],

@@ -13,9 +13,11 @@
  *   - `archive` / `forget` -> move the page into a dated
  *                    `Brain/.snapshots/` directory - never delete;
  *   - `retire`    -> the document retirement core: a near-duplicate
- *                    copy is deleted, its manifest entry dropped and
- *                    its removal audited (destructive by design, so
- *                    the plan builder only selects it attended).
+ *                    copy is deleted, its manifest entry marked
+ *                    retired into the canonical, and its removal
+ *                    audited (destructive by design, so the plan
+ *                    builder only selects it attended); the applied
+ *                    detail carries the per-copy link counts.
  *
  * Dry-run previews the routed actions with zero writes. Per-finding
  * fail-soft; one audit record per non-dry run.
@@ -176,12 +178,31 @@ async function executeFinding(
             `${first.path}: ${first.message}`,
         );
       }
+      // The per-copy link accounting rides the detail (review M7): the
+      // counts used to be dropped here, so an apply that rewrote ten
+      // inbound links reported only "retired N" and one whose rewrite
+      // was refused looked like every other.
+      const links = result.retired.reduce(
+        (acc, copy) => ({
+          rewritten: acc.rewritten + copy.wikilinks.rewritten.length,
+          failed: acc.failed + copy.wikilinks.failed.length,
+        }),
+        { rewritten: 0, failed: 0 },
+      );
+      // The disk accounting rides it too (review M6, retire half): the
+      // snapshot archive lands in a counted surface before the removals
+      // free anything, so the detail states the net, not only the shrink.
+      const disk = result.disk;
+      const net = disk.netBytes ?? 0;
       return Object.freeze({
         finding_id: finding.id,
         action: "retire",
-        detail: `retired ${result.retired.length} near-duplicate cop${
-          result.retired.length === 1 ? "y" : "ies"
-        } into ${canonical}`,
+        detail:
+          `retired ${result.retired.length} near-duplicate cop${
+            result.retired.length === 1 ? "y" : "ies"
+          } into ${canonical}; links: ${links.rewritten} rewritten, ${links.failed} failed; ` +
+          `disk: snapshot ${disk.snapshotBytes ?? 0} bytes, removed ${disk.removedBytes} bytes, ` +
+          `net ${net >= 0 ? "+" : ""}${net} bytes`,
       });
     }
     default:

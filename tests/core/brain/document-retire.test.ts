@@ -11,10 +11,11 @@
  * collected ({path, message}), the failed copy stays on disk, and the
  * run completes.
  *
- * The manifest drop is the resurrect guard: with the entry gone, the
- * retired copy's source classifies `new` again, so the system never
- * claims a retired page's records are current and a later ingest can
- * only bring the source back as a deliberate full re-ingest.
+ * The retired manifest marker is the resurrect guard: the entry stays,
+ * marked `retired_into` the canonical page, so the unchanged source
+ * classifies `retired` and no batch plan queues it again - while a real
+ * content change re-admits it as `modified`, and a deliberate re-ingest
+ * re-records the entry without the marker.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -25,11 +26,13 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
+import { planBatches } from "../../../src/core/brain/ingest/batch-plan.ts";
 import {
   classifyPaths,
   readManifest,
@@ -37,7 +40,7 @@ import {
 } from "../../../src/core/brain/ingest/content-manifest.ts";
 import { listContinuityRecords } from "../../../src/core/brain/continuity/store.ts";
 import {
-  RETIRE_LINKS_SKIPPED_BASENAME_COLLISION,
+  RETIRE_BASENAME_COLLISION_REFUSAL,
   retireDocumentCopies,
 } from "../../../src/core/brain/document-retire.ts";
 import { CHMOD_CANNOT_DENY } from "../../helpers/platform.ts";
@@ -135,13 +138,12 @@ describe("retireDocumentCopies", () => {
     expect(copy.path).toBe(retired);
     expect(copy.canonical).toBe(canonical);
     expect(copy.manifestKey).toBe("imports/b.md");
-    expect(copy.manifestDropped).toBe(true);
+    expect(copy.manifestRetired).toBe(true);
     expect(copy.sourceArchiveHash).toBe(ARCHIVE_HASH);
     expect(copy.auditRecordId).not.toBeNull();
 
     // The wikilink retarget report, asserted: the citing page matched,
     // was rewritten, and its [[src-b]] now names the canonical spelling.
-    expect(copy.wikilinksSkipped).toBeNull();
     expect(copy.wikilinks!.matched).toEqual([citing]);
     expect(copy.wikilinks!.rewritten).toEqual([citing]);
     expect(copy.wikilinks!.failed).toEqual([]);
@@ -159,26 +161,67 @@ describe("retireDocumentCopies", () => {
     expect(result.recoverability.state).toBe("covered");
   });
 
-  test("drops the manifest entry round-tripping the read contract", () => {
+  test("marks the manifest entry retired, round-tripping the read contract", () => {
     const { canonical, retired } = seedPair();
+    const before = readManifest(vault).entries["imports/b.md"];
     const fingerprintBefore = readManifest(vault).entries["imports/a.md"]?.fingerprint;
 
     retireDocumentCopies(vault, [{ path: retired, canonical }], { agent: "tester", now: NOW });
 
     const manifest = readManifest(vault);
-    expect(manifest.entries["imports/b.md"]).toBeUndefined();
+    // The entry STAYS, marked retired into the canonical page - the
+    // resurrect guard. Dropping it would re-admit the unchanged source.
+    expect(manifest.entries["imports/b.md"]?.retired_into).toBe(canonical);
+    // The digest and fingerprint the entry was recorded under survive.
+    expect(manifest.entries["imports/b.md"]?.sha256).toBe(before?.sha256);
+    expect(manifest.entries["imports/b.md"]?.fingerprint).toBe(before?.fingerprint);
     // The surviving entry keeps the fingerprint it was recorded under -
-    // a removal never re-stamps the contract the survivors answered.
+    // a retirement never re-stamps the contract the survivors answered.
     expect(manifest.entries["imports/a.md"]?.fingerprint).toBe(fingerprintBefore);
   });
 
-  test("the manifest drop is the resurrect guard: the retired source classifies new", () => {
+  test("the retired marker is the resurrect guard: a batch plan never queues the retired source", () => {
     const { canonical, retired } = seedPair();
     retireDocumentCopies(vault, [{ path: retired, canonical }], { agent: "tester", now: NOW });
 
+    // The unchanged source classifies `retired`, never `new`.
     const classification = classifyPaths(vault, ["imports/b.md"], readManifest(vault));
-    expect(classification.new).toContain("imports/b.md");
+    expect(classification.retired).toContain("imports/b.md");
+    expect(classification.new).not.toContain("imports/b.md");
     expect(classification.unchanged).not.toContain("imports/b.md");
+
+    // A batch plan over the folder does not queue the retired source.
+    const plan = planBatches(vault, "imports", { maxBatchBytes: 1024 * 1024, maxBatchFiles: 100 });
+    const queued = plan.batches.flatMap((b) => b.files.map((f) => f.path));
+    expect(queued).not.toContain("imports/b.md");
+    expect(plan.skippedRetired).toContain("imports/b.md");
+
+    // A real content change re-admits it: the bytes moved, so the copy
+    // classifies `modified` and the plan queues it again.
+    writeFileSync(join(vault, "imports", "b.md"), "changed duplicate source bytes\n", "utf8");
+    const after = classifyPaths(vault, ["imports/b.md"], readManifest(vault));
+    expect(after.modified).toContain("imports/b.md");
+    expect(after.retired).not.toContain("imports/b.md");
+    const changedPlan = planBatches(vault, "imports", {
+      maxBatchBytes: 1024 * 1024,
+      maxBatchFiles: 100,
+    });
+    expect(changedPlan.batches.flatMap((b) => b.files.map((f) => f.path))).toContain(
+      "imports/b.md",
+    );
+  });
+
+  test("a deliberate re-ingest re-admits the retired source", () => {
+    const { canonical, retired } = seedPair();
+    retireDocumentCopies(vault, [{ path: retired, canonical }], { agent: "tester", now: NOW });
+
+    // A deliberate full re-ingest re-records the entry without the marker
+    // (updateManifest is the post-ingest write), and the source classifies
+    // `unchanged` again - the retirement claimed the records, not the file.
+    updateManifest(vault, ["imports/b.md"]);
+    const classification = classifyPaths(vault, ["imports/b.md"], readManifest(vault));
+    expect(classification.unchanged).toContain("imports/b.md");
+    expect(classification.retired).not.toContain("imports/b.md");
   });
 
   test("appends one source_invalidation record per copy naming the provenance", () => {
@@ -204,6 +247,26 @@ describe("retireDocumentCopies", () => {
     expect(existsSync(join(vault, "Brain", ".archives", `${ARCHIVE_HASH}.txt`))).toBe(true);
   });
 
+  test("the result reports the snapshot bytes and the net disk delta", () => {
+    // Review M6 (retire half): the destructive span archives Brain/ into a
+    // COUNTED surface (.snapshots) before it frees anything, so a result
+    // carrying only removal counts hides that the vault can GROW. The
+    // result carries the page bytes measured before the removal, the
+    // snapshot archive's bytes, and the net between them.
+    const { canonical, retired } = seedPair();
+    const pageBytes = statSync(join(vault, retired)).size;
+
+    const result = retireDocumentCopies(vault, [{ path: retired, canonical }], {
+      agent: "tester",
+      now: NOW,
+    });
+
+    expect(result.retired[0]!.pageBytes).toBe(pageBytes);
+    expect(result.disk.removedBytes).toBe(pageBytes);
+    expect(result.disk.snapshotBytes).toBe(statSync(result.snapshotPath!).size);
+    expect(result.disk.netBytes).toBe((result.disk.snapshotBytes ?? 0) - pageBytes);
+  });
+
   test("a per-copy failure is collected, the copy stays on disk, and the run completes", () => {
     const { canonical, retired } = seedPair();
     const missing = "Brain/sources/src-gone.md";
@@ -225,12 +288,14 @@ describe("retireDocumentCopies", () => {
     expect(result.snapshotRunId).not.toBeNull();
   });
 
-  test("a basename collision skips the link pass and names why", () => {
+  test("a basename collision refuses the copy and keeps it on disk", () => {
     // An unrelated page in another namespace shares the retired copy's
     // basename, so the bare [[src-b]] spelling is ambiguous: rewriting it
-    // would repoint links that meant the namesake. The copy still retires;
-    // the pass is skipped by name and every link stays exactly as it was -
-    // a stale link is discoverable, a mis-pointed one misleads silently.
+    // would repoint links that meant the namesake, and removing the page
+    // anyway would re-point every leftover [[src-b]] at the namesake
+    // SILENTLY - resolved by a deletion, never confirmed by an editor.
+    // The copy is refused per copy and stays on disk instead (review L5);
+    // the stale link stays exactly as visible as it was.
     const { canonical, retired, citing } = seedPair();
     const namesake = "Brain/entities/src-b.md";
     mkdirSync(join(vault, "Brain", "entities"), { recursive: true });
@@ -241,16 +306,48 @@ describe("retireDocumentCopies", () => {
       now: NOW,
     });
 
-    expect(result.failed).toEqual([]);
-    const copy = result.retired[0]!;
-    expect(copy.path).toBe(retired);
-    expect(copy.wikilinks).toBeNull();
-    expect(copy.wikilinksSkipped).toBe(RETIRE_LINKS_SKIPPED_BASENAME_COLLISION);
-    // The citing page keeps its spelling, the namesake page is untouched,
-    // and the retired copy itself is still gone.
-    expect(readFileSync(join(vault, citing), "utf8")).toContain("[[src-b]]");
+    expect(result.retired).toEqual([]);
+    expect(result.failed).toHaveLength(1);
+    expect(result.failed[0]!.path).toBe(retired);
+    expect(result.failed[0]!.message).toContain(RETIRE_BASENAME_COLLISION_REFUSAL);
+    // Nothing moved: the retired page, the namesake page, the citing
+    // spelling, and the audit.
+    expect(existsSync(join(vault, retired))).toBe(true);
     expect(existsSync(join(vault, namesake))).toBe(true);
-    expect(existsSync(join(vault, retired))).toBe(false);
+    expect(readFileSync(join(vault, citing), "utf8")).toContain("[[src-b]]");
+    expect(listContinuityRecords(vault, { kind: "source_invalidation" })).toHaveLength(0);
+  });
+
+  test("a failed inbound-link rewrite keeps the copy in place", () => {
+    if (CHMOD_CANNOT_DENY) return;
+    // One citing page sits in a directory this run cannot write: the
+    // retarget report collects the write failure without throwing, and
+    // retiring the copy over it would strand exactly the link the pass
+    // could not repoint. The refusal comes BEFORE the removal, so the
+    // copy stays on disk (review M7).
+    const { canonical, retired } = seedPair();
+    rmSync(join(vault, "Brain", "note.md"));
+    mkdirSync(join(vault, "Brain", "links"), { recursive: true });
+    writeFileSync(join(vault, "Brain", "links", "note.md"), "See [[src-b]] here.\n", "utf8");
+    const linksDir = join(vault, "Brain", "links");
+    chmodSync(linksDir, 0o555);
+    try {
+      const result = retireDocumentCopies(vault, [{ path: retired, canonical }], {
+        agent: "tester",
+        now: NOW,
+      });
+
+      expect(result.retired).toEqual([]);
+      expect(result.failed).toHaveLength(1);
+      expect(result.failed[0]!.path).toBe(retired);
+      // The failure names the file whose rewrite did not land.
+      expect(result.failed[0]!.message).toContain("links/note.md");
+      // The copy is still on disk; nothing was claimed as retired.
+      expect(existsSync(join(vault, retired))).toBe(true);
+      expect(listContinuityRecords(vault, { kind: "source_invalidation" })).toHaveLength(0);
+    } finally {
+      chmodSync(linksDir, 0o755);
+    }
   });
 
   test("a copy whose canonical page is missing is refused per copy", () => {
@@ -319,7 +416,7 @@ describe("retireDocumentCopies", () => {
       // The honest half of the old claim: the page is NOT on disk.
       expect(existsSync(join(vault, retired))).toBe(false);
       // The steps before the failure did land.
-      expect(readManifest(vault).entries["imports/b.md"]).toBeUndefined();
+      expect(readManifest(vault).entries["imports/b.md"]?.retired_into).toBe(canonical);
       expect(listContinuityRecords(vault, { kind: "source_invalidation" })).toHaveLength(0);
     } finally {
       chmodSync(continuityDir, 0o755);
@@ -327,8 +424,8 @@ describe("retireDocumentCopies", () => {
   });
 
   test("the per-copy reason words the manifest outcome from what actually happened", () => {
-    const { retired } = seedPair();
-    retireDocumentCopies(vault, [{ path: retired, canonical: "Brain/sources/src-a.md" }], {
+    const { canonical, retired } = seedPair();
+    retireDocumentCopies(vault, [{ path: retired, canonical }], {
       agent: "tester",
       now: NOW,
     });
@@ -340,10 +437,10 @@ describe("retireDocumentCopies", () => {
         >
       )["reason"],
     );
-    expect(reason).toContain("dropped manifest key imports/b.md");
+    expect(reason).toContain(`marked manifest key imports/b.md retired into ${canonical}`);
   });
 
-  test("a shared source_path retires twice: the second drop is named already-absent", () => {
+  test("a shared source_path retires twice: the second marker is named already-marked", () => {
     const { canonical } = seedPair();
     // A second copy declaring the SAME source_path as the first copy's.
     const second = writeSourcePage("b2", {
@@ -363,11 +460,15 @@ describe("retireDocumentCopies", () => {
     const reasons = listContinuityRecords(vault, { kind: "source_invalidation" }).map((r) =>
       String((r.payload as Record<string, unknown>)["reason"]),
     );
-    expect(reasons.some((r) => r.includes("dropped manifest key imports/b.md"))).toBe(true);
-    expect(reasons.some((r) => r.includes("manifest key imports/b.md already absent"))).toBe(true);
+    expect(reasons.some((r) => r.includes(`marked manifest key imports/b.md retired`))).toBe(true);
+    // The second retirement marks the SAME key into the SAME canonical, so
+    // the bytes are already identical and the clause names that fact.
+    expect(
+      reasons.some((r) => r.includes("manifest key imports/b.md already marked retired")),
+    ).toBe(true);
   });
 
-  test("no manifest on disk is named, not claimed as a drop", () => {
+  test("no manifest on disk is named, not claimed as a marker", () => {
     const { canonical, retired } = seedPair();
     rmSync(join(vault, ".open-second-brain", "ingest-manifest.json"));
     retireDocumentCopies(vault, [{ path: retired, canonical }], { agent: "tester", now: NOW });
@@ -381,7 +482,7 @@ describe("retireDocumentCopies", () => {
     );
     expect(reason).toContain("manifest");
     expect(reason).toContain("imports/b.md");
-    expect(reason).not.toContain("dropped manifest key");
+    expect(reason).not.toContain("marked manifest key");
   });
 
   test("a copy with no recorded source_path names the absence, not a drop", () => {
@@ -401,7 +502,7 @@ describe("retireDocumentCopies", () => {
       )["reason"],
     );
     expect(reason).toContain("no manifest key recorded");
-    expect(reason).not.toContain("dropped manifest key");
+    expect(reason).not.toContain("marked manifest key");
   });
 
   test("a copy path that escapes the vault is refused as a containment breach, not a vanish", () => {

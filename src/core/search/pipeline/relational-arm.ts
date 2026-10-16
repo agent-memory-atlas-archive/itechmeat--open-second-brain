@@ -41,6 +41,16 @@ import {
 } from "../result-filters.ts";
 import { parseValidityWindow } from "../validity.ts";
 import { SearchError } from "../search-error.ts";
+import {
+  RETRIEVAL_TRUST_EXCLUSION_REASON,
+  SEARCH_TRUST_GATE_MODE,
+  classifyRetrievalTrust,
+  resolveSearchTrustGateMode,
+} from "../../brain/trust/retrieval-gate.ts";
+import {
+  RETRIEVAL_TRUST_REFUSAL_LANE,
+  type RetrievalTrustRefusal,
+} from "../../brain/trust/retrieval-receipts.ts";
 import type { BrainSearchResult } from "../search-result.ts";
 import type { Store } from "../store.ts";
 import type { ResolvedSearchConfig, SearchOptions } from "../types.ts";
@@ -52,6 +62,44 @@ const RELATIONAL_MAX_DEPTH = 2;
 export const ENTITY_BRIDGES_ENV = "OPEN_SECOND_BRAIN_SEARCH_ENTITY_BRIDGES";
 /** Machine-config key for walking entity bridges. */
 export const ENTITY_BRIDGES_CONFIG = "search_entity_bridges_enabled";
+
+/**
+ * Namespace the arm's refusal reasons carry, mirroring how the kernel
+ * namespaces an adjuster's exclusion: the origin of the verdict, never
+ * prose. Combined with the per-lane split on the refusal record, an arm
+ * refusal and a pool exclusion can never blur.
+ */
+export const RELATIONAL_ARM_REFUSAL_NAMESPACE = "relational_arm";
+
+/**
+ * The full structural reason vocabulary of the arm's edge-level
+ * eligibility gate: the page gate's three controlled-vocabulary signals
+ * reused verbatim ({@link RETRIEVAL_TRUST_EXCLUSION_REASON} - the same
+ * controlled-vocabulary frontmatter signals the page gate reads), plus
+ * the four tokens only an edge and its window can fail on. Fixed tokens,
+ * not prose, so the same vault yields the same record.
+ */
+export const RELATIONAL_ARM_REFUSAL_REASON = Object.freeze({
+  ...RETRIEVAL_TRUST_EXCLUSION_REASON,
+  /** A DECLARED validity window value that cannot be parsed. */
+  invalidValidityWindow: "invalid_validity_window",
+  /** A declared window whose inclusive end is strictly past. */
+  closedValidityWindow: "closed_validity_window",
+  /** A declared window whose start is still ahead of query time. */
+  pendingValidityWindow: "pending_validity_window",
+  /** The arriving relation's polarity is a counted exclusion. */
+  contradictsPolarity: "contradicts_polarity",
+} as const);
+
+/**
+ * The relation polarities the edge gate counts as exclusions, from the
+ * existing relation-polarity vocabulary: `contradicts` is the
+ * relevant-but-not-endorsing edge the pool-level pass only warns about.
+ * `superseded_by` is not here - it is the supersession backbone the arm
+ * annotates (`supersededBy`), pointing stale-to-fresh - and the positive
+ * relations boost.
+ */
+const REFUSAL_POLARITIES: ReadonlySet<string> = new Set(["contradicts"]);
 
 /**
  * Whether the arm walks entity bridges: on by default (design decision 11),
@@ -143,6 +191,42 @@ export interface RelationalReach {
 export interface RelationalArmOutcome {
   readonly rankedChunkIds: number[];
   readonly reachByChunk: Map<number, RelationalReach>;
+  /**
+   * The arm's lane of the retrieval trust receipts' refusal record
+   * (session-mining-economy, t_05a0eaa4). Present only when the trust
+   * gate's resolved mode is not off - the eligibility gate ran - and
+   * lists every walked node whose arrival (its own frontmatter signals,
+   * its validity window at query time, the arriving edge's polarity, or
+   * the arrived edge's source endpoint) the classification marked
+   * ineligible AND whose derivation the caller could read: a node, or an
+   * edge source, withheld at the caller's reach and owner scope
+   * contributes no record, so the receipts read the same whether the walk
+   * crossed unreadable documents or not. This is a DIFFERENT act from the
+   * reach gating's identical-to-absent provenance convention above: a
+   * refusal is removed from (enforce) or kept in (shadow) the
+   * contribution set AND counted here, while an omitted provenance step
+   * is never named and never counted.
+   */
+  readonly refusals?: ReadonlyArray<RetrievalTrustRefusal>;
+}
+
+/**
+ * Whether a caller at this reach and owner scope could read the page: the
+ * exact verdict {@link gatePath} applies to every provenance step, so
+ * both disclosure channels - the provenance beside a row and the trust
+ * receipts' refusal records - are held to the same line.
+ */
+function isCallerReadable(
+  vault: string,
+  path: string,
+  reach: TransportReach,
+  agentScope: string | null,
+  cache: FrontmatterCache,
+): boolean {
+  return (
+    isPathReadableAtReach(vault, path, reach, cache) &&
+    (agentScope === null || isPathOwnerVisible(vault, path, agentScope, cache))
+  );
 }
 
 /**
@@ -213,6 +297,12 @@ export function runRelationalArm(
   const config = machineConfigData(opts.configPath);
   const budgets = opts.budgets ?? resolveTraversalBudgets({ env: process.env, config });
   const bridges = opts.entityBridges ?? resolveEntityBridgesEnabled({ env: process.env, config });
+  // The edge-level eligibility gate (session-mining-economy, t_05a0eaa4)
+  // runs under the same resolved trust-gate mode the page gate answers
+  // to - the same env and the caller's own config map, so the two gates
+  // can never disagree about the posture. Off: no classification, no
+  // refusal field, the outcome shape byte-identical.
+  const trustGateMode = resolveSearchTrustGateMode({ env: process.env, config });
   const nodes = relationalFanout(fanoutStoreFor(store, bridges), seedDocIds, {
     maxDepth: RELATIONAL_MAX_DEPTH,
     edgeTypes: relQuery.edgeTypes,
@@ -232,12 +322,64 @@ export function runRelationalArm(
   const titles = store.documentTitles();
   const nowMs = Date.now();
   const seenKeys = new Set<string>();
+  const gateActive = trustGateMode !== SEARCH_TRUST_GATE_MODE.off;
+  const refusals: RetrievalTrustRefusal[] = [];
   for (const node of nodes) {
     const rep = reps.get(node.documentId);
     if (rep === undefined) continue;
     const key = rrfKey({ origin: null, path: rep.path, chunkId: rep.chunkId });
     if (seenKeys.has(key)) continue;
     seenKeys.add(key);
+    if (gateActive) {
+      // The walked edge that carried the walk in is the path's last step;
+      // its source endpoint is another walked node except at hop 1, where
+      // the source is a seed the caller named itself.
+      const lastStep = node.path.at(-1);
+      const sourceStep = node.path.length >= 2 ? node.path.at(-2) : undefined;
+      const sourceMeta = sourceStep === undefined ? undefined : titles.get(sourceStep.documentId);
+      const sourcePath = sourceMeta?.path ?? null;
+      const eligibility = classifyArrivalEligibility({
+        vault,
+        nodePath: rep.path,
+        sourcePath,
+        arrivingRelation: lastStep?.relation ?? null,
+        cache: frontmatterCache,
+        nowMs,
+      });
+      if (eligibility.node.length + eligibility.source.length > 0) {
+        // A refusal is RECORDED only for what the caller could read at
+        // its reach and owner scope - the identical-to-absent convention
+        // the provenance gate below holds: a page withheld there
+        // contributes nothing to the receipts, so the records a caller
+        // sees read the same whether the walk crossed unreadable
+        // documents or not. The enforcement verdict below stays the FULL
+        // classification: the exclusion (enforce) or the kept
+        // contribution (shadow) does not depend on what was recordable.
+        const recordable = isCallerReadable(vault, rep.path, reach, agentScope, frontmatterCache)
+          ? [
+              ...eligibility.node,
+              ...(sourcePath === null ||
+              isCallerReadable(vault, sourcePath, reach, agentScope, frontmatterCache)
+                ? eligibility.source
+                : []),
+            ]
+          : [];
+        if (recordable.length > 0) {
+          refusals.push(
+            Object.freeze({
+              document_id: rep.documentId,
+              chunk_id: rep.chunkId,
+              path: rep.path,
+              reasons: Object.freeze(recordable.toSorted()),
+              lane: RETRIEVAL_TRUST_REFUSAL_LANE.arm,
+            }),
+          );
+        }
+        // Enforce removes the ineligible edge's node from the
+        // contribution set; shadow counts it and contributes as usual.
+        if (trustGateMode === SEARCH_TRUST_GATE_MODE.enforce) continue;
+      }
+    }
     const gated = gatePath(vault, node.path, titles, reach, agentScope, frontmatterCache, nowMs);
     outcome.rankedChunkIds.push(rep.chunkId);
     outcome.reachByChunk.set(rep.chunkId, {
@@ -246,7 +388,7 @@ export function runRelationalArm(
       ...gated,
     });
   }
-  return outcome;
+  return { ...outcome, ...(gateActive ? { refusals: Object.freeze(refusals) } : {}) };
 }
 
 /**
@@ -323,6 +465,88 @@ function closedSupersessionTip(
 }
 
 /**
+ * The eligibility verdict for one walked node's arrival, split by which
+ * page each reason was derived from. Four questions, all frontmatter-
+ * structural, none prose:
+ *
+ *   - the node's page and - for a node reached from another walked node -
+ *     the arrived edge's source page carry one of the page gate's three
+ *     controlled-vocabulary signals (a seed is the caller's own entry
+ *     point and is judged only as far as the walk reads it, never
+ *     refused for its own markers);
+ *   - the node's declared validity window covers query time
+ *     (`parseValidityWindow`, the `closedSupersessionTip` inclusive-end
+ *     grammar; a DECLARED value that cannot be parsed is a refusal of
+ *     its own, never a silent pass);
+ *   - the arriving relation's polarity is not a counted exclusion
+ *     (the existing relation-polarity vocabulary).
+ *
+ * The split exists for the receipts' disclosure line: the `node` reasons
+ * describe the node's own page and arriving edge, the `source` reasons
+ * describe ANOTHER page, and a record may carry a page's facts only when
+ * that page is readable at the caller's reach and scope. The enforcement
+ * verdict is the union and never differs between modes.
+ *
+ * An unreadable page answers no signals, the same tolerance the page
+ * gate's shared frontmatter reader gives it.
+ */
+function classifyArrivalEligibility(input: {
+  readonly vault: string;
+  /** The arrived-at node's page path. */
+  readonly nodePath: string;
+  /** The arrived edge's source page path, when the walk records it. */
+  readonly sourcePath: string | null;
+  /** The relation that carried the walk into the node, when known. */
+  readonly arrivingRelation: string | null;
+  readonly cache: FrontmatterCache;
+  readonly nowMs: number;
+}): { readonly node: string[]; readonly source: string[] } {
+  const node: string[] = [];
+  const source: string[] = [];
+  const pageGateReasons = (path: string, into: string[]): void => {
+    const entry = readCachedFrontmatterEntry(input.cache, input.vault, path);
+    if (entry.unreadable) return;
+    for (const reason of classifyRetrievalTrust(entry.meta).reasons) {
+      into.push(`${RELATIONAL_ARM_REFUSAL_NAMESPACE}:${reason}`);
+    }
+  };
+  pageGateReasons(input.nodePath, node);
+  if (input.sourcePath !== null) pageGateReasons(input.sourcePath, source);
+
+  const entry = readCachedFrontmatterEntry(input.cache, input.vault, input.nodePath);
+  if (!entry.unreadable) {
+    // Null window: neither side declared - an open window, which covers
+    // query time trivially.
+    const window = parseValidityWindow(entry.meta);
+    if (window !== null) {
+      if (window.invalid) {
+        node.push(
+          `${RELATIONAL_ARM_REFUSAL_NAMESPACE}:${RELATIONAL_ARM_REFUSAL_REASON.invalidValidityWindow}`,
+        );
+      } else if (window.validFromMs !== null && window.validFromMs > input.nowMs) {
+        node.push(
+          `${RELATIONAL_ARM_REFUSAL_NAMESPACE}:${RELATIONAL_ARM_REFUSAL_REASON.pendingValidityWindow}`,
+        );
+      } else if (window.validUntilMs !== null && window.validUntilMs < input.nowMs) {
+        node.push(
+          `${RELATIONAL_ARM_REFUSAL_NAMESPACE}:${RELATIONAL_ARM_REFUSAL_REASON.closedValidityWindow}`,
+        );
+      }
+    }
+  }
+
+  if (
+    input.arrivingRelation !== null &&
+    REFUSAL_POLARITIES.has(normalizeRelation(input.arrivingRelation))
+  ) {
+    node.push(
+      `${RELATIONAL_ARM_REFUSAL_NAMESPACE}:${RELATIONAL_ARM_REFUSAL_REASON.contradictsPolarity}`,
+    );
+  }
+  return { node, source };
+}
+
+/**
  * Gate one node's walked path at the caller's reach and owner scope:
  * unreadable steps and steps another agent owns (under a requested scope)
  * are omitted alike, so a hidden node's document id is never named, never
@@ -350,13 +574,7 @@ function gatePath(
   for (const step of steps) {
     const meta = titles.get(step.documentId);
     const unreadable =
-      meta === undefined ||
-      !isPathReadableAtReach(vault, meta.path, reach, cache) ||
-      // The same owner-scope verdict the row-level filters apply to
-      // content rows: an owner-private page another agent owns is as
-      // withheld from provenance as an unreadable one. No requested
-      // scope means no ownership filtering - the opt-in default.
-      (agentScope !== null && !isPathOwnerVisible(vault, meta.path, agentScope, cache));
+      meta === undefined || !isCallerReadable(vault, meta.path, reach, agentScope, cache);
     if (unreadable) continue;
     gated.push(step);
     if (supersededBy === undefined) {

@@ -23,9 +23,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 
+import { DERIVED_STORE_DIR, DERIVED_STORE_FILE } from "../../../src/core/brain/path-constants.ts";
+import { brainConfigPath } from "../../../src/core/brain/paths.ts";
 import { resolveIndexPath } from "../../../src/core/search/paths.ts";
+import { STATE_SURFACES } from "../../../src/core/state/surfaces.ts";
 import {
   STORAGE_SURFACE,
   STORAGE_TIER,
@@ -33,6 +36,13 @@ import {
   measureStorageUsage,
   type StorageUsage,
 } from "../../../src/core/brain/storage/usage.ts";
+import { evaluateCapacityGate } from "../../../src/core/brain/storage/gate.ts";
+import {
+  STORAGE_CAPACITY_CRITICAL_CODE,
+  storageCapacityCheck,
+} from "../../../src/core/brain/doctor/storage-capacity.ts";
+import type { BrainConfig } from "../../../src/core/brain/types.ts";
+import type { DoctorFindings } from "../../../src/core/brain/doctor/check.ts";
 import { CHMOD_CANNOT_DENY, IS_WINDOWS } from "../../helpers/platform.ts";
 
 let vault: string;
@@ -202,5 +212,162 @@ describe("measureStorageUsage", () => {
     expect(surfaceBytes(usage, STORAGE_SURFACE.brainTree)).toBe(
       FIXTURE_BYTES.page + FIXTURE_BYTES.config + FIXTURE_BYTES.ledger,
     );
+  });
+});
+
+describe("the configured store location", () => {
+  // The override the search layer honours: env first, then the machine
+  // config's search_db_path. The meter resolves through the search
+  // layer's own configured resolver, so the census can never disagree
+  // with the indexer about which file is the store.
+  const ENV_KEY = "OPEN_SECOND_BRAIN_SEARCH_DB";
+  let savedEnv: string | undefined;
+  let overrideHome: string;
+  let overridePath: string;
+
+  beforeEach(() => {
+    savedEnv = process.env[ENV_KEY];
+    delete process.env[ENV_KEY];
+    overrideHome = mkdtempSync(join(tmpdir(), "o2b-store-override-"));
+    overridePath = join(overrideHome, "moved.sqlite");
+  });
+
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = savedEnv;
+    rmSync(overrideHome, { recursive: true, force: true });
+  });
+
+  test("the store is measured at the configured override, not the default location", () => {
+    mkdirSync(join(vault, "Brain", "sources"), { recursive: true });
+    writeFileSync(join(vault, "Brain", "sources", "AA-page.md"), "x".repeat(1000), "utf8");
+    // A stale database left behind at the default location: bytes the
+    // search layer never reads. Pre-fix the meter counted THESE as the
+    // store, and the real store - the one every search opens - not at
+    // all.
+    mkdirSync(join(vault, DERIVED_STORE_DIR), { recursive: true });
+    writeFileSync(join(vault, DERIVED_STORE_DIR, DERIVED_STORE_FILE), "x".repeat(7000), "utf8");
+    process.env[ENV_KEY] = overridePath;
+    writeFileSync(overridePath, "x".repeat(3000), "utf8");
+    const usage = measureStorageUsage(vault, { now: NOW });
+    expect(surfaceBytes(usage, STORAGE_SURFACE.derivedStore)).toBe(3000);
+    expect(usage.complete).toBe(true);
+  });
+
+  test("a search_db_path in an explicit config file is honoured through configPath", () => {
+    // A caller that resolved the search config through an explicit
+    // --config holds that path, and the store the indexer opens is the
+    // one THAT file names. Resolving through the default config file
+    // instead would measure whatever sits at the default location - on
+    // this fixture, nothing - while the real store grows elsewhere.
+    const configHome = mkdtempSync(join(tmpdir(), "o2b-store-cfgpath-"));
+    try {
+      const movedDb = join(configHome, "moved.sqlite");
+      writeFileSync(movedDb, "x".repeat(2500), "utf8");
+      const configPath = join(configHome, "config.yaml");
+      writeFileSync(configPath, `vault: ${vault}\nsearch_db_path: ${movedDb}\n`, "utf8");
+
+      const usage = measureStorageUsage(vault, { now: NOW, configPath });
+      expect(surfaceBytes(usage, STORAGE_SURFACE.derivedStore)).toBe(2500);
+      expect(usage.complete).toBe(true);
+    } finally {
+      rmSync(configHome, { recursive: true, force: true });
+    }
+  });
+
+  test("under an override the lane gate and the doctor check agree", () => {
+    // The doctor measures the store the operator's searches actually use
+    // (ctx.dbPath); pre-fix the lane gate measured the default location
+    // instead, so the doctor could report critical while the gate and
+    // every ingest ran on a stale file's numbers.
+    mkdirSync(join(vault, "Brain", "sources"), { recursive: true });
+    writeFileSync(brainConfigPath(vault), "schema_version: 1\n\nstorage:\n  cap_bytes: 10000\n");
+    writeFileSync(join(vault, "Brain", "sources", "AA-page.md"), "x".repeat(6000), "utf8");
+    process.env[ENV_KEY] = overridePath;
+    writeFileSync(overridePath, "x".repeat(3500), "utf8");
+
+    const decision = evaluateCapacityGate(vault, { capBytes: 10_000, now: NOW });
+    const out: DoctorFindings = { issues: [], uncertain: [] };
+    storageCapacityCheck.run(
+      {
+        vault,
+        now: NOW,
+        config: { schema_version: 1, storage: { cap_bytes: 10_000 } } as BrainConfig,
+        dbPath: overridePath,
+        configPath: undefined,
+        knownBasenames: new Set(),
+        idIndex: new Map(),
+        preferences: [],
+        logs: [],
+      },
+      out,
+    );
+    const critical = out.issues.find((i) => i.code === STORAGE_CAPACITY_CRITICAL_CODE);
+    expect(critical).toBeDefined();
+    // The figures in the doctor's message are the figures the gate
+    // decided on: one store, one census.
+    const reported = /\((\d+) of \d+ bytes\)/u.exec(critical!.message);
+    expect(reported).not.toBeNull();
+    expect(Number(reported![1])).toBe(decision.reading!.measuredBytes);
+    expect(decision.reading!.measuredBytes).toBeGreaterThan(9_000);
+  });
+});
+
+describe("the census against the state catalogue", () => {
+  test("every catalogued state surface lands in exactly one counted surface", () => {
+    // The meter claims to charge every durable state surface for the
+    // bytes it keeps on disk. STATE_SURFACES is the catalogue of those
+    // locations: seed a file at every row's default location and require
+    // the census to see every byte exactly once. A new writer under
+    // `.open-second-brain/` (or anywhere else) with no counted surface -
+    // or a path the walk excludes, or a byte counted by two surfaces -
+    // breaks the delta.
+    const PROBE_BYTES = 16;
+    const paths = [...new Set(STATE_SURFACES.map((row) => row.derive(vault, null)))];
+    // The meter's directory surfaces: a probe written AT one of these
+    // roots would be a regular file standing where a walkable directory
+    // belongs, and the walk would refuse the surface.
+    const DIR_BASENAMES = [
+      ".snapshots",
+      ".artifacts",
+      ".archives",
+      ".payloads",
+      ".state",
+      DERIVED_STORE_DIR,
+    ];
+    const seeded = new Set<string>();
+    for (const path of paths) {
+      // A row whose path is a strict prefix of another row's path is a
+      // DIRECTORY row: its probe goes inside it, or it would be a regular
+      // file standing where another row's parent must be.
+      const isParent = paths.some((other) => other !== path && other.startsWith(`${path}${sep}`));
+      const target =
+        isParent || DIR_BASENAMES.includes(basename(path)) ? join(path, "probe.bin") : path;
+      if (seeded.has(target)) continue;
+      seeded.add(target);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, "x".repeat(PROBE_BYTES), "utf8");
+    }
+    const usage = measureStorageUsage(vault, { now: NOW });
+    expect(usage.complete).toBe(true);
+    expect(usage.totalBytes).toBe(seeded.size * PROBE_BYTES);
+  });
+
+  test("the store's directory is a counted surface beside the store itself", () => {
+    // The accumulating state beside brain.sqlite: the hook audit, the
+    // session ledger, the maintenance lease database - pre-fix none of
+    // it was counted, and the forecast read a busy vault as flat.
+    const storeDir = join(vault, DERIVED_STORE_DIR);
+    mkdirSync(join(storeDir, "hook-audit"), { recursive: true });
+    writeFileSync(join(storeDir, "hook-audit", "2026-W42.jsonl"), "x".repeat(700), "utf8");
+    writeFileSync(join(storeDir, "sessions.jsonl"), "x".repeat(300), "utf8");
+    writeFileSync(join(storeDir, "maintenance.sqlite"), "x".repeat(500), "utf8");
+    // The store itself stays on its own surface, never double-counted.
+    writeFileSync(join(storeDir, DERIVED_STORE_FILE), "x".repeat(1000), "utf8");
+    writeFileSync(join(storeDir, `${DERIVED_STORE_FILE}-wal`), "x".repeat(200), "utf8");
+    const usage = measureStorageUsage(vault, { now: NOW });
+    expect(surfaceBytes(usage, STORAGE_SURFACE.derivedStoreDir)).toBe(1500);
+    expect(surfaceBytes(usage, STORAGE_SURFACE.derivedStore)).toBe(1200);
+    expect(usage.complete).toBe(true);
   });
 });

@@ -476,13 +476,17 @@ per-result `score_breakdown`: `retrieval_decision_trace` (evaluated /
 surfaced / excluded counts plus every excluded candidate as a compact
 reference with its structural reasons) and `memory_trust_assessment` (the
 same exclusion set as a reason histogram). Both are by-products of the
-retrieval trust gate; with the gate off the response carries
-`retrieval_trace_unavailable` naming the switch that produces them
-(`search_trust_gate_enabled`) instead of going quiet. Without `explain` no
-key appears at all. In the same release `total` stopped echoing the row
-count: it is the ranked candidate pool the `limit` sliced the returned rows
-from, so `total > results.length` means the ranker had more candidates
-than it handed you. Read it as candidates ranked, not as a corpus
+retrieval trust gate, which runs in one of three modes
+(`search_trust_gate_mode: off | shadow | enforce`; the bare
+`search_trust_gate_enabled` alone maps to `shadow`, measuring without
+excluding, and `enforce` is what excludes): with the gate off the
+response carries `retrieval_trace_unavailable` naming the switches that
+produce them (`search_trust_gate_enabled`, or
+`search_trust_gate_mode: shadow`) instead of going quiet. Without
+`explain` no key appears at all. In the same release `total` stopped
+echoing the row count: it is the ranked candidate pool the `limit`
+sliced the returned rows from, so `total > results.length` means the
+ranker had more candidates than it handed you. Read it as candidates ranked, not as a corpus
 statistic: the pool is capped at roughly three times the requested
 `limit`, so it moves with `limit` and saturates on a large vault, and
 link traversal can add a document that matched no term at all.
@@ -2169,6 +2173,21 @@ format characters), when it contains NUL, or when it exceeds the cap.
   `decision_model: { degraded }` when a request failed and every turn was
   sent. With the use `off` none of these fields appears. Commit items accept
   an optional string `source_turn` naming the plan turn a rule came from.
+- Since v1.86.0 `brain_extract_signals` remembers barren mines. A commit
+  that ends with nothing written and nothing staged records a zero-yield
+  tombstone in the session mining ledger beside the session import ledger,
+  keyed on a SHA-256 of the mined turn material; the next plan over that
+  session at unchanged content runs before the pre-filter and spends
+  nothing, returning `skipped: { reason: "mining_tombstone", mining_outcome:
+  { written, staged, deduped, durability_rejected } }` with `llm_step: null`
+  and empty `turns_mined` - the recorded breakdown is the evidence, never a
+  bare empty plan. A re-import that changes the session's turns changes the
+  hash and re-opens it with no clearing step. The `force` tool argument
+  bypasses the tombstone for exactly one plan call, for a caller that
+  removed the downstream preference and wants the session re-proposed; a
+  corrupt mining ledger refuses the plan by name rather than reading as
+  empty. A commit that succeeds but cannot record its tombstone still
+  succeeds and carries `mining_ledger_failure` by name.
 - Advisory decision-model fields (optional, see
   [decision-models/dedup-tension.md](decision-models/dedup-tension.md) and
   [decision-models/labels.md](decision-models/labels.md)). All of them are

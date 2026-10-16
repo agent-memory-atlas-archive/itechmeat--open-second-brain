@@ -116,6 +116,69 @@ describe("classifyPaths", () => {
     expect(res.unchanged).toEqual(["touched.md"]);
     expect(res.modified).toEqual([]);
   });
+
+  test("an entry marked retired_into classifies `retired` while its bytes are unchanged", () => {
+    // The resurrect guard (H3): a near-duplicate retirement marks the entry
+    // instead of dropping it, so the unchanged source never reads as `new`.
+    writeSource("dup.md", "duplicate bytes");
+    updateManifest(vault, ["dup.md"]);
+    const recorded = readManifest(vault).entries["dup.md"]!;
+    writeManifestAtomic(vault, {
+      "dup.md": { ...recorded, retired_into: "Brain/sources/src-canonical.md" },
+    });
+
+    const res = classifyPaths(vault, ["dup.md"], readManifest(vault));
+    expect(res.retired).toEqual(["dup.md"]);
+    expect(res.new).toEqual([]);
+    expect(res.unchanged).toEqual([]);
+    expect(res.modified).toEqual([]);
+  });
+
+  test("a retired entry whose bytes changed re-admits as `modified`", () => {
+    writeSource("dup.md", "duplicate bytes");
+    updateManifest(vault, ["dup.md"]);
+    const recorded = readManifest(vault).entries["dup.md"]!;
+    writeManifestAtomic(vault, {
+      "dup.md": { ...recorded, retired_into: "Brain/sources/src-canonical.md" },
+    });
+
+    writeSource("dup.md", "the duplicate grew");
+    const res = classifyPaths(vault, ["dup.md"], readManifest(vault));
+    expect(res.modified).toEqual(["dup.md"]);
+    expect(res.retired).toEqual([]);
+  });
+
+  test("a retired entry round-trips: it never serializes down to the v1 digest shape", () => {
+    writeSource("dup.md", "duplicate bytes");
+    updateManifest(vault, ["dup.md"]);
+    const recorded = readManifest(vault).entries["dup.md"]!;
+    writeManifestAtomic(vault, {
+      "dup.md": { ...recorded, retired_into: "Brain/sources/src-canonical.md" },
+    });
+
+    // Data a write could read back is data the write must keep: the marker
+    // survives a re-read and a re-write under the read-back contract.
+    const reread = readManifest(vault).entries["dup.md"]!;
+    expect(reread.retired_into).toBe("Brain/sources/src-canonical.md");
+    writeManifestAtomic(vault, { "dup.md": reread });
+    const onDisk = JSON.parse(readFileSync(manifestPath(vault), "utf8")) as {
+      entries: Record<string, { retired_into?: string }>;
+    };
+    expect(onDisk.entries["dup.md"]?.retired_into).toBe("Brain/sources/src-canonical.md");
+  });
+
+  test("a malformed retired_into on disk drops the field, never the entry", () => {
+    writeManifestBytes(
+      JSON.stringify({
+        schema_version: 3,
+        contract: { fingerprint: computeExtractionContractFingerprint(vault) },
+        entries: { "dup.md": { sha256: "a".repeat(64), retired_into: 42 } },
+      }),
+    );
+    const entry = readManifest(vault).entries["dup.md"];
+    expect(entry?.sha256).toBe("a".repeat(64));
+    expect(entry?.retired_into).toBeUndefined();
+  });
 });
 
 describe("manifest persistence", () => {
@@ -502,6 +565,60 @@ describe("extraction watermark (t_a9cd4221)", () => {
       fingerprint: live,
       ...WATERMARK,
     });
+  });
+
+  test("a requested watermark is stat'ed and hashed inside the manifest lock", () => {
+    // The L1 shape: the pinned form carries a digest computed OUTSIDE the
+    // lock, so two concurrent runs over an appended source can land the
+    // older digest-and-watermark pair last. The request form computes
+    // neither value until the lock is held: updateManifest reads the file
+    // itself, so the recorded pair always describes the bytes the write
+    // saw, not the bytes the caller once saw.
+    writeSource("Inbox/grow.md", "append-only log, revision one\n");
+    updateManifest(
+      vault,
+      ["Inbox/grow.md"],
+      {},
+      {
+        watermarks: { "Inbox/grow.md": { at: "2026-06-13T12:00:00Z" } },
+      },
+    );
+    const entry = readManifest(vault).entries["Inbox/grow.md"]!;
+    expect(entry.sha256).toBe(hashFile(join(vault, "Inbox", "grow.md")));
+    expect(entry.extracted_bytes).toBe(Buffer.byteLength("append-only log, revision one\n"));
+    expect(entry.extracted_at).toBe("2026-06-13T12:00:00Z");
+    expect(entry.fingerprint).toBe(computeExtractionContractFingerprint(vault));
+  });
+
+  test("a watermark request supersedes a stale caller-precomputed pair", () => {
+    // The race, in one test: the caller hashes the OLD bytes (as ingest.ts
+    // did before the lock), the source appends, and only then does the
+    // manifest write take the lock. The recorded entry must describe the
+    // CURRENT bytes, never the stale pair.
+    writeSource("Inbox/grow.md", "revision one\n");
+    const staleDigest = hashFile(join(vault, "Inbox", "grow.md"));
+    const staleSize = Buffer.byteLength("revision one\n");
+    writeSource("Inbox/grow.md", "revision one\nrevision two appended\n");
+
+    updateManifest(
+      vault,
+      ["Inbox/grow.md"],
+      {
+        "Inbox/grow.md": {
+          sha256: staleDigest,
+          fingerprint: computeExtractionContractFingerprint(vault),
+          extracted_bytes: staleSize,
+          extracted_at: "2026-06-13T11:00:00Z",
+        },
+      },
+      { watermarks: { "Inbox/grow.md": { at: "2026-06-13T12:00:00Z" } } },
+    );
+
+    const entry = readManifest(vault).entries["Inbox/grow.md"]!;
+    expect(entry.sha256).toBe(hashFile(join(vault, "Inbox", "grow.md")));
+    expect(entry.sha256).not.toBe(staleDigest);
+    expect(entry.extracted_bytes).toBe(Buffer.byteLength("revision one\nrevision two appended\n"));
+    expect(entry.extracted_at).toBe("2026-06-13T12:00:00Z");
   });
 });
 
