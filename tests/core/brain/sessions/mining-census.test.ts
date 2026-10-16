@@ -22,7 +22,7 @@
  * Nothing here writes either.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,6 +48,8 @@ import { importSession } from "../../../../src/core/brain/sessions/import.ts";
 import { atomicWriteFileSync } from "../../../../src/core/fs-atomic.ts";
 import { SESSION_RUNTIME_ID } from "../../../../src/core/runtime/host-facts.ts";
 import { DERIVED_STORE_DIR } from "../../../../src/core/brain/path-constants.ts";
+import * as continuityStore from "../../../../src/core/brain/continuity/store.ts";
+import type { AppendContinuityRecordInput } from "../../../../src/core/brain/continuity/types.ts";
 
 let tmp: string;
 let vault: string;
@@ -310,6 +312,26 @@ describe("buildMiningCensus", () => {
     expect(census.distilled).toBe(1);
   });
 
+  test("an import under an explicit recall id joins on that id, not the basename", async () => {
+    // --recall-session-id files the turns and every mining record under
+    // the pinned id; the census must follow it rather than read the log's
+    // basename as a session the plan would refuse.
+    const path = writeSession("pinned.jsonl", [{ role: "user", text: "ship the parser" }]);
+    await importSession(vault, path, {
+      agent: "tester",
+      now: NOW,
+      recall: true,
+      recallSessionId: "pinned-session",
+    });
+    recordSessionImports(vault, [
+      { path, runtime: SESSION_RUNTIME_ID.claudeCode, sessionId: "pinned-session" },
+    ]);
+    expect(buildMiningCensus(vault)).toMatchObject({ undistilled: 1, refused: 0 });
+
+    mineYield("pinned-session");
+    expect(buildMiningCensus(vault)).toMatchObject({ distilled: 1, undistilled: 0, refused: 0 });
+  });
+
   test("counts are aggregated per runtime, by the ledger's own label", async () => {
     await importOne(writeSession("alpha.jsonl", [{ role: "user", text: "ship the parser" }]));
     const beta = writeSession("beta.jsonl", [{ role: "user", text: "write the docs" }]);
@@ -355,5 +377,63 @@ describe("buildMiningCensus", () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(sessionLedgerPath(vault), "{ this is not json", "utf8");
     expect(() => buildMiningCensus(vault)).toThrow(/session import ledger is corrupted JSON/);
+  });
+
+  test("the census reads the continuity store a fixed number of times, whatever the backlog size", () => {
+    // A census that re-read the store once per imported session costs
+    // sessions x store - quadratic in the backlog - and spends the whole
+    // SessionStart hook budget on a realistic sweep. Seed a few sessions
+    // and a few hundred, and pin that the store reads do not grow.
+    const seed = (count: number, offset: number): void => {
+      const paths: string[] = [];
+      const turns: AppendContinuityRecordInput[] = [];
+      for (let i = offset; i < offset + count; i++) {
+        const name = `scale-${i}.jsonl`;
+        const path = join(sessionsDir, name);
+        writeFileSync(path, "{}\n", "utf8");
+        paths.push(path);
+        for (let t = 0; t < 3; t++) {
+          turns.push({
+            kind: "session_turn",
+            createdAt: "2026-09-18T09:00:00Z",
+            payload: {
+              session_id: name,
+              turn_id: `t-${t}`,
+              timestamp: "2026-09-18T09:00:00Z",
+              role: t % 2 === 0 ? "user" : "assistant",
+              text: `turn ${t} of session ${i}`,
+            },
+          });
+        }
+      }
+      continuityStore.appendContinuityRecords(vault, turns);
+      recordSessionImports(
+        vault,
+        paths.map((path) => ({ path, runtime: SESSION_RUNTIME_ID.claudeCode })),
+        NOW,
+      );
+    };
+    // The spied reader is the continuity store's full listing - the one
+    // whole-store read the census is allowed to make, once per build.
+    const storeReads = (): number => {
+      const spy = spyOn(continuityStore, "listContinuityRecords");
+      try {
+        buildMiningCensus(vault);
+        return spy.mock.calls.length;
+      } finally {
+        spy.mockRestore();
+      }
+    };
+
+    seed(3, 0);
+    const small = storeReads();
+    // A census that stopped reading the store would pass the equality
+    // below vacuously at zero.
+    expect(small).toBeGreaterThan(0);
+    expect(buildMiningCensus(vault).undistilled).toBe(3);
+    seed(300, 3);
+    const large = storeReads();
+    expect(buildMiningCensus(vault).undistilled).toBe(303);
+    expect(large).toBe(small);
   });
 });

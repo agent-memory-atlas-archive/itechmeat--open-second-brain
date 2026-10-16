@@ -11,6 +11,7 @@
 
 import { commitExtractedSignals, ExtractSignalsError } from "../../core/brain/extract-signals.ts";
 import { loadDedupIndex } from "../../core/brain/dedup-hash.ts";
+import { TRANSPORT_REACH } from "../../core/graph/transport-reach.ts";
 import {
   planExtractSignalsPrefiltered,
   recordExtractPrefilterCommit,
@@ -20,8 +21,9 @@ import { ResponseCheckError } from "../../core/brain/response-checks.ts";
 import { ResponseShapeError } from "../../core/brain/response-shape.ts";
 import { resolveAgentName, resolveTokenImpactLedgerEnabled } from "../../core/config.ts";
 import { coerceStr } from "../coerce.ts";
+import { INVALID_PARAMS, MCPError } from "../protocol.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
-import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
+import { contextReach, type ServerContext, type ToolDefinition } from "../tool-contract.ts";
 import { vaultRelativeSafe, wrapToolErrors } from "./shared.ts";
 
 const TOOL = "brain_extract_signals";
@@ -45,6 +47,9 @@ async function toolBrainExtractSignals(
     // answer claiming the session states nothing, and it goes through the
     // validators like any other so the caller gets one contract.
     const decisionModel = resolveExtractPrefilterConfig(ctx.vault, ctx.configPath ?? undefined);
+    // Below local reach a store failure is named without its raised
+    // message, which carries the absolute host path.
+    const closeHostErrors = contextReach(ctx) !== TRANSPORT_REACH.local;
     if (args["items"] === undefined) {
       const plan = await planExtractSignalsPrefiltered(ctx.vault, session, {
         now: new Date(),
@@ -55,6 +60,7 @@ async function toolBrainExtractSignals(
         // plan call, for "I removed the downstream item and want it
         // re-proposed".
         force: args["force"] === true,
+        closeHostErrors,
       });
       return {
         phase: "plan",
@@ -67,9 +73,9 @@ async function toolBrainExtractSignals(
           text: t.text,
           timestamp: t.timestamp,
         })),
-        // The hash of the material this plan offered; the commit that
-        // answers it passes it back as `surveyed_turns_hash` so the mining
-        // tombstone keys on the surveyed material.
+        // The hash of the material this plan offered, also recorded as a
+        // pending survey; the commit that answers it may pass it back as
+        // `surveyed_turns_hash` to check the session did not change.
         surveyed_turns_hash: plan.surveyedTurnsHash,
         cap: plan.cap,
         confidence_floor: plan.confidenceFloor,
@@ -101,10 +107,21 @@ async function toolBrainExtractSignals(
         ...(plan.decisionModel !== undefined
           ? { decision_model: { degraded: plan.decisionModel.degraded } }
           : {}),
+        // Present only when the plan could not record its survey; a barren
+        // commit then needs `surveyed_turns_hash` to record its tombstone.
+        ...(plan.surveyRecordFailure !== undefined
+          ? { survey_record_failure: plan.surveyRecordFailure }
+          : {}),
       };
     }
     const now = new Date();
-    const surveyedTurnsHash = coerceStr(args, "surveyed_turns_hash", false);
+    // Read raw rather than through coerceStr, which maps "" to absent: an
+    // empty relay is a malformed hash, and the core refuses it by name.
+    const surveyedRaw = args["surveyed_turns_hash"];
+    if (surveyedRaw !== undefined && surveyedRaw !== null && typeof surveyedRaw !== "string") {
+      throw new MCPError(INVALID_PARAMS, "argument 'surveyed_turns_hash' must be a string");
+    }
+    const surveyedTurnsHash = typeof surveyedRaw === "string" ? surveyedRaw : undefined;
     const res = commitExtractedSignals(
       ctx.vault,
       session,
@@ -114,11 +131,11 @@ async function toolBrainExtractSignals(
         agent,
         now,
         dedup: await loadDedupIndex(ctx.vault),
-        // The answered plan's surveyed hash, echoed back by the caller:
-        // what the zero-yield tombstone keys on. Absent, the commit
-        // records nothing - there is no material the verdict was earned
-        // over.
-        ...(surveyedTurnsHash ? { surveyedTurnsHash } : {}),
+        // The answered plan's surveyed hash, when the caller echoes it: a
+        // check that the session did not change since the plan. Absent,
+        // the commit checks the survey the plan recorded instead.
+        ...(surveyedTurnsHash !== undefined ? { surveyedTurnsHash } : {}),
+        closeHostErrors,
       },
     );
     recordExtractPrefilterCommit(ctx.vault, decisionModel, res, now);
@@ -150,7 +167,7 @@ export const EXTRACT_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: TOOL,
     description:
-      "Mine taste signals from an imported session's USER turns; runs no model. Omit `items` for the plan; with `items` pass the plan's `surveyed_turns_hash` back so a barren commit records its tombstone. Barren sessions skip as 'mining_tombstone'; `force` re-mines once. Refuses caps, floors, repeats.",
+      "Mine taste signals from an imported session's USER turns; runs no model. Omit `items` for the plan; with `items` commit, and a barren commit records a tombstone. Barren sessions skip as 'mining_tombstone'; `force` re-mines once. Refuses caps, floors, repeats.",
     inputSchema: {
       type: "object",
       properties: {
@@ -161,7 +178,7 @@ export const EXTRACT_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
         surveyed_turns_hash: {
           type: "string",
           description:
-            "Commit phase only: the `surveyed_turns_hash` from the plan response this payload answers. Omit it and a barren commit records nothing.",
+            "Commit phase only, optional: the plan's `surveyed_turns_hash`. If the session changed since that plan, no mining record is written.",
         },
         items: {
           type: "array",

@@ -512,6 +512,28 @@ test("the bench pin accepts the pool-cap knob name in a recall pin", () => {
   );
 });
 
+test("the bench pin names the trust gate mode, and the dead legacy field is refused by name", () => {
+  // A pin of the legacy field would measure with the gate off without
+  // any sign, so it is refused; the mode is the pinnable knob.
+  const pin = parseBenchPinnedKnobs('{"recall":{"searchTrustGateMode":"enforce"}}');
+  expect(pin.recall?.searchTrustGateMode).toBe("enforce");
+  expect(() => parseBenchPinnedKnobs('{"recall":{"retrievalTrustGateEnabled":true}}')).toThrow(
+    /retrievalTrustGateEnabled.*not a known knob/,
+  );
+});
+
+test("an override carrying an invalid trust gate mode is refused by the resolver", () => {
+  writeFileSync(configPath, `vault: "${tmp}"\n`);
+  const base = resolveSearchConfig({ vault: tmp, configPath });
+  expect(() =>
+    resolveSearchConfig({
+      vault: tmp,
+      configPath,
+      overrides: { recall: { ...base.recall, searchTrustGateMode: "measure" as "shadow" } },
+    }),
+  ).toThrow(/search_trust_gate_mode must be/);
+});
+
 // ── Retrieval trust gate mode (session-mining-economy, t_05a0eaa4) ──────────
 
 test("the trust gate mode defaults off and stays absent from the resolved recall config", () => {
@@ -536,9 +558,11 @@ test("an explicit trust gate mode resolves from config, env winning", () => {
   expect(resolveSearchConfig({ vault: tmp, configPath }).recall.searchTrustGateMode).toBe("shadow");
 });
 
-test("the legacy boolean maps true to shadow and false to off", () => {
+test("the legacy boolean maps true to enforce and false to off", () => {
   writeFileSync(configPath, `vault: "${tmp}"\nsearch_trust_gate_enabled: true\n`);
-  expect(resolveSearchConfig({ vault: tmp, configPath }).recall.searchTrustGateMode).toBe("shadow");
+  expect(resolveSearchConfig({ vault: tmp, configPath }).recall.searchTrustGateMode).toBe(
+    "enforce",
+  );
 
   writeFileSync(configPath, `vault: "${tmp}"\nsearch_trust_gate_enabled: false\n`);
   expect(
@@ -587,6 +611,14 @@ test("an invalid trust gate mode is refused naming the key in force", () => {
   }
   expect(envMessage).toContain("OPEN_SECOND_BRAIN_SEARCH_TRUST_GATE_MODE");
   expect(envMessage).not.toContain("search_trust_gate_mode must");
+});
+
+test("an invalid legacy trust gate boolean from the env names the env var", () => {
+  writeFileSync(configPath, `vault: "${tmp}"\n`);
+  process.env["OPEN_SECOND_BRAIN_SEARCH_TRUST_GATE"] = "yes";
+  expect(() => resolveSearchConfig({ vault: tmp, configPath })).toThrow(
+    "OPEN_SECOND_BRAIN_SEARCH_TRUST_GATE must be",
+  );
 });
 
 test("a trust gate mode change re-keys the config fingerprint", () => {

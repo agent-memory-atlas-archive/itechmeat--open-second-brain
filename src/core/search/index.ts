@@ -31,6 +31,8 @@ import {
 import { loadRerankRegistry, expandRegisteredRerankProvider } from "./rerank/registry.ts";
 import { decisionModelModeFor, resolveDecisionModelConfig } from "../decision-model/config.ts";
 import {
+  isSearchTrustGateMode,
+  resolveSearchTrustGateLegacyEnabled,
   resolveSearchTrustGateMode,
   SEARCH_TRUST_GATE_MODE,
 } from "../brain/trust/retrieval-gate.ts";
@@ -652,6 +654,18 @@ function validateResolvedConfig(config: ResolvedSearchConfig, extraBodySource: s
   }
   validateWeight(config.keywordWeight, "search_keyword_weight");
   validateWeight(config.semanticWeight, "search_semantic_weight");
+  // A mode can arrive through an override (a bench pin) that skipped the
+  // key resolution, so the merged value is checked here too.
+  const gateMode: unknown = config.recall.searchTrustGateMode;
+  if (
+    gateMode !== undefined &&
+    !(typeof gateMode === "string" && isSearchTrustGateMode(gateMode))
+  ) {
+    throw new SearchError(
+      "INVALID_INPUT",
+      `search_trust_gate_mode must be 'off', 'shadow' or 'enforce', got '${String(gateMode)}'`,
+    );
+  }
   if (config.keywordWeight + config.semanticWeight > 1.0 + 1e-9) {
     throw new SearchError(
       "INVALID_INPUT",
@@ -1313,16 +1327,13 @@ export function resolveSearchConfig(opts: {
     false,
     "search_metadata_boost_gate",
   );
-  const retrievalTrustGateEnabled = parseBool(
-    envOrConfig(env, config, "OPEN_SECOND_BRAIN_SEARCH_TRUST_GATE", "search_trust_gate_enabled"),
-    false,
-    "search_trust_gate_enabled",
-  );
+  const retrievalTrustGateEnabled = resolveSearchTrustGateLegacyEnabled({ env, config });
   // The gate's mode (session-mining-economy, t_05a0eaa4): an explicit
   // `search_trust_gate_mode` wins (invalid values refused naming the key
   // in force, `parseFusionMode` discipline), else the legacy boolean
-  // above maps true to shadow and false to off. The refusal for a bad
-  // legacy boolean is the `parseBool` one above, naming that key.
+  // above maps true to enforce - the excluding behavior it always had -
+  // and false to off. A bad legacy boolean is refused above, naming the
+  // key in force.
   const searchTrustGateMode = resolveSearchTrustGateMode({ env, config });
   const supersedeFadeEnabled = parseBool(
     envOrConfig(

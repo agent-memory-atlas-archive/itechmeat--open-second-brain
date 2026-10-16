@@ -111,6 +111,17 @@ export interface ManifestEntry {
    */
   readonly extracted_at?: string;
   /**
+   * SHA-256 hex of exactly the leading {@link extracted_bytes} bytes, when
+   * that prefix is shorter than the source - an append whose last line had
+   * no newline yet, so the extracting pass stopped at the last complete
+   * line. Read only by the append proof ({@link extractedDigestOf});
+   * {@link sha256} stays the whole-file digest classification compares, so
+   * such a source classifies `unchanged` until it changes again. Absent,
+   * the prefix is the whole source and {@link sha256} describes it.
+   * ADDITIVE: a malformed shape drops the field, never the entry.
+   */
+  readonly extracted_sha256?: string;
+  /**
    * The resurrect guard (storage lifecycle, PR #257 review H3): the vault
    * path of the canonical summary page this source's near-duplicate copy
    * was retired into. Set by the retirement core INSTEAD of dropping the
@@ -139,6 +150,16 @@ export interface ManifestEntry {
  */
 export function extractedBytesOf(entry: ManifestEntry | undefined): number {
   return entry?.extracted_bytes ?? 0;
+}
+
+/**
+ * The digest of the entry's leading {@link extractedBytesOf} bytes - what
+ * the append proof verifies a grown source against: the prefix digest when
+ * the extracted prefix is shorter than the recorded source, else the
+ * whole-file digest, which then describes the same bytes.
+ */
+export function extractedDigestOf(entry: ManifestEntry): string {
+  return entry.extracted_sha256 ?? entry.sha256;
 }
 
 /**
@@ -325,6 +346,7 @@ function parseEntryValue(value: unknown): ManifestEntry | null {
   const extractedBytes = record["extracted_bytes"];
   const extractedAt = record["extracted_at"];
   const retiredInto = record["retired_into"];
+  const extractedSha = record["extracted_sha256"];
   return {
     sha256: record["sha256"],
     ...(typeof fingerprint === "string" ? { fingerprint } : {}),
@@ -334,6 +356,9 @@ function parseEntryValue(value: unknown): ManifestEntry | null {
       : {}),
     ...(typeof retiredInto === "string" && retiredInto.length > 0
       ? { retired_into: retiredInto }
+      : {}),
+    ...(typeof extractedSha === "string" && /^[0-9a-f]{64}$/.test(extractedSha)
+      ? { extracted_sha256: extractedSha }
       : {}),
   };
 }
@@ -353,6 +378,7 @@ function hasRecordedState(entry: ManifestEntry): boolean {
   return (
     entry.fingerprint !== undefined ||
     entry.extracted_bytes !== undefined ||
+    entry.extracted_sha256 !== undefined ||
     entry.retired_into !== undefined
   );
 }
@@ -616,6 +642,38 @@ export function updateManifest(
     // as current, and the untouched entries here may predate the live
     // contract - their owed reprocess must survive this write.
     return writeManifestAtomic(vault, entries, { fingerprint: live });
+  } finally {
+    handle.release();
+  }
+}
+
+/** What {@link markManifestRetired} found and did. */
+export type ManifestRetireMark = "no-manifest" | "no-entry" | "already-marked" | "marked";
+
+/**
+ * Stamp `retired_into` on one entry under the manifest lock - the same
+ * critical section {@link updateManifest} takes - so a concurrent ingest
+ * can neither lose its own write to this one nor overwrite the entry and
+ * drop the marker. Every other field of the entry, and every other entry,
+ * is kept as read inside the lock.
+ */
+export function markManifestRetired(
+  vault: string,
+  key: string,
+  retiredInto: string,
+): ManifestRetireMark {
+  if (!existsSync(manifestPath(vault))) return "no-manifest";
+  const handle = acquireLockSyncWithRetry(manifestPath(vault), undefined, {
+    remedy: ingestLockRemedy,
+  });
+  try {
+    const manifest = readManifest(vault);
+    const existing = manifest.entries[key];
+    if (existing === undefined) return "no-entry";
+    if (existing.retired_into === retiredInto) return "already-marked";
+    const entries = { ...manifest.entries, [key]: { ...existing, retired_into: retiredInto } };
+    writeManifestAtomic(vault, entries, manifest.contract);
+    return "marked";
   } finally {
     handle.release();
   }

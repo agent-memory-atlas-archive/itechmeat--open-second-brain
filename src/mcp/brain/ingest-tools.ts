@@ -9,7 +9,7 @@
  * Idempotent on the source path.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import { serializeImportCensus } from "../../core/brain/import-census.ts";
@@ -18,17 +18,6 @@ import { clearCheckpoint, PLAN_ID_LABEL } from "../../core/brain/ingest/checkpoi
 import { assertCheckpointId } from "../../core/brain/checkpoint-store.ts";
 import { STORAGE_CAPACITY_CRITICAL_CODE } from "../../core/brain/doctor/storage-capacity.ts";
 import { MAINTENANCE_CAPACITY_REMEDY } from "../../core/brain/maintenance/lane.ts";
-import { BRAIN_CONFIG_SUPPORTED_VERSIONS } from "../../core/brain/policy/defaults.ts";
-import { BrainConfigError } from "../../core/brain/policy/errors.ts";
-import { KeyIndexCollector, type BlockParseContext } from "../../core/brain/policy/key-index.ts";
-import {
-  BRAIN_STORAGE_DEFAULTS,
-  parseStorageBlock,
-  resolveStorage,
-} from "../../core/brain/policy/blocks/storage.ts";
-import type { BrainConfig, ResolvedBrainStorageConfig } from "../../core/brain/types.ts";
-import { brainConfigPath } from "../../core/brain/paths.ts";
-import { parseBrainYaml, type ParsedBlock } from "../../core/brain/yaml-parse.ts";
 import {
   StorageCapacityError,
   type StorageErrorCode,
@@ -38,6 +27,10 @@ import {
   evaluateCapacityGate,
   type CapacityGateDecision,
 } from "../../core/brain/storage/gate.ts";
+import {
+  loadGateStorageConfig,
+  StorageGateConfigError,
+} from "../../core/brain/storage/gate-config.ts";
 import { ingestSource } from "../../core/brain/ingest/ingest.ts";
 import type { PartsOutcome, TableOutcome } from "../../core/brain/ingest/extract-source.ts";
 import type { CodeEdgeSeed, PreExtractResult } from "../../core/brain/ingest/pre-extract.ts";
@@ -103,18 +96,6 @@ const ADMISSION_REFUSAL_CODE: StorageErrorCode = "capacity_exhausted";
 const CONFIG_GATE_REFUSAL_CODE = "config_invalid";
 
 /**
- * A broken `_brain.yaml` the admission gate cannot decide under. Its prose
- * is built from a relative config label, never the config's host path, so
- * the refusal can cross to a remote caller (see {@link loadGateStorageConfig}).
- */
-class StorageGateConfigError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "StorageGateConfigError";
-  }
-}
-
-/**
  * Refuse the ingest when a fresh census measures the vault at its
  * critical storage tier - the interactive half of the storage lifecycle's
  * backpressure, beside the maintenance lane's gate.
@@ -138,11 +119,17 @@ class StorageGateConfigError extends Error {
  * the two walls an operator can hit - the paused lane and the refused
  * write - cannot disagree about what to do next.
  */
-function refuseWhenVaultExhausted(vault: string, reach: TransportReach, now: Date): void {
+function refuseWhenVaultExhausted(
+  vault: string,
+  reach: TransportReach,
+  now: Date,
+  configPath: string | null,
+): void {
   const storage = loadGateStorageConfig(vault);
   if (storage.cap_bytes === null) return;
   const decision = evaluateCapacityGate(vault, {
     now,
+    ...(configPath ? { configPath } : {}),
     capBytes: storage.cap_bytes,
     warnPercent: storage.warn_percent,
     criticalPercent: storage.critical_percent,
@@ -187,69 +174,6 @@ function admissionDetails(
     // value is the pointer never spells the command by hand.
     ...nextCommandField(STORAGE_CAPACITY_CRITICAL_CODE),
   };
-}
-
-/**
- * The storage policy the admission gate decides under, read from ONLY the
- * `storage:` block of `_brain.yaml` (review M1).
- *
- * The gate's decision needs no other block, but the whole-file loader
- * validated all of them, so a typo in an unrelated block turned every
- * ingest into an internal error naming the config's host path - including
- * on vaults whose operator never configured a cap, where the documented
- * default is that nothing refuses. This reader answers the gate's actual
- * question: an absent config or block is the defaults (no cap, no gate),
- * and the rest of the file is never validated here.
- *
- * A file that cannot be read or parsed, an unsupported `schema_version`,
- * or a `storage:` block that does not validate is a policy this gate
- * cannot see through, and silently reading it as "no cap" would run
- * writes past an operator's bound. Those refuse BY NAME: the error
- * carries field-level prose built from a relative config label, and the
- * handler maps it onto the registered {@link CONFIG_GATE_REFUSAL_CODE}
- * envelope - never a path below local reach.
- */
-function loadGateStorageConfig(vault: string): ResolvedBrainStorageConfig {
-  const path = brainConfigPath(vault);
-  if (!existsSync(path)) return BRAIN_STORAGE_DEFAULTS;
-  let text: string;
-  try {
-    text = readFileSync(path, "utf8");
-  } catch (err) {
-    // Only the errno code is kept: a read-failure message embeds the
-    // absolute path the call failed on.
-    const code = (err as NodeJS.ErrnoException).code ?? "unreadable";
-    throw new StorageGateConfigError(`_brain.yaml could not be read (${code})`);
-  }
-  let parsed: ParsedBlock;
-  try {
-    parsed = parseBrainYaml(text);
-  } catch (err) {
-    // The parser's messages name line numbers, never paths.
-    throw new StorageGateConfigError(`_brain.yaml could not be parsed: ${(err as Error).message}`);
-  }
-  const version = parsed["schema_version"];
-  if (typeof version !== "number" || !BRAIN_CONFIG_SUPPORTED_VERSIONS.includes(version)) {
-    throw new StorageGateConfigError(
-      `_brain.yaml: unsupported schema_version: ${JSON.stringify(version ?? null)}`,
-    );
-  }
-  const ctx: BlockParseContext = {
-    obj: parsed,
-    // A relative label, never the host path: the field errors this context
-    // raises become the refusal's prose.
-    source: "_brain.yaml",
-    warnings: [],
-    keys: new KeyIndexCollector(),
-  };
-  try {
-    // Only the storage block is parsed and resolved; `resolveStorage`
-    // reads nothing else off the config.
-    return resolveStorage({ storage: parseStorageBlock(ctx) } as BrainConfig);
-  } catch (err) {
-    if (err instanceof BrainConfigError) throw new StorageGateConfigError(err.message);
-    throw err;
-  }
 }
 
 /**
@@ -308,7 +232,7 @@ async function toolBrainIngestSource(
     // envelope here, before the generic wrapper could flatten it into an
     // internal error.
     try {
-      refuseWhenVaultExhausted(ctx.vault, contextReach(ctx), new Date());
+      refuseWhenVaultExhausted(ctx.vault, contextReach(ctx), new Date(), ctx.configPath ?? null);
     } catch (err) {
       if (err instanceof StorageCapacityError) throw capacityRefusalEnvelope(err);
       // A broken config the gate cannot see through refuses by name, with
@@ -556,6 +480,7 @@ function discardOrphanedArchiveEntry(vault: string, hash: string): boolean {
 function serializePlan(
   plan: SourceCleanupPlan,
   archiveEntries: ReadonlyArray<ArchiveCleanupEntry>,
+  local: boolean,
 ): Record<string, unknown> {
   return {
     source: plan.source,
@@ -576,7 +501,12 @@ function serializePlan(
     // clean run with a smaller count. Always carried (empty on a clean or
     // dry run) so an automations can read the field unconditionally, like
     // `deleted` beside it.
-    failed: plan.failed.map((f) => ({ path: f.path, message: f.message })),
+    // Below local reach the raised message, which can carry a host path,
+    // is replaced by the errno code; the vault-relative path stays.
+    failed: plan.failed.map((f) => ({
+      path: f.path,
+      message: local ? f.message : `removal failed (${f.code ?? "error"})`,
+    })),
     manifest_entry_removed: plan.manifestEntryRemoved,
     audit_record_id: plan.auditRecordId,
     // The archive-entry cleanup kind (answer trust, Task C4), reported as
@@ -684,14 +614,14 @@ async function toolBrainDeleteBySource(
       archiveEntries = orphanedArchiveEntries(ctx.vault, stamped, new Set(plan.deleted)).filter(
         (entry) => discardOrphanedArchiveEntry(ctx.vault, entry.hash),
       );
-      return serializePlan(plan, archiveEntries);
+      return serializePlan(plan, archiveEntries, contextReach(ctx) === TRANSPORT_REACH.local);
     }
     archiveEntries = orphanedArchiveEntries(
       ctx.vault,
       stamped,
       new Set(preview.derived.map((entry) => entry.path)),
     );
-    return serializePlan(preview, archiveEntries);
+    return serializePlan(preview, archiveEntries, contextReach(ctx) === TRANSPORT_REACH.local);
   } catch (err) {
     // Write-side trust (Task 12): a permissions document rule denied the
     // confirmed cleanup. Named code, the rule that decided, and the

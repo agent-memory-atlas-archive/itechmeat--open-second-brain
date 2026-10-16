@@ -197,10 +197,12 @@ describe("think-block strip (t_dac8bf7e)", () => {
 // ----- The zero-yield mining tombstone on the surface ------------------------
 //
 //  6. A commit that lands nothing tombstones the session - keyed on the
-//     surveyed hash the plan printed, which the commit relays back - and
-//     the next plan says so by name with the recorded breakdown, in --json
-//     and in text, instead of re-offering the same turns. A commit that
-//     answers no plan records nothing, so the session stays eligible.
+//     session's current mined turns, with the plan's surveyed hash relayed
+//     back or with the plan's recorded survey standing in for it (a turn
+//     imported after the plan withholds it) - and the next plan says so by name with the
+//     recorded breakdown, in --json and in text, instead of re-offering the
+//     same turns. A relayed hash is a check: a malformed one refuses the
+//     commit before any write.
 //  7. --force bypasses the tombstone for exactly one plan call: the forced
 //     plan carries the envelope, and the plan after it is suppressed again.
 //  8. A ledger write failure on a successful commit exits 0 and names the
@@ -258,15 +260,58 @@ describe("mining tombstone", () => {
     expect(payload.turns_mined).toEqual([]);
   });
 
-  test("a barren commit without the surveyed hash records nothing and fails open", async () => {
-    // The relay is what makes the tombstone honest: without it the commit
-    // has no material to key on, records nothing, and the session stays
-    // eligible - never suppressed on unverified evidence.
+  test("a barren commit without the surveyed hash still tombstones the session", async () => {
+    // The documented synopsis: plan, then commit the payload alone. The
+    // plan's recorded survey is all the tombstone may need.
+    await surveyedHash();
     const mine = await run([SESSION, "--payload", JSON.stringify({ items: [] }), "--json"]);
     expect(mine.returncode).toBe(0);
     const r = await run([SESSION, "--json"]);
-    const payload = JSON.parse(r.stdout) as { skipped?: unknown };
+    const payload = JSON.parse(r.stdout) as { skipped?: { reason: string } };
+    expect(payload.skipped?.reason).toBe("mining_tombstone");
+  });
+
+  test("a turn imported after the plan keeps a relay-less barren commit from tombstoning", async () => {
+    await surveyedHash();
+    importSessionRecall(vault, {
+      sessionId: SESSION,
+      turns: [
+        {
+          turnId: "t2",
+          timestamp: "2026-08-22T09:02:00Z",
+          role: "user",
+          text: "Keep release notes in English.",
+        },
+      ],
+      createdAt: "2026-08-22T10:00:00Z",
+    });
+    const mine = await run([SESSION, "--payload", JSON.stringify({ items: [] }), "--json"]);
+    expect(mine.returncode).toBe(0);
+    expect(
+      (JSON.parse(mine.stdout) as { mining_ledger_failure?: string }).mining_ledger_failure,
+    ).toContain("changed since the plan");
+    const r = await run([SESSION, "--json"]);
+    const payload = JSON.parse(r.stdout) as {
+      skipped?: unknown;
+      turns_mined: Array<{ turn_id: string }>;
+    };
     expect(payload.skipped).toBeUndefined();
+    expect(payload.turns_mined.map((t) => t.turn_id)).toEqual(["t1", "t2"]);
+  });
+
+  test("a malformed surveyed hash refuses the commit before any write", async () => {
+    const mine = await run([
+      SESSION,
+      "--payload",
+      JSON.stringify({ items: [ITEM] }),
+      "--surveyed-turns-hash",
+      "not-a-hash",
+      "--json",
+    ]);
+    expect(mine.returncode).toBe(1);
+    expect(mine.stdout).toContain("surveyed_turns_hash must be");
+    const r = await run([SESSION, "--json"]);
+    expect((JSON.parse(r.stdout) as { skipped?: unknown }).skipped).toBeUndefined();
   });
 
   test("text mode names the tombstone and the force escape", async () => {

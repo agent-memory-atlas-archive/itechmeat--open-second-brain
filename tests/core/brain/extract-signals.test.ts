@@ -66,6 +66,7 @@ import {
   sessionMiningLedgerPath,
   type SessionMiningEntry,
 } from "../../../src/core/brain/session-mining-ledger.ts";
+import { sessionMiningSurveysPath } from "../../../src/core/brain/session-mining-surveys.ts";
 import {
   ResponseCheckError,
   SEMANTIC_VIOLATION_CODES,
@@ -634,15 +635,18 @@ test("the session mining ledger schema version is pinned at 1", () => {
 
 // ----- Record-at-commit (session-mining-economy) ----------------------------
 //
-// 24. Every successful commit that answers a plan records its outcome
-//     breakdown over the surveyed hash: zero-yield as the tombstone's
+// 24. Every successful commit records its outcome breakdown over the
+//     session's current mined turns: zero-yield as the tombstone's
 //     evidence, yield as the distilled state the census reports.
 // 25. A commit that ends in a partial-write error records nothing - a
 //     failed run is not an outcome.
-// 26. The tombstone keys on the material the model actually answered, so a
-//     turn imported between plan and commit is never suppressed unseen; a
-//     commit that answers no plan of this module's attests nothing and
-//     records nothing, which is the safe direction.
+// 26. A turn imported between plan and commit is never suppressed unseen:
+//     a relayed plan hash that no longer matches records nothing and names
+//     why. Without a relay the plan's recorded survey stands in for it: the
+//     documented flow (plan, then a barren commit) tombstones while the
+//     session is unchanged, and a session that changed since the plan, two
+//     pending plans over different turns, or no plan at all withholds the
+//     tombstone by name. A yield records either way.
 // 27. When the commit itself succeeds but the ledger write fails, the
 //     result names the failure and nothing throws; the field is absent
 //     whenever the ledger was not attempted or succeeded.
@@ -746,10 +750,10 @@ test("a partial-write failure records nothing - a failed run is not a barren one
   expect(readSessionMiningLedger(vault).entries).toEqual({});
 });
 
-test("the tombstone keys on the surveyed hash, not the turns present at commit time", () => {
+test("a relayed plan hash the session outgrew records nothing and names why", () => {
   const plan = planExtractSignals(vault, SESSION, { now: NOW });
   importTurns(SESSION, [turn("t9", "user", "Imported after the plan was built.")]);
-  commitExtractedSignals(
+  const res = commitExtractedSignals(
     vault,
     SESSION,
     { items: [] },
@@ -759,10 +763,10 @@ test("the tombstone keys on the surveyed hash, not the turns present at commit t
       surveyedTurnsHash: plan.surveyedTurnsHash,
     },
   );
-  const entry = ledgerEntry()!;
-  // The verdict was earned over the planned material, and that is the
-  // material the record describes - never what the session holds by now.
-  expect(entry.minedContentHash).toBe(minedTurnsHash(plan.turnsMined));
+  // The verdict was earned over material the session no longer holds, so
+  // no record may claim the current turns.
+  expect(ledgerEntry()).toBeUndefined();
+  expect(res.miningLedgerFailure).toContain(plan.surveyedTurnsHash);
 });
 
 test("a turn imported between plan and commit is not suppressed unseen", async () => {
@@ -788,12 +792,124 @@ test("a turn imported between plan and commit is not suppressed unseen", async (
   expect(next.turnsMined.map((t) => t.turnId)).toEqual(["t1", "t3", "t9"]);
 });
 
-test("a commit that answers no plan attests nothing and records nothing", () => {
-  // Without a plan there is no material the verdict was earned over; a
-  // tombstone keyed on whatever the session holds now could suppress turns
-  // no model ever saw. Recording nothing keeps the session eligible.
-  commitExtractedSignals(vault, SESSION, { items: [] }, { agent: "tester", now: NOW });
-  expect(readSessionMiningLedger(vault).entries).toEqual({});
+/** The plan phase both surfaces run: it records the survey it hands out. */
+function surfacePlan(): ReturnType<typeof planExtractSignalsPrefiltered> {
+  return planExtractSignalsPrefiltered(vault, SESSION, { now: NOW, decisionModel: null });
+}
+
+/** A commit that relays no plan hash, as the documented flow does. */
+function commitWithoutRelay(
+  items: ReadonlyArray<Record<string, unknown>>,
+): ReturnType<typeof commitExtractedSignals> {
+  return commitExtractedSignals(vault, SESSION, { items }, { agent: "tester", now: NOW });
+}
+
+test("the documented flow - plan, then a barren commit without a relay - tombstones", async () => {
+  const plan = await surfacePlan();
+  const res = commitWithoutRelay([]);
+  expect(res.miningLedgerFailure).toBeUndefined();
+  expect(ledgerEntry()?.minedContentHash).toBe(plan.surveyedTurnsHash);
+  expect((await surfacePlan()).skipped?.reason).toBe(EXTRACT_MINING_TOMBSTONE_SKIP_REASON);
+});
+
+test("re-planning unchanged turns keeps the survey unambiguous", async () => {
+  await surfacePlan();
+  await surfacePlan();
+  expect(commitWithoutRelay([]).miningLedgerFailure).toBeUndefined();
+  expect(ledgerEntry()).toBeDefined();
+});
+
+test("a turn imported after the plan withholds a relay-less tombstone and names why", async () => {
+  const plan = await surfacePlan();
+  importTurns(SESSION, [turn("t9", "user", "Imported after the plan was built.")]);
+  const res = commitWithoutRelay([]);
+  expect(ledgerEntry()).toBeUndefined();
+  expect(res.miningLedgerFailure).toContain("changed since the plan");
+  expect(res.miningLedgerFailure).toContain(plan.surveyedTurnsHash);
+  // The new turn was never offered to a model, so the next plan offers it.
+  const next = await surfacePlan();
+  expect(next.skipped).toBeUndefined();
+  expect(next.turnsMined.map((t) => t.turnId)).toEqual(["t1", "t3", "t9"]);
+});
+
+test("two pending plans over different turns withhold a relay-less tombstone", async () => {
+  await surfacePlan();
+  importTurns(SESSION, [turn("t9", "user", "Imported between the two plans.")]);
+  await surfacePlan();
+  // The commit cannot tell which of the two plans it answers.
+  const res = commitWithoutRelay([]);
+  expect(ledgerEntry()).toBeUndefined();
+  expect(res.miningLedgerFailure).toContain("2 plans over different turns");
+});
+
+test("a barren commit with no recorded plan withholds the tombstone and names why", () => {
+  const res = commitWithoutRelay([]);
+  expect(ledgerEntry()).toBeUndefined();
+  expect(res.miningLedgerFailure).toContain("no plan of this session was recorded");
+});
+
+test("a commit consumes the survey, so a second barren commit has none to attest", async () => {
+  await surfacePlan();
+  commitWithoutRelay([item()]);
+  const res = commitWithoutRelay([]);
+  expect(res.miningLedgerFailure).toContain("no plan of this session was recorded");
+  // The first commit's yield record stands; the barren one did not replace it.
+  expect(ledgerEntry()!.outcome.written).toBe(1);
+});
+
+test("a yield records without a relay or a survey - only the tombstone needs one", () => {
+  const res = commitWithoutRelay([item()]);
+  expect(res.written).toHaveLength(1);
+  expect(res.miningLedgerFailure).toBeUndefined();
+  expect(ledgerEntry()!.outcome.written).toBe(1);
+});
+
+test("a relayed hash still tombstones when no survey was recorded", () => {
+  const { res } = commitAnsweringPlan([]);
+  expect(res.miningLedgerFailure).toBeUndefined();
+  expect(ledgerEntry()).toBeDefined();
+});
+
+test("a survey the plan cannot record is named on the plan, and the relay still tombstones", async () => {
+  mkdirSync(dirname(sessionMiningSurveysPath(vault)), { recursive: true });
+  writeFileSync(sessionMiningSurveysPath(vault), "{ truncated");
+  const plan = await surfacePlan();
+  expect(plan.llmStep).not.toBeNull();
+  expect(plan.surveyRecordFailure).toContain("session mining surveys file is corrupted JSON");
+  // Without the relay the commit cannot attest the material...
+  expect(commitWithoutRelay([]).miningLedgerFailure).toContain("could not be read");
+  expect(ledgerEntry()).toBeUndefined();
+  // ...and with it the tombstone lands.
+  const relayed = commitExtractedSignals(
+    vault,
+    SESSION,
+    { items: [] },
+    { agent: "tester", now: NOW, surveyedTurnsHash: plan.surveyedTurnsHash },
+  );
+  expect(relayed.miningLedgerFailure).toBeUndefined();
+  expect(ledgerEntry()).toBeDefined();
+});
+
+test("a damaged survey row reads as ambiguous, never as one clean survey", async () => {
+  // A dropped row plus the next plan would look like a single survey and
+  // could attest material an earlier plan never offered.
+  mkdirSync(dirname(sessionMiningSurveysPath(vault)), { recursive: true });
+  writeFileSync(
+    sessionMiningSurveysPath(vault),
+    JSON.stringify({ schema_version: 1, surveys: { [SESSION]: { hashes: "not-a-list" } } }),
+  );
+  await surfacePlan();
+  expect(commitWithoutRelay([]).miningLedgerFailure).toContain("plans over different turns");
+  expect(ledgerEntry()).toBeUndefined();
+});
+
+test("a tombstone-suppressed plan hands out no envelope and records no survey", async () => {
+  await surfacePlan();
+  commitWithoutRelay([]);
+  const skipped = await surfacePlan();
+  expect(skipped.skipped?.reason).toBe(EXTRACT_MINING_TOMBSTONE_SKIP_REASON);
+  expect(existsSync(sessionMiningSurveysPath(vault))).toBe(true);
+  expect(JSON.parse(readFileSync(sessionMiningSurveysPath(vault), "utf8")).surveys).toEqual({});
 });
 
 /** Plants a corrupt mining ledger so a read of it refuses by name. */
@@ -845,4 +961,38 @@ test("the ledger-failure field is absent when the record succeeded", () => {
   const { res } = commitAnsweringPlan([]);
   expect(ledgerEntry()).toBeDefined();
   expect("miningLedgerFailure" in res).toBe(false);
+});
+
+test("a barren commit whose ledger record fails keeps the survey, so its retry tombstones", async () => {
+  const plan = await surfacePlan();
+  seedCorruptLedger();
+  expect(commitWithoutRelay([]).miningLedgerFailure).toContain(
+    "session mining ledger is corrupted JSON",
+  );
+  // The operator clears the damaged ledger and retries the same answer
+  // without a relay: the survey the failed commit read must still attest it.
+  rmSync(sessionMiningLedgerPath(vault));
+  const retry = commitWithoutRelay([]);
+  expect(retry.miningLedgerFailure).toBeUndefined();
+  expect(ledgerEntry()?.minedContentHash).toBe(plan.surveyedTurnsHash);
+});
+
+test("below local reach a survey store failure names no host path", async () => {
+  mkdirSync(dirname(sessionMiningSurveysPath(vault)), { recursive: true });
+  writeFileSync(sessionMiningSurveysPath(vault), "{ truncated");
+  const plan = await planExtractSignalsPrefiltered(vault, SESSION, {
+    now: NOW,
+    decisionModel: null,
+    closeHostErrors: true,
+  });
+  expect(plan.surveyRecordFailure).toBe("session mining surveys store failed (error)");
+  const res = commitExtractedSignals(
+    vault,
+    SESSION,
+    { items: [] },
+    { agent: "tester", now: NOW, closeHostErrors: true },
+  );
+  expect(res.miningLedgerFailure).toContain("session mining surveys store failed (error)");
+  expect(res.miningLedgerFailure).not.toContain(vault);
+  expect(res.miningLedgerFailure).not.toContain(tmpdir());
 });

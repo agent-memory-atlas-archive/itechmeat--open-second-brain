@@ -46,10 +46,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { atomicWriteFileSync } from "../fs-atomic.ts";
-import { listContinuityRecords } from "./continuity/store.ts";
 import { hashBytes } from "./ingest/content-manifest.ts";
 import { DERIVED_STORE_DIR } from "./path-constants.ts";
-import { listSessionRawTurns, sessionIdOf } from "./session-recall.ts";
+import { buildSessionTurnIndex } from "./session-recall.ts";
 import { acquireLockSyncWithRetry, ingestLockRemedy } from "./sync-lockfile.ts";
 import { isoSecond } from "./time.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
@@ -118,6 +117,16 @@ export interface SessionMiningLedger {
 }
 
 /**
+ * The remedy every file-level refusal names: the refusal stops every plan,
+ * the census and the nudge, so the operator must learn what removing the
+ * file costs (every session re-opens for mining) and that nothing else is
+ * lost.
+ */
+const CORRUPT_LEDGER_REMEDY =
+  "; to recover, move the file aside or delete it - every imported session then becomes " +
+  "eligible for mining again, and the next commits rebuild the ledger";
+
+/**
  * Read the ledger. A missing file is an empty ledger - no session is
  * tombstoned, which is the correct answer for a vault that has mined
  * nothing. A CORRUPT or unknown-schema file is a hard error: a silent reset
@@ -136,16 +145,18 @@ export function readSessionMiningLedger(vault: string): SessionMiningLedger {
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
   } catch (e) {
-    throw new Error(`session mining ledger is corrupted JSON: ${path}`, { cause: e });
+    throw new Error(`session mining ledger is corrupted JSON: ${path}${CORRUPT_LEDGER_REMEDY}`, {
+      cause: e,
+    });
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`session mining ledger is not an object: ${path}`);
+    throw new Error(`session mining ledger is not an object: ${path}${CORRUPT_LEDGER_REMEDY}`);
   }
   const obj = parsed as Record<string, unknown>;
   if (obj["schema_version"] !== SESSION_MINING_LEDGER_SCHEMA_VERSION) {
     throw new Error(
       `session mining ledger schema_version ${String(obj["schema_version"])} not supported ` +
-        `(expected ${SESSION_MINING_LEDGER_SCHEMA_VERSION}): ${path}`,
+        `(expected ${SESSION_MINING_LEDGER_SCHEMA_VERSION}): ${path}${CORRUPT_LEDGER_REMEDY}`,
     );
   }
   const entries: Record<string, SessionMiningEntry> = {};
@@ -157,7 +168,9 @@ export function readSessionMiningLedger(vault: string): SessionMiningLedger {
   // different from per-ENTRY damage, which is dropped rather than guessed
   // at, because a dropped entry can only re-open one session for mining.
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-    throw new Error(`session mining ledger entries is not an object: ${path}`);
+    throw new Error(
+      `session mining ledger entries is not an object: ${path}${CORRUPT_LEDGER_REMEDY}`,
+    );
   }
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
     const entry = readEntry(key, value);
@@ -275,20 +288,12 @@ export function recordSessionMiningOutcome(
     // One store pass for the whole prune, mirroring the import ledger's
     // one-existsSync-per-entry idiom: a full turn listing per entry here
     // would be a whole-store read plus a lineage build per entry, growing
-    // with the ledger's history instead of with this record.
-    const sessionsWithTurns = new Set<string>();
-    for (const turnRecord of listContinuityRecords(vault)) {
-      if (turnRecord.kind !== "session_turn") continue;
-      const sid = sessionIdOf(turnRecord.payload);
-      if (sid !== undefined) sessionsWithTurns.add(sid);
-    }
+    // with the ledger's history instead of with this record. The index
+    // applies the lineage scope, so a root ref mined over segment-recorded
+    // turns keeps its entry.
+    const turns = buildSessionTurnIndex(vault);
     for (const key of Object.keys(entries)) {
-      if (sessionsWithTurns.has(key)) continue;
-      // A session holding no direct turn record may still have turns,
-      // reachable through the lineage scope (a root ref mined over
-      // segment-recorded turns); the exact read decides those, and only
-      // those.
-      if (listSessionRawTurns(vault, key).length === 0) delete entries[key];
+      if (turns.turnsFor(key).length === 0) delete entries[key];
     }
     const next = serializeLedger(entries);
     if (existsSync(path) && readFileSync(path, "utf8") === next) return false;

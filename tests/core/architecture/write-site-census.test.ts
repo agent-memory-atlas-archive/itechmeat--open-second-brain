@@ -588,11 +588,12 @@ const DIRECT_WRITE_EXCLUSIONS: Readonly<Record<string, WriteExclusion>> = Object
       "re-confirmed, then the source unlinked.",
   },
   "src/core/search/store/lifecycle.ts": {
-    categories: [C.lifecycleMove],
-    calls: ["renameSync"],
+    categories: [C.lifecycleMove, C.retentionDelete],
+    calls: ["renameSync", "unlinkSync"],
     reason:
-      "restores the `.bak` sqlite index over a missing database after a crashed " +
-      "reindex, re-checked under the lock. A database file has no text-writer form.",
+      "restores the parked `.old` (else the `.bak`) sqlite index over a missing database " +
+      "after a crashed reindex, re-checked under the lock, and deletes a `.old` a completed " +
+      "swap left beside the live index. A database file has no text-writer form.",
   },
 
   // --- Retention, reset and cleanup deletes ------------------------------
@@ -1426,8 +1427,13 @@ const DIRECT_WRITE_ROWS = 82;
  * writes its tombstone JSON through `atomicWriteFileSync` under the
  * ledger file's own lock - derived-store machine state, not a note, so
  * it arrives in the shared class needing no exclusion.
+ *
+ * 121 -> 122, from the v1.86.1 review fixes and nothing else: the pending
+ * mining surveys (`src/core/brain/session-mining-surveys.ts`) write their
+ * JSON through `atomicWriteFileSync` under the file's own lock - derived-
+ * store machine state, not a note, needing no exclusion.
  */
-const SHARED_HELPER_ROWS = 121;
+const SHARED_HELPER_ROWS = 122;
 
 // ----- Origin-channel coverage boundary (Unit C) ----------------------------
 
@@ -1546,9 +1552,11 @@ const UNSTAMPED_DIRECT_ROWS = 81;
  * origin stamp on a fold rewrite). 117 -> 118: the session mining ledger
  * (`src/core/brain/session-mining-ledger.ts`) writes its tombstone JSON
  * through the shared atomic writer (derived-store machine state, not
- * notes; no origin stamp on machine state).
+ * notes; no origin stamp on machine state). 118 -> 119: the pending mining
+ * surveys (`src/core/brain/session-mining-surveys.ts`) write their JSON
+ * the same way (derived-store machine state; no origin stamp).
  */
-const UNSTAMPED_SHARED_ROWS = 118;
+const UNSTAMPED_SHARED_ROWS = 119;
 
 describe("in-vault write-site census", () => {
   test("every direct-fs write site carries a written exclusion", () => {
