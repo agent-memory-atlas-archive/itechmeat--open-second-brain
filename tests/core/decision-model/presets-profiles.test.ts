@@ -20,9 +20,11 @@ import {
   buildDecisionModelCheck,
   renderDecisionModelCheck,
 } from "../../../src/core/decision-model/diagnostics.ts";
+import { ConverseDecisionProvider } from "../../../src/core/decision-model/converse.ts";
 import { makeDecisionProvider } from "../../../src/core/decision-model/provider.ts";
 import { runDecision } from "../../../src/core/decision-model/run.ts";
 import { probeDecisionModel } from "../../../src/core/doctor-readiness.ts";
+import { DECISION_MODEL_HOSTED_MAX_STATE_TOKENS } from "../../../src/core/decision-model/presets.ts";
 import { FAKE_DECISION_KEY } from "../../helpers/fake-credentials.ts";
 import {
   answerAll,
@@ -45,6 +47,19 @@ function preset(name: string, extra: Record<string, string> = {}): Record<string
   return {
     decision_model_enabled: "true",
     decision_model_provider: name,
+    decision_model_uses: "rerank:shadow",
+    ...extra,
+  };
+}
+
+/** A configured `converse` gateway: base URL, pinned id and key variable are the operator's. */
+function converseConfig(extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    decision_model_enabled: "true",
+    decision_model_provider: "converse",
+    decision_model_base_url: "https://gateway.example.com",
+    decision_model_id: "gateway-jev-1",
+    decision_model_env_key: "O2B_TEST_CONVERSE_KEY",
     decision_model_uses: "rerank:shadow",
     ...extra,
   };
@@ -284,6 +299,32 @@ describe("check and doctor for the new presets", () => {
     expect(JSON.stringify(report)).not.toContain(FAKE_DECISION_KEY);
   });
 
+  test("check warns that an unpriced llm-emulation under-counts the daily cost gate", async () => {
+    const report = await buildDecisionModelCheck({
+      config: preset("llm-emulation", {
+        decision_model_base_url: "https://api.example.com/v1",
+        decision_model_id: "chat-1",
+        decision_model_env_key: "O2B_TEST_EMU_KEY",
+      }),
+      vault: null,
+      env: { O2B_TEST_EMU_KEY: FAKE_DECISION_KEY },
+    });
+    expect(report.warnings.join("\n")).toContain("no prices are set for llm-emulation");
+    // Priced, the unpriced-route warning goes.
+    const priced = await buildDecisionModelCheck({
+      config: preset("llm-emulation", {
+        decision_model_base_url: "https://api.example.com/v1",
+        decision_model_id: "chat-1",
+        decision_model_env_key: "O2B_TEST_EMU_KEY",
+        decision_model_input_price_usd_per_mtok: "1",
+        decision_model_output_price_usd_per_mtok: "4",
+      }),
+      vault: null,
+      env: { O2B_TEST_EMU_KEY: FAKE_DECISION_KEY },
+    });
+    expect(priced.warnings.join("\n")).not.toContain("no prices are set for llm-emulation");
+  });
+
   test("doctor passes a keyless loopback server without claiming a key", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "osb-dm-doctor-"));
     try {
@@ -297,6 +338,145 @@ describe("check and doctor for the new presets", () => {
       const verdict = await probeDecisionModel({ vault: tmp, config: configPath, env: {} });
       expect(verdict.status).toBe("pass");
       expect(verdict.detail).toContain("no key needed");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the converse preset", () => {
+  const ENV = { O2B_TEST_CONVERSE_KEY: FAKE_DECISION_KEY } as NodeJS.ProcessEnv;
+
+  test("resolves end-to-end to the converse adapter with its own profile", () => {
+    const cfg = resolveDecisionModelConfig({ env: ENV, config: converseConfig(), vault: null });
+    expect(cfg.status).toBe("active");
+    expect(cfg.errors).toEqual([]);
+    expect(cfg.adapter).toBe("converse");
+    // A generative model behind the gateway writes its own probabilities,
+    // so the route is uncalibrated exactly like llm-emulation.
+    expect(cfg.calibrated).toBe(false);
+    expect(cfg.thresholdProfile).toBe("converse");
+    expect(cfg.envKey).toBe("O2B_TEST_CONVERSE_KEY");
+    const provider = makeDecisionProvider(cfg, ENV);
+    expect(provider).toBeInstanceOf(ConverseDecisionProvider);
+    expect(provider!.calibrated).toBe(false);
+  });
+
+  test("enforce is refused without allow_uncalibrated, and stays shadow once allowed", () => {
+    const enforcing = converseConfig({ decision_model_uses: "rerank:enforce" });
+    const refused = resolveDecisionModelConfig({ env: ENV, config: enforcing, vault: null });
+    expect(refused.status).toBe("invalid");
+    expect(refused.errors.join("\n")).toContain("decision_model_allow_uncalibrated");
+    const allowed = resolveDecisionModelConfig({
+      env: ENV,
+      config: converseConfig({
+        decision_model_uses: "rerank:enforce",
+        decision_model_allow_uncalibrated: "true",
+      }),
+      vault: null,
+    });
+    expect(allowed.status).toBe("active");
+    // No use is tuned for the converse profile yet: enforce runs as shadow.
+    expect(decisionModelModeFor(allowed, "rerank")).toBe("shadow");
+    expect(allowed.shadowOnlyUses).toEqual(["rerank"]);
+  });
+
+  test("a key is required everywhere; the gateway is bearer-authenticated", () => {
+    const local = resolveDecisionModelConfig({
+      env: {},
+      config: converseConfig({ decision_model_base_url: "http://127.0.0.1:9000" }),
+      vault: null,
+    });
+    expect(local.status).toBe("no_key");
+    expect(local.keyRequired).toBe(true);
+    expect(makeDecisionProvider(local, {})).toBeNull();
+  });
+
+  test("state clamps to the preset ceiling", () => {
+    const clamped = resolveDecisionModelConfig({
+      env: ENV,
+      config: converseConfig({ decision_model_max_state_tokens: "50000" }),
+      vault: null,
+    });
+    expect(clamped.maxStateTokens).toBe(DECISION_MODEL_HOSTED_MAX_STATE_TOKENS);
+    expect(clamped.notes.join("\n")).toContain("clamped");
+  });
+
+  test("it cannot borrow another family's profile to enforce", () => {
+    const cfg = resolveDecisionModelConfig({
+      env: ENV,
+      config: converseConfig({
+        decision_model_uses: "rerank:enforce",
+        decision_model_allow_uncalibrated: "true",
+        decision_model_threshold_profile: "jev-1.13",
+      }),
+      vault: null,
+    });
+    expect(cfg.thresholdProfile).toBe("converse");
+    expect(cfg.notes.join("\n")).toContain("decision_model_threshold_profile");
+    // No use is tuned for the converse profile yet: enforce runs as shadow.
+    expect(decisionModelModeFor(cfg, "rerank")).toBe("shadow");
+    expect(cfg.shadowOnlyUses).toEqual(["rerank"]);
+  });
+
+  test("check lists the adapter and the profile and never the key value", async () => {
+    const report = await buildDecisionModelCheck({
+      config: converseConfig(),
+      vault: null,
+      env: ENV,
+    });
+    expect(report.status).toBe("active");
+    expect(report.adapter).toBe("converse");
+    expect(report.calibrated).toBe(false);
+    expect(report.threshold_profile).toBe("converse");
+    expect(report.key_required).toBe(true);
+    const text = renderDecisionModelCheck(report);
+    expect(text).toContain("adapter converse, uncalibrated");
+    expect(text).toContain("threshold profile: converse");
+    expect(JSON.stringify(report)).not.toContain(FAKE_DECISION_KEY);
+  });
+
+  test("check warns that the unpriced converse route is invisible to the daily cost gate", async () => {
+    const report = await buildDecisionModelCheck({
+      config: converseConfig(),
+      vault: null,
+      env: ENV,
+    });
+    expect(report.warnings.join("\n")).toContain("counts none of converse's calls");
+    expect(report.warnings.join("\n")).toContain("decision_model_output_price_usd_per_mtok");
+    // An input price alone still leaves the chat route's cost unknown:
+    // the warning holds until the output price joins it.
+    const inputOnly = await buildDecisionModelCheck({
+      config: converseConfig({ decision_model_input_price_usd_per_mtok: "0.05" }),
+      vault: null,
+      env: ENV,
+    });
+    expect(inputOnly.warnings.join("\n")).toContain("counts none of converse's calls");
+    // Priced on both, the warning goes.
+    const priced = await buildDecisionModelCheck({
+      config: converseConfig({
+        decision_model_input_price_usd_per_mtok: "0.05",
+        decision_model_output_price_usd_per_mtok: "0.2",
+      }),
+      vault: null,
+      env: ENV,
+    });
+    expect(priced.warnings.join("\n")).not.toContain("counts none of converse's calls");
+  });
+
+  test("doctor resolves the preset and names the key variable it waits for", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "osb-dm-doctor-converse-"));
+    try {
+      const configPath = join(tmp, "config.yaml");
+      writeFileSync(
+        configPath,
+        Object.entries(converseConfig())
+          .map(([k, v]) => `${k}: "${v}"`)
+          .join("\n") + "\n",
+      );
+      const verdict = await probeDecisionModel({ vault: tmp, config: configPath, env: {} });
+      expect(verdict.status).toBe("skipped");
+      expect(verdict.detail).toContain("O2B_TEST_CONVERSE_KEY");
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }

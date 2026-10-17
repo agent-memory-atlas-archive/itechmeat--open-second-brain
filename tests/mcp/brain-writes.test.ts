@@ -53,6 +53,7 @@ interface WritesReply {
   readonly returned: number;
   readonly writes: ReadonlyArray<Record<string, unknown>>;
   readonly warnings: ReadonlyArray<unknown>;
+  readonly next_cursor: string | null;
 }
 
 const listWrites = async (args: Record<string, unknown> = {}): Promise<WritesReply> =>
@@ -143,6 +144,57 @@ describe("brain_writes action list", () => {
     const err = await rejectedMcpError(call("brain_writes", { op: "delete" }));
     expect(err.code).toBe(INVALID_PARAMS);
     expect(err.message).toContain("create, update, append, revert");
+  });
+});
+
+describe("brain_writes cursor pagination", () => {
+  test("the input schema declares a described cursor property", () => {
+    const schema = tool("brain_writes").inputSchema as {
+      properties: Record<string, { type?: string; maxLength?: number; description?: string }>;
+    };
+    expect(schema.properties["cursor"]).toMatchObject({ type: "string", maxLength: 32 });
+    expect(schema.properties["cursor"]?.description).toBeTruthy();
+  });
+
+  test("each page's next_cursor leads to the next and the pages reassemble the log", async () => {
+    await call("brain_create_note", { path: "Notes/One.md", content: "body" });
+    await call("brain_create_note", { path: "Notes/Two.md", content: "body" });
+    await call("brain_create_note", { path: "Notes/Three.md", content: "body" });
+
+    const total = 3;
+    const limit = 2;
+    // Bound the walk by the page arithmetic: ceil(total/limit) pages plus one
+    // slack step, so a next_cursor that never turns null (a never-exhausting
+    // tool) exhausts the budget and fails here instead of hanging the suite.
+    const maxSteps = Math.ceil(total / limit) + 1;
+    const targets: Array<unknown> = [];
+    let cursor: string | null = null;
+    for (let step = 0; step < maxSteps; step += 1) {
+      const reply = await listWrites({ limit, ...(cursor !== null ? { cursor } : {}) });
+      expect(reply.total_matched).toBe(total);
+      // Guard the walk protocol itself: an undefined next_cursor (a tool
+      // that ignores the cursor) is a shape violation, not a stop condition.
+      expect(reply.next_cursor === null || typeof reply.next_cursor === "string").toBe(true);
+      targets.push(...reply.writes.map((w) => w["target"]));
+      cursor = reply.next_cursor;
+      if (cursor === null) break;
+    }
+    expect(cursor).toBeNull();
+    // Newest first, so a full walk reads the log backwards.
+    expect(targets).toEqual(["Notes/Three.md", "Notes/Two.md", "Notes/One.md"]);
+  });
+
+  test("a page that fits the whole match reports next_cursor null", async () => {
+    await call("brain_create_note", { path: "Notes/One.md", content: "body" });
+    const reply = await listWrites({ limit: 2 });
+    expect(reply.total_matched).toBe(1);
+    expect(reply.next_cursor).toBeNull();
+  });
+
+  test("a malformed cursor is INVALID_PARAMS", async () => {
+    const err = await rejectedMcpError(listWrites({ cursor: "!!!not-base64!!!" }));
+    expect(err.code).toBe(INVALID_PARAMS);
+    expect(err.message).toContain("cursor");
   });
 });
 

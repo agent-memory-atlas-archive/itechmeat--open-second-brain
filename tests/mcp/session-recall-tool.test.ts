@@ -289,6 +289,17 @@ describe("brain_session_grep coverage operation (t_2c2a883c)", () => {
       const refused = await call({ operation: "coverage", char_budget: 100_000, ...extra });
       expect(refused.error?.code).toBe(-32602);
     }
+
+    // The coverage answer is one selection with no walk, so a well-formed
+    // match-operation cursor must be refused by name, not silently
+    // ignored (an ignored cursor would read as a page that happened).
+    const cursor = await call({
+      operation: "coverage",
+      char_budget: 100_000,
+      cursor: "bzow",
+    });
+    expect(cursor.error?.code).toBe(-32602);
+    expect(cursor.error?.message).toContain("cursor is not applicable to operation 'coverage'");
   });
 
   test("entity_key accepts the mined-key length (200) and refuses longer", async () => {
@@ -396,5 +407,157 @@ describe("brain_session_grep coverage operation (t_2c2a883c)", () => {
       session_id: "session-mcp",
     });
     expect("topic_report" in withoutTopics).toBe(false);
+  });
+});
+
+describe("brain_session_grep cursor pagination", () => {
+  test("the input schema declares a described cursor property", () => {
+    const tool = buildToolTable("full").find((t) => t.name === "brain_session_grep")!;
+    const schema = tool.inputSchema as {
+      properties: Record<string, { type?: string; maxLength?: number; description?: string }>;
+    };
+    expect(schema.properties["cursor"]).toMatchObject({ type: "string", maxLength: 32 });
+    expect(schema.properties["cursor"]?.description).toBeTruthy();
+  });
+
+  test("each page's next_cursor leads to the next and the pages reassemble the hits", async () => {
+    const turns: SessionTurn[] = [
+      {
+        turnId: "w1",
+        role: "user",
+        timestamp: "2026-06-01T10:00:01.000Z",
+        text: "walrus fact one",
+      },
+      {
+        turnId: "w2",
+        role: "assistant",
+        timestamp: "2026-06-01T10:00:02.000Z",
+        text: "walrus fact two",
+      },
+      {
+        turnId: "w3",
+        role: "user",
+        timestamp: "2026-06-01T10:00:03.000Z",
+        text: "walrus fact three",
+      },
+    ];
+    importSessionRecall(vault, {
+      sessionId: "session-walk",
+      turns,
+      createdAt: "2026-06-01T10:00:00.000Z",
+    });
+    const server = new MCPServer({ vault, configPath: null });
+    await initialize(server);
+
+    const full = await callOn(server, "brain_session_grep", {
+      query: "walrus",
+      session_id: "session-walk",
+    });
+    const allIds = (full["hits"] as ReadonlyArray<{ id: string }>).map((h) => h.id);
+    expect(allIds.length).toBeGreaterThanOrEqual(3);
+
+    // Bound the walk by the page arithmetic: ceil(total/limit) pages plus one
+    // slack step, so a next_cursor that never turns null (an ignored or
+    // never-exhausting cursor) exhausts the budget and fails here instead of
+    // hanging the suite.
+    const limit = 2;
+    const maxSteps = Math.ceil(allIds.length / limit) + 1;
+    const walked: string[] = [];
+    let cursor: string | null = null;
+    for (let step = 0; step < maxSteps; step += 1) {
+      const page = await callOn(server, "brain_session_grep", {
+        query: "walrus",
+        session_id: "session-walk",
+        limit,
+        ...(cursor !== null ? { cursor } : {}),
+      });
+      expect(page["total"]).toBe(allIds.length);
+      // Guard the walk protocol: an ignored cursor is a shape violation,
+      // not a stop condition.
+      const next = page["next_cursor"];
+      expect(next === null || typeof next === "string").toBe(true);
+      walked.push(...(page["hits"] as ReadonlyArray<{ id: string }>).map((h) => h.id));
+      cursor = next as string | null;
+      if (cursor === null) break;
+    }
+    expect(cursor).toBeNull();
+    expect(walked).toEqual(allIds);
+  });
+
+  test("a malformed cursor is refused as invalid params", async () => {
+    const server = new MCPServer({ vault, configPath: null });
+    await initialize(server);
+    const response = (await server.handleRequest({
+      jsonrpc: JSONRPC_VERSION,
+      id: 30,
+      method: "tools/call",
+      params: {
+        name: "brain_session_grep",
+        arguments: { query: "x", cursor: "!!!" },
+      },
+    })) as { error?: { code: number } };
+    expect(response.error?.code).toBe(-32602);
+  });
+});
+
+describe("brain_session_grep default answer size (M10)", () => {
+  function importNeedleSession(target: string): void {
+    const turns: SessionTurn[] = Array.from({ length: 14 }, (_, i) => ({
+      turnId: `n${i + 1}`,
+      role: i % 2 === 0 ? "user" : "assistant",
+      timestamp: `2026-06-02T10:00:${String((i % 59) + 1).padStart(2, "0")}.000Z`,
+      text: `needle fact ${i + 1}`,
+    }));
+    importSessionRecall(target, {
+      sessionId: "session-needle",
+      turns,
+      createdAt: "2026-06-02T10:00:00.000Z",
+    });
+  }
+
+  test("no limit returns the bounded default page, not every hit", async () => {
+    importNeedleSession(vault);
+    const payload = await callTool("brain_session_grep", {
+      query: "needle",
+      session_id: "session-needle",
+    });
+    // The historical bounded default (DEFAULT_LIMIT in session-recall.ts);
+    // the pagination migration had defaulted the page to the whole set
+    // (the match set spans the raw turns and the summary nodes distilled
+    // from them).
+    expect(payload["total"]).toBeGreaterThan(10);
+    expect((payload["hits"] as ReadonlyArray<unknown>).length).toBe(10);
+    expect(payload["next_cursor"]).not.toBeNull();
+  });
+
+  test("include_raw decorates the page's items and the walk still reassembles", async () => {
+    importNeedleSession(vault);
+    const server = new MCPServer({ vault, configPath: null });
+    await initialize(server);
+    const first = await callOn(server, "brain_session_grep", {
+      query: "needle",
+      session_id: "session-needle",
+      include_raw: true,
+    });
+    const hits = first["hits"] as ReadonlyArray<Record<string, unknown>>;
+    expect(hits.length).toBe(10);
+    for (const hit of hits) {
+      // Every returned hit carries its inlined raw captures (C2) - the
+      // decoration ran for the page, not for the whole match set.
+      expect(hit["raw"]).toBeDefined();
+      expect(hit["extracted"]).toBeDefined();
+    }
+    const cursor = first["next_cursor"];
+    expect(typeof cursor).toBe("string");
+    const second = await callOn(server, "brain_session_grep", {
+      query: "needle",
+      session_id: "session-needle",
+      include_raw: true,
+      cursor,
+    });
+    const rest = second["hits"] as ReadonlyArray<Record<string, unknown>>;
+    expect(hits.length + rest.length).toBe(first["total"] as number);
+    expect(second["next_cursor"]).toBeNull();
+    for (const hit of rest) expect(hit["raw"]).toBeDefined();
   });
 });

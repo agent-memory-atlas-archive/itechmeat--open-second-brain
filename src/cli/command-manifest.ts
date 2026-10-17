@@ -126,6 +126,14 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
       flag("target", "string"),
       flag("apply", "boolean"),
       flag("check", "boolean"),
+      // The consent flag the apply lane takes (t_b6bcd984): without it a
+      // --json/non-TTY apply refuses, so help and completions must offer
+      // the remedy.
+      flag("yes", "boolean"),
+      // Declaring `json` here (the refusal above names it) stops
+      // addInheritedFlagsToCommand appending the inherited stand-in, so
+      // the verb models the flag its own parser takes.
+      flag("json", "boolean"),
       flag("friction", "boolean"),
       flag("base", "string"),
       flag("compare", "string"),
@@ -332,8 +340,20 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
         command("pin", "Pin a preference"),
         command("unpin", "Unpin a preference"),
         command("set-primary", "Set primary Brain agent"),
-        command("protect", "Emit runtime deny rules for Brain"),
-        command("unprotect", "Remove managed runtime deny rules"),
+        command("protect", "Emit runtime deny rules for Brain", [
+          flag("target", "string"),
+          flag("vault", "string"),
+          flag("apply", "boolean"),
+          flag("yes", "boolean"),
+          flag("json", "boolean"),
+        ]),
+        command("unprotect", "Remove managed runtime deny rules", [
+          flag("target", "string"),
+          flag("vault", "string"),
+          flag("apply", "boolean"),
+          flag("yes", "boolean"),
+          flag("json", "boolean"),
+        ]),
         command(
           "snapshot",
           "Inspect Brain snapshots",
@@ -604,7 +624,7 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
         command("panel", "Multi-persona decision panel riding the write-session kernel"),
         command(
           "trigger",
-          "Grounded proactive trigger queue (scan/list/ack/dismiss/act/suppress/unsuppress/history)",
+          "Grounded proactive trigger queue (scan/list/ack/dismiss/act/suppress/unsuppress/snooze/unsnooze/history)",
         ),
         command("deep-synthesis", "Topic dossier: agreements, contradictions, stale claims, gaps"),
         command("ideas", "Ranked next-direction candidates from open loops"),

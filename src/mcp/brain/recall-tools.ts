@@ -67,6 +67,8 @@ import {
 } from "../../core/config.ts";
 import {
   coverageSessionRecall,
+  DEFAULT_LIMIT as SESSION_RECALL_DEFAULT_LIMIT,
+  decorateSessionRecallHits,
   describeSessionRecall,
   expandSessionRecall,
   searchSessionRecall,
@@ -79,6 +81,7 @@ import { aggregateQueryDemand, serializeQueryDemandReport } from "../../core/bra
 import { buildRetrievalPlan, serializeRetrievalPlan } from "../../core/brain/retrieval-plan.ts";
 import { isoSecond } from "../../core/brain/time.ts";
 import { isPayloadRemotelyReadable } from "../../core/brain/payload-inventory.ts";
+import { pageSlice } from "../../core/brain/offset-cursor.ts";
 import {
   DEFAULT_PAYLOAD_PAGE_CHARS,
   PayloadNotFoundError,
@@ -94,6 +97,7 @@ import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { vaultPathField } from "../vault-path-field.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
 import { coercePositiveInteger, optionalStringArg, requiredStringArg } from "./shared.ts";
+import { cursorOffsetArg, CURSOR_SCHEMA } from "./pagination.ts";
 import { AGENT_SCOPE_SCHEMA, coerceAgentScope, unknownOperationError } from "../coerce.ts";
 
 /** Recall-quality benchmark over an inline dataset. */
@@ -991,22 +995,41 @@ async function toolBrainSessionGrep(
     "raw_budget_chars",
     args["raw_budget_chars"],
   );
+  // The matches are a deterministic ranked walk (score, then id), so the
+  // page is cut here over the full hit set: `total` counts every match
+  // across pages and `next_cursor` continues the walk (null when
+  // exhausted). Absent `limit`, the page is the historical bounded
+  // default (DEFAULT_LIMIT in session-recall.ts) - an unpaginated call
+  // used to answer 10 hits, not every hit in the vault.
+  //
+  // The search below NEVER runs with includeRaw: decoration reads the
+  // record set once per hit decorated, so decorating the full match set
+  // on every page made a cursor walk O(N^2). The page is cut first and
+  // only its items are decorated.
+  const offset = cursorOffsetArg("brain_session_grep", args);
+  const sessionIdArg = optionalStringArg("brain_session_grep", args, "session_id");
+  const hits = searchSessionRecall(ctx.vault, {
+    query: requiredStringArg("brain_session_grep", args, "query"),
+    ...withheldAtRemoteReach(ctx),
+    ...(sessionIdArg !== undefined ? { sessionId: sessionIdArg } : {}),
+    limit: Number.MAX_SAFE_INTEGER,
+    ...(snippetChars !== undefined ? { snippetChars } : {}),
+    ...(bounds.sinceMs !== null ? { sinceMs: bounds.sinceMs } : {}),
+    ...(bounds.untilMs !== null ? { untilMs: bounds.untilMs } : {}),
+    ...(rawBudgetChars !== undefined ? { rawBudgetChars } : {}),
+  });
+  const page = pageSlice(hits.hits, offset, limit ?? SESSION_RECALL_DEFAULT_LIMIT);
+  if (!includeRaw) {
+    return { hits: page.items, total: page.total, next_cursor: page.next_cursor };
+  }
   return {
-    ...searchSessionRecall(ctx.vault, {
-      query: requiredStringArg("brain_session_grep", args, "query"),
+    hits: decorateSessionRecallHits(ctx.vault, page.items, {
       ...withheldAtRemoteReach(ctx),
-      ...(optionalStringArg("brain_session_grep", args, "session_id") !== undefined
-        ? {
-            sessionId: optionalStringArg("brain_session_grep", args, "session_id"),
-          }
-        : {}),
-      ...(limit !== undefined ? { limit } : {}),
-      ...(snippetChars !== undefined ? { snippetChars } : {}),
-      ...(bounds.sinceMs !== null ? { sinceMs: bounds.sinceMs } : {}),
-      ...(bounds.untilMs !== null ? { untilMs: bounds.untilMs } : {}),
-      ...(includeRaw ? { includeRaw: true } : {}),
+      ...(sessionIdArg !== undefined ? { sessionId: sessionIdArg } : {}),
       ...(rawBudgetChars !== undefined ? { rawBudgetChars } : {}),
     }),
+    total: page.total,
+    next_cursor: page.next_cursor,
   };
 }
 
@@ -1037,11 +1060,12 @@ function toolBrainSessionGrepCoverage(
     "snippet_chars",
     "include_raw",
     "raw_budget_chars",
+    "cursor",
   ] as const) {
     if (args[inapplicable] !== undefined) {
       throw new MCPError(
         INVALID_PARAMS,
-        `brain_session_grep: ${inapplicable} is not applicable to operation 'coverage'; it sizes or filters the match operation`,
+        `brain_session_grep: ${inapplicable} is not applicable to operation 'coverage'; it pages, sizes or filters the match operation`,
       );
     }
   }
@@ -1640,6 +1664,7 @@ export const RECALL_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           minimum: 1,
           description: "Maximum hits to return (operation=match).",
         },
+        cursor: CURSOR_SCHEMA,
         snippet_chars: {
           type: "integer",
           minimum: 1,

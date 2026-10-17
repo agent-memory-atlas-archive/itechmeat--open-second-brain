@@ -55,6 +55,15 @@ Ask the user which route they want; never pick one for them.
 - **`llm-emulation`**: a generative chat endpoint asked only for
   probabilities. Uncalibrated, costs far more, and meant for `shadow`
   evaluation only. Never suggest it as the default.
+- **Converse gateway** (`converse`): a bearer-authenticated gateway
+  speaking the Bedrock-style Converse protocol. Uncalibrated like
+  `llm-emulation` (the model behind the gateway writes its own
+  probabilities), so `enforce` needs
+  `decision_model_allow_uncalibrated`, and its `converse` threshold
+  profile has no tuned uses yet, so every `enforce` runs as `shadow`
+  until tuned from this route's own shadow data. The base URL, model id
+  and key variable are the user's to set. Never suggest it as the
+  default.
 
 A `compatible` server enforces nothing until
 `decision_model_threshold_profile` names the model family it serves;

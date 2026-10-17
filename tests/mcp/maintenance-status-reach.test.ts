@@ -108,3 +108,58 @@ describe("brain_maintenance status at the caller's reach", () => {
     expect(rendered).not.toContain("capacity_percent");
   });
 });
+
+describe("brain_maintenance status journal cursor pagination", () => {
+  test("the input schema declares a described cursor property", () => {
+    const schema = ADMIN_TOOLS.find((tool) => tool.name === "brain_maintenance")!.inputSchema as {
+      properties: Record<string, { type?: string; maxLength?: number; description?: string }>;
+    };
+    expect(schema.properties["cursor"]).toMatchObject({ type: "string", maxLength: 32 });
+    expect(schema.properties["cursor"]?.description).toBeTruthy();
+  });
+
+  test("the journal walks by cursor to exhaustion", async () => {
+    for (const [index, holder] of ["worker-b", "worker-c", "worker-d"].entries()) {
+      appendJournal(vault, {
+        ts: `2026-10-15T12:0${index + 1}:00Z`,
+        holder,
+        verdict: MAINTENANCE_VERDICT.run,
+      });
+    }
+    const total = 4;
+    const limit = 2;
+    // A server that never ends the walk would hang an unbounded loop;
+    // ceil(total / limit) + 1 is one past the walk's own page count.
+    const maxSteps = Math.ceil(total / limit) + 1;
+    const walked: string[] = [];
+    let cursor: string | null = null;
+    for (let step = 0; step < maxSteps; step++) {
+      const res = (await maintenance(
+        { ...ctx },
+        { operation: "status", limit, ...(cursor !== null ? { cursor } : {}) },
+      )) as Record<string, unknown>;
+      expect(res["journal_total"]).toBe(total);
+      // Guard the walk protocol: an ignored cursor would loop forever.
+      const next = res["next_cursor"];
+      expect(next === null || typeof next === "string").toBe(true);
+      walked.push(
+        ...(res["journal"] as ReadonlyArray<Record<string, unknown>>).map(
+          (entry) => entry["holder"] as string,
+        ),
+      );
+      cursor = next as string | null;
+      if (cursor === null) break;
+    }
+    // The walk ended because the server exhausted the set, not because
+    // the step bound fired.
+    expect(cursor).toBeNull();
+    expect(walked.toSorted()).toEqual(["worker-a", "worker-b", "worker-c", "worker-d"]);
+    expect(new Set(walked).size).toBe(4);
+  });
+
+  test("a malformed cursor is refused as invalid params", async () => {
+    await expect(maintenance({ ...ctx }, { operation: "status", cursor: "!!!" })).rejects.toThrow(
+      /malformed cursor/,
+    );
+  });
+});

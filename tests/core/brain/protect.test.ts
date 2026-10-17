@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -8,6 +17,8 @@ import {
   BrainProtectError,
   buildProtectRules,
   claudeCodeRulePath,
+  computeProtect,
+  computeUnprotect,
   printSnippet,
   PROTECT_SCHEMA_VERSION,
   readManifest,
@@ -16,6 +27,7 @@ import {
   unprotect,
   writeManifest,
 } from "../../../src/core/brain/protect.ts";
+import { IS_WINDOWS } from "../../helpers/platform.ts";
 
 const tmpRoots: string[] = [];
 
@@ -218,6 +230,30 @@ describe("applyProtect claudecode", () => {
     expect(settings.permissions.deny).toContain(`Write(${cc(abs(vault))}/Brain/preferences/**)`);
   });
 
+  test("computeProtect returns before/after without writing (t_b6bcd984)", () => {
+    const vault = mkVault();
+    mkdirSync(join(vault, ".claude"), { recursive: true });
+    const original = '{\n  "theme": "dark"\n}\n';
+    writeFileSync(join(vault, ".claude", "settings.json"), original);
+    const c = computeProtect({ target: "claudecode", vault });
+    expect(c.changed).toBe(true);
+    expect(c.before).toBe(original);
+    // The after-side merges the OSB rules beside the operator's own key.
+    expect(c.after).toContain('"theme": "dark"');
+    expect(c.after).toContain(`Write(${cc(abs(vault))}/Brain/preferences/**)`);
+    // The compute step is a preview: the file on disk is untouched.
+    expect(readFileSync(join(vault, ".claude", "settings.json"), "utf8")).toBe(original);
+  });
+
+  test("computeProtect reports no change when settings already match", () => {
+    const vault = mkVault();
+    applyProtect({ target: "claudecode", vault });
+    const onDisk = readFileSync(join(vault, ".claude", "settings.json"), "utf8");
+    const c = computeProtect({ target: "claudecode", vault });
+    expect(c.changed).toBe(false);
+    expect(c.after).toBe(onDisk);
+  });
+
   test("idempotent: second apply produces byte-identical settings", () => {
     const vault = mkVault();
     applyProtect({ target: "claudecode", vault });
@@ -245,6 +281,20 @@ describe("applyProtect claudecode", () => {
     tmpRoots.push(dir);
     expect(() => applyProtect({ target: "claudecode", vault: dir })).toThrow(BrainProtectError);
   });
+
+  test.skipIf(IS_WINDOWS)(
+    "apply's own .bak backup is exclusive and private 0600 (settings carry secrets)",
+    () => {
+      const vault = mkVault();
+      mkdirSync(join(vault, ".claude"), { recursive: true });
+      writeFileSync(join(vault, ".claude", "settings.json"), '{\n  "theme": "dark"\n}\n');
+      const r = applyProtect({ target: "claudecode", vault });
+      expect(r.changed).toBe(true);
+      expect(r.backupPath).not.toBe("");
+      expect(statSync(r.backupPath).mode & 0o777).toBe(0o600);
+      expect(readFileSync(r.backupPath, "utf8")).toBe('{\n  "theme": "dark"\n}\n');
+    },
+  );
 });
 
 describe("unprotect claudecode", () => {
@@ -265,6 +315,217 @@ describe("unprotect claudecode", () => {
   test("unprotect on absent manifest exits without throwing", () => {
     const vault = mkVault();
     expect(() => unprotect({ target: "claudecode", vault })).not.toThrow();
+  });
+
+  test("backups the settings file before rewriting, exclusive name", () => {
+    const vault = mkVault();
+    mkdirSync(join(vault, ".claude"), { recursive: true });
+    writeFileSync(join(vault, ".claude", "settings.json"), "{}\n");
+    applyProtect({ target: "claudecode", vault });
+    const before = readFileSync(join(vault, ".claude", "settings.json"), "utf8");
+
+    const r = unprotect({ target: "claudecode", vault });
+    expect(r.changed).toBe(true);
+    expect(r.backupPath).not.toBe("");
+    // The backup is the pre-unprotect bytes (rules still in them), taken
+    // before the rewrite under the exclusive stamp name.
+    expect(readFileSync(r.backupPath, "utf8")).toBe(before);
+  });
+
+  test.skipIf(IS_WINDOWS)(
+    "unprotect's backup is private 0600 - settings backups carry secrets",
+    () => {
+      const vault = mkVault();
+      mkdirSync(join(vault, ".claude"), { recursive: true });
+      writeFileSync(join(vault, ".claude", "settings.json"), "{}\n");
+      applyProtect({ target: "claudecode", vault });
+      const r = unprotect({ target: "claudecode", vault });
+      expect(r.changed).toBe(true);
+      // Private 0600: settings backups carry secrets (guarded-host-writes
+      // convention, t_b6bcd984). Windows stat.mode does not carry the
+      // POSIX bits, so the mode is a POSIX-only assertion - the apply
+      // twin above gates the same way.
+      expect(statSync(r.backupPath).mode & 0o777).toBe(0o600);
+    },
+  );
+
+  test("a no-op unprotect takes no backup and reports changed:false", () => {
+    const vault = mkVault();
+    mkdirSync(join(vault, ".claude"), { recursive: true });
+    writeFileSync(join(vault, ".claude", "settings.json"), '{"user": true}\n');
+    const before = readFileSync(join(vault, ".claude", "settings.json"), "utf8");
+    const r = unprotect({ target: "claudecode", vault });
+    expect(r.changed).toBe(false);
+    expect(r.backupPath).toBe("");
+    expect(readFileSync(join(vault, ".claude", "settings.json"), "utf8")).toBe(before);
+  });
+});
+
+describe("computeUnprotect", () => {
+  test("returns before/after without writing (t_b6bcd984 twin, claudecode)", () => {
+    const vault = mkVault();
+    mkdirSync(join(vault, ".claude"), { recursive: true });
+    writeFileSync(join(vault, ".claude", "settings.json"), '{"user": true}\n');
+    applyProtect({ target: "claudecode", vault });
+    const onDisk = readFileSync(join(vault, ".claude", "settings.json"), "utf8");
+
+    const c = computeUnprotect({ target: "claudecode", vault });
+    expect(c.changed).toBe(true);
+    expect(c.before).toBe(onDisk);
+    expect(c.after).toContain('"user": true');
+    expect(c.after).not.toContain("Brain/preferences");
+    // The compute step is a preview: the file on disk is untouched.
+    expect(readFileSync(join(vault, ".claude", "settings.json"), "utf8")).toBe(onDisk);
+    // The preview IS the write: running the unprotect lands `after`.
+    unprotect({ target: "claudecode", vault });
+    expect(readFileSync(join(vault, ".claude", "settings.json"), "utf8")).toBe(c.after);
+  });
+
+  test("reports no change with no manifest and no settings file (claudecode)", () => {
+    const vault = mkVault();
+    const c = computeUnprotect({ target: "claudecode", vault });
+    expect(c.changed).toBe(false);
+    expect(c.after).toBe(c.before);
+    expect(c.before).toBe("");
+    // And the write half agrees: nothing appears on disk.
+    unprotect({ target: "claudecode", vault });
+    expect(existsSync(join(vault, ".claude", "settings.json"))).toBe(false);
+  });
+
+  test("codex: preview matches the write, fence removed on the last vault", () => {
+    const home = mkHome();
+    const vault = mkVault();
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    const userToml = '# user content\nmodel = "gpt-5.5"\n';
+    writeFileSync(join(home, ".codex", "config.toml"), userToml);
+    applyProtect({ target: "codex", vault, __homeOverride: home });
+    const withFence = readFileSync(join(home, ".codex", "config.toml"), "utf8");
+
+    const c = computeUnprotect({ target: "codex", vault, __homeOverride: home });
+    expect(c.changed).toBe(true);
+    expect(c.before).toBe(withFence);
+    expect(c.after).toBe(userToml);
+    expect(readFileSync(join(home, ".codex", "config.toml"), "utf8")).toBe(withFence);
+  });
+});
+
+describe("approved preview pin (t_b6bcd984)", () => {
+  /** The in-vault manifest the lanes read; moved by hand after a preview here. */
+  function manifestEntry(vault: string, target: string): Record<string, unknown> {
+    const path = join(vault, ".open-second-brain", "protect.lock.json");
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as {
+      entries: Array<Record<string, unknown>>;
+    };
+    const entry = parsed.entries.find((e) => e["target"] === target) as Record<string, unknown>;
+    return entry;
+  }
+
+  function rewriteManifest(
+    vault: string,
+    target: string,
+    mutate: (e: Record<string, unknown>) => void,
+  ): void {
+    const path = join(vault, ".open-second-brain", "protect.lock.json");
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as {
+      entries: Array<Record<string, unknown>>;
+    };
+    const entry = parsed.entries.find((e) => e["target"] === target) as Record<string, unknown>;
+    mutate(entry);
+    writeFileSync(path, JSON.stringify(parsed, null, 2) + "\n");
+  }
+
+  function backupCount(dir: string): number {
+    return readdirSync(dir).filter((name) => name.includes(".bak.")).length;
+  }
+
+  test("applyProtect lands exactly the approved preview bytes", () => {
+    const vault = mkVault();
+    mkdirSync(join(vault, ".claude"), { recursive: true });
+    writeFileSync(join(vault, ".claude", "settings.json"), '{\n  "theme": "dark"\n}\n');
+    const c = computeProtect({ target: "claudecode", vault });
+    applyProtect({ target: "claudecode", vault, approved: c });
+    expect(readFileSync(join(vault, ".claude", "settings.json"), "utf8")).toBe(c.after);
+  });
+
+  test("applyProtect refuses when the target moved after the preview (claudecode)", () => {
+    const vault = mkVault();
+    mkdirSync(join(vault, ".claude"), { recursive: true });
+    writeFileSync(join(vault, ".claude", "settings.json"), '{\n  "theme": "dark"\n}\n');
+    const c = computeProtect({ target: "claudecode", vault });
+    // The file moves after the preview was taken; the approved pair no
+    // longer describes reality, so nothing is written and no backup lands.
+    writeFileSync(join(vault, ".claude", "settings.json"), '{\n  "theme": "light"\n}\n');
+    expect(() => applyProtect({ target: "claudecode", vault, approved: c })).toThrow(
+      /moved since the consent preview/,
+    );
+    expect(readFileSync(join(vault, ".claude", "settings.json"), "utf8")).toBe(
+      '{\n  "theme": "light"\n}\n',
+    );
+    expect(backupCount(join(vault, ".claude"))).toBe(0);
+  });
+
+  test("unprotect refuses when the manifest moved after the preview (claudecode)", () => {
+    const vault = mkVault();
+    mkdirSync(join(vault, ".claude"), { recursive: true });
+    const userDeny = "Bash(rm -rf /)";
+    writeFileSync(
+      join(vault, ".claude", "settings.json"),
+      JSON.stringify({ permissions: { deny: [userDeny], allow: [] } }, null, 2) + "\n",
+    );
+    applyProtect({ target: "claudecode", vault });
+    const c = computeUnprotect({ target: "claudecode", vault });
+    // The manifest the removal set is read from changes after the preview:
+    // it now claims the operator's own rule too, so the derived write no
+    // longer matches the approved diff. The pin refuses; nothing moves.
+    rewriteManifest(vault, "claudecode", (e) => {
+      (e["owned_deny"] as string[]).push(userDeny);
+    });
+    // The pre-protect apply already took its own backup; the refused
+    // unprotect must not take another.
+    const backupsBefore = backupCount(join(vault, ".claude"));
+    expect(() => unprotect({ target: "claudecode", vault, approved: c })).toThrow(
+      /moved since the consent preview/,
+    );
+    // The host file keeps the exact bytes the preview showed.
+    expect(readFileSync(join(vault, ".claude", "settings.json"), "utf8")).toBe(c.before);
+    expect(backupCount(join(vault, ".claude"))).toBe(backupsBefore);
+    expect(manifestEntry(vault, "claudecode")).not.toBeNull();
+  });
+
+  test("a no-op approval refuses a target that moved (claudecode)", () => {
+    const vault = mkVault();
+    applyProtect({ target: "claudecode", vault });
+    const c = computeProtect({ target: "claudecode", vault });
+    expect(c.changed).toBe(false);
+    // An edit arrives after the "no changes" preview: applying the old
+    // no-op approval must not silently grow into a real write.
+    writeFileSync(
+      join(vault, ".claude", "settings.json"),
+      JSON.stringify({ theme: "light" }, null, 2) + "\n",
+    );
+    expect(() => applyProtect({ target: "claudecode", vault, approved: c })).toThrow(
+      /moved since the consent preview/,
+    );
+    expect(readFileSync(join(vault, ".claude", "settings.json"), "utf8")).toContain('"theme"');
+  });
+
+  test("codex unprotect refuses when the manifest moved after the preview", () => {
+    const home = mkHome();
+    const vault = mkVault();
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    const userToml = '# user content\nmodel = "gpt-5.5"\n';
+    writeFileSync(join(home, ".codex", "config.toml"), userToml);
+    applyProtect({ target: "codex", vault, __homeOverride: home });
+    const c = computeUnprotect({ target: "codex", vault, __homeOverride: home });
+    rewriteManifest(vault, "codex", (e) => {
+      // Drop one owned path, so the derived fence keeps an entry the
+      // approved preview would have removed.
+      (e["owned_paths"] as string[]).pop();
+    });
+    expect(() => unprotect({ target: "codex", vault, __homeOverride: home, approved: c })).toThrow(
+      /moved since the consent preview/,
+    );
+    expect(readFileSync(join(home, ".codex", "config.toml"), "utf8")).toBe(c.before);
   });
 });
 
@@ -288,6 +549,20 @@ describe("applyProtect codex", () => {
     applyProtect({ target: "codex", vault, __homeOverride: home });
     const second = readFileSync(join(home, ".codex", "config.toml"), "utf8");
     expect(second).toBe(first);
+  });
+
+  test("computeProtect codex returns before/after without writing (t_b6bcd984)", () => {
+    const home = mkHome();
+    const vault = mkVault();
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    const userToml = '# user content\nmodel = "gpt-5.5"\n';
+    writeFileSync(join(home, ".codex", "config.toml"), userToml);
+    const c = computeProtect({ target: "codex", vault, __homeOverride: home });
+    expect(c.changed).toBe(true);
+    expect(c.before).toBe(userToml);
+    expect(c.after).toContain("# >>> open-second-brain managed >>>");
+    expect(c.after.startsWith(userToml)).toBe(true);
+    expect(readFileSync(join(home, ".codex", "config.toml"), "utf8")).toBe(userToml);
   });
 
   test("preserves user content outside the fence", () => {
@@ -338,6 +613,22 @@ describe("applyProtect codex", () => {
     expect(config).toContain(`"${abs(vaultA)}/Brain/preferences/**" = "none"`);
     expect(config).toContain(`"${abs(vaultB)}/Brain/preferences/**" = "none"`);
   });
+
+  test.skipIf(IS_WINDOWS)(
+    "codex apply's own .bak backup is private 0600 too (one backup helper for the lane)",
+    () => {
+      const home = mkHome();
+      const vault = mkVault();
+      mkdirSync(join(home, ".codex"), { recursive: true });
+      const userToml = '# user content\nmodel = "gpt-5.5"\n';
+      writeFileSync(join(home, ".codex", "config.toml"), userToml);
+      const r = applyProtect({ target: "codex", vault, __homeOverride: home });
+      expect(r.changed).toBe(true);
+      expect(r.backupPath).not.toBe("");
+      expect(statSync(r.backupPath).mode & 0o777).toBe(0o600);
+      expect(readFileSync(r.backupPath, "utf8")).toBe(userToml);
+    },
+  );
 });
 
 describe("unprotect codex", () => {

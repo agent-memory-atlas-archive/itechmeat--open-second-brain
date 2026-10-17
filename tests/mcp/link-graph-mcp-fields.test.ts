@@ -368,3 +368,139 @@ describe("brain_unlinked_mentions at remote reach", () => {
     expect(await mentionsAt("remote", "pref-zzsecrettarget")).toEqual([]);
   });
 });
+
+describe("brain_unlinked_mentions cursor pagination", () => {
+  test("the input schema declares a described cursor property", () => {
+    const tool = buildToolTable("full").find((t) => t.name === "brain_unlinked_mentions")!;
+    const schema = tool.inputSchema as {
+      properties: Record<string, { type?: string; maxLength?: number; description?: string }>;
+    };
+    expect(schema.properties["cursor"]).toMatchObject({ type: "string", maxLength: 32 });
+    expect(schema.properties["cursor"]?.description).toBeTruthy();
+  });
+
+  test("each page's next_cursor leads to the next and the pages reassemble every mention", async () => {
+    writePref("pref-target", {
+      kind: "preference",
+      topic: "t",
+      status: "confirmed",
+      principle: "p",
+      title: "Walk Target",
+    });
+    for (const slug of ["pref-w1", "pref-w2", "pref-w3"]) {
+      writePref(
+        slug,
+        { kind: "preference", topic: "w", status: "confirmed", principle: "p" },
+        "Still thinking about Walk Target here.",
+      );
+    }
+    const server = new MCPServer({ vault, configPath });
+    await initialize(server);
+
+    const total = 3;
+    const limit = 2;
+    // A server that never ends the walk would hang an unbounded loop;
+    // ceil(total / limit) + 1 is one past the walk's own page count.
+    const maxSteps = Math.ceil(total / limit) + 1;
+    const sources: string[] = [];
+    let cursor: string | null = null;
+    for (let step = 0; step < maxSteps; step++) {
+      const r = await callTool(server, "brain_unlinked_mentions", {
+        id: "pref-target",
+        limit,
+        ...(cursor !== null ? { cursor } : {}),
+      });
+      const out = JSON.parse(r.result!.content[0]!.text);
+      expect(out["total"]).toBe(total);
+      // Guard the walk protocol: an ignored cursor would loop forever.
+      const next = out["next_cursor"];
+      expect(next === null || typeof next === "string").toBe(true);
+      sources.push(...out["mentions"].map((m: { source: string }) => m["source"]));
+      cursor = next;
+      if (cursor === null) break;
+    }
+    // The walk ended because the server exhausted the set, not because
+    // the step bound fired.
+    expect(cursor).toBeNull();
+    expect(sources.toSorted()).toEqual(["pref-w1", "pref-w2", "pref-w3"]);
+    expect(new Set(sources).size).toBe(3);
+  });
+
+  test("a malformed cursor is refused as invalid params", async () => {
+    const server = new MCPServer({ vault, configPath });
+    await initialize(server);
+    const r = await callTool(server, "brain_unlinked_mentions", {
+      id: "pref-x",
+      cursor: "!!!",
+    });
+    expect((r as { error?: { code: number } }).error?.code).toBe(-32602);
+  });
+
+  test("a page fetch's scan stops at the page's lookahead bound and the walk still reassembles every mention", async () => {
+    writePref("pref-bound-target", {
+      kind: "preference",
+      topic: "t",
+      status: "confirmed",
+      principle: "p",
+      title: "Bound Target",
+    });
+    // Ten sources carrying two mentions each: the true filtered set (20)
+    // sits far past one page's reach, so the answer to page 1 tells
+    // whether the scan walked the whole set (total 20) or stopped at the
+    // page's own reach (the offset + limit + 1 lookahead bound).
+    for (let i = 1; i <= 10; i++) {
+      writePref(
+        `pref-bound-${i}`,
+        { kind: "preference", topic: "b", status: "confirmed", principle: "p" },
+        "Bound Target said once.\nBound Target said twice.",
+      );
+    }
+    const server = new MCPServer({ vault, configPath });
+    await initialize(server);
+
+    const first = JSON.parse(
+      (
+        await callTool(server, "brain_unlinked_mentions", {
+          id: "pref-bound-target",
+          limit: 2,
+        })
+      ).result!.content[0]!.text,
+    );
+    // The scan may stop three mentions in; `total` reports that bound
+    // instead of pretending page 1 paid for the whole walk.
+    expect(first["total"]).toBe(3);
+    expect(first["mentions"]).toHaveLength(2);
+    expect(first["next_cursor"]).not.toBeNull();
+
+    // The bound buys the page, never truncation: walking still
+    // reassembles all twenty mentions, and the exhausted walk's total is
+    // exact. The residual walk is bounded by the whole walk's own page
+    // arithmetic so a never-null cursor fails fast instead of hanging.
+    const totalMentions = 20;
+    const walkLimit = 2;
+    const maxSteps = Math.ceil(totalMentions / walkLimit) + 1;
+    const sources: string[] = first["mentions"].map(
+      (m: { source: string }) => m["source"] as string,
+    );
+    let cursor = first["next_cursor"] as string | null;
+    let lastTotal = first["total"];
+    for (let step = 0; step < maxSteps && cursor !== null; step++) {
+      const out = JSON.parse(
+        (
+          await callTool(server, "brain_unlinked_mentions", {
+            id: "pref-bound-target",
+            limit: walkLimit,
+            cursor,
+          })
+        ).result!.content[0]!.text,
+      );
+      sources.push(...out["mentions"].map((m: { source: string }) => m["source"]));
+      lastTotal = out["total"];
+      cursor = out["next_cursor"];
+    }
+    expect(cursor).toBeNull();
+    expect(lastTotal).toBe(20);
+    expect(sources).toHaveLength(20);
+    expect(new Set(sources).size).toBe(10);
+  });
+});

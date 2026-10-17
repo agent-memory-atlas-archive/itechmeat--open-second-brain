@@ -29,9 +29,11 @@ export const DECISION_MODEL_HOSTED_MAX_STATE_TOKENS = 32_000;
  * `vercel-evaluate` speaks the Vercel AI Gateway's renamed
  * `POST <base>/v1/evaluate` variant; `llm-emulation` asks an
  * OpenAI-compatible chat model for probabilities (uncalibrated, explicit
- * only).
+ * only); `converse` speaks a bearer-authenticated Converse-protocol
+ * (Bedrock-style) gateway's `POST <base>/model/<model_id>/converse`, the
+ * model named in the path.
  */
-export type DecisionModelAdapter = "systemone" | "vercel-evaluate" | "llm-emulation";
+export type DecisionModelAdapter = "systemone" | "vercel-evaluate" | "llm-emulation" | "converse";
 
 /** Most `choice` options the wire format accepts in one question. */
 export const DECISION_MODEL_WIRE_MAX_CHOICE_OPTIONS = 255;
@@ -265,11 +267,93 @@ export const DECISION_MODEL_PRESETS: Readonly<Record<string, DecisionModelPreset
       "the OpenAI-compatible chat endpoint at the configured base URL (a generative model); " +
       "its operator's terms apply",
   },
+  // Calibration decision, recorded: a Converse gateway is chat-shaped -
+  // the answers are generated text in which the model wrote its own
+  // probabilities, exactly the grounds `llm-emulation` is declared
+  // uncalibrated on - and nothing in the Converse protocol implies a
+  // calibrated judgment model behind it, so the route is declared
+  // uncalibrated too. The per-item answer rules are identical on every
+  // route; `enforce` additionally needs
+  // `decision_model_allow_uncalibrated`. The gateway is the operator's,
+  // so the base URL, the pinned model id and the key variable are
+  // configured, and the processor terms are the gateway operator's. The
+  // answers are NOT the hosted Jev 1.13 family's, so the preset does not
+  // borrow `jev-1.13`: it carries its own threshold profile, and nothing
+  // enforces on it until it is tuned from this route's own shadow data -
+  // an `enforce` setting runs as `shadow` until then.
+  converse: {
+    name: "converse",
+    adapter: "converse",
+    // The operator's bearer-authenticated gateway, such as
+    // https://gateway.example.com; requests go to
+    // <base>/model/<model_id>/converse, the model named in the path.
+    baseUrl: null,
+    model: null,
+    envKey: null,
+    maxStateTokens: DECISION_MODEL_HOSTED_MAX_STATE_TOKENS,
+    maxChoiceOptions: DECISION_MODEL_WIRE_MAX_CHOICE_OPTIONS,
+    // A Converse gateway is bearer-authenticated: the key variable is
+    // required on every host, loopback included.
+    keyOptionalOnLoopback: false,
+    // The gateway's pricing is the operator's; a reported usage still feeds
+    // the daily cost gate once a price is configured.
+    inputPriceUsdPerMtok: null,
+    calibrated: false,
+    thresholdProfile: "converse",
+    licence: null,
+    licenceNote: null,
+    processor:
+      "the Converse-protocol gateway at the configured base URL; its operator's terms apply",
+  },
 });
 
 export const DECISION_MODEL_PRESET_NAMES: ReadonlyArray<string> = Object.freeze(
   Object.keys(DECISION_MODEL_PRESETS),
 );
+
+/**
+ * The adapters none of whose presets publish an input price - the
+ * chat-shaped routes (`llm-emulation`, `converse`), where the gateway
+ * fronts an operator-chosen model family, so the repo cannot name a
+ * price and the daily cost gate records nothing for the route's calls
+ * until the operator sets one. Derived from the preset table: an adapter
+ * is here when every preset that speaks it carries
+ * `inputPriceUsdPerMtok: null`, so a new route of the same shape joins
+ * the unpriced-route warning of `check` without a name list to extend. A
+ * family with any published price (`systemone`, `vercel-evaluate`) stays
+ * out: its wire format may report a per-request cost, so an unpriced
+ * preset of it keeps the generic unknown-price warning.
+ */
+export const DECISION_MODEL_UNPRICED_ADAPTERS: ReadonlyArray<DecisionModelAdapter> = Object.freeze(
+  [...new Set(Object.values(DECISION_MODEL_PRESETS).map((preset) => preset.adapter))].filter(
+    (adapter) =>
+      Object.values(DECISION_MODEL_PRESETS)
+        .filter((preset) => preset.adapter === adapter)
+        .every((preset) => preset.inputPriceUsdPerMtok === null),
+  ),
+);
+
+/**
+ * The adapters whose routes are chat-shaped: the answer is generated text
+ * in which the model wrote its own probabilities, so the request bills
+ * output tokens the same way it bills input ones, and the cost is only
+ * known once the operator sets both prices. Derived from the preset table
+ * like {@link DECISION_MODEL_UNPRICED_ADAPTERS}: a route is chat-shaped
+ * exactly when nothing about its wire protocol grounds a calibration
+ * claim, the grounds the table records as `calibrated: false`, so an
+ * adapter is here when every preset that speaks it is declared
+ * uncalibrated. A calibrated route (`systemone`, `vercel-evaluate`)
+ * serves a judgment model family whose published price covers the reply.
+ */
+export const DECISION_MODEL_CHAT_SHAPED_ADAPTERS: ReadonlyArray<DecisionModelAdapter> =
+  Object.freeze(
+    [...new Set(Object.values(DECISION_MODEL_PRESETS).map((preset) => preset.adapter))].filter(
+      (adapter) =>
+        Object.values(DECISION_MODEL_PRESETS)
+          .filter((preset) => preset.adapter === adapter)
+          .every((preset) => preset.calibrated === false),
+    ),
+  );
 
 export function decisionModelPreset(name: string): DecisionModelPreset | null {
   return Object.hasOwn(DECISION_MODEL_PRESETS, name) ? DECISION_MODEL_PRESETS[name]! : null;

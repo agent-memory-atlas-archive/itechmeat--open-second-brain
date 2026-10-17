@@ -22,7 +22,10 @@ import { join } from "node:path";
 
 import { bootstrapBrain } from "../../src/core/brain/init.ts";
 import { atomicWriteFileSync } from "../../src/core/fs-atomic.ts";
-import { DANGLING_SCAN } from "../../src/core/brain/notes/scaffold-stub.ts";
+import {
+  DANGLING_SCAN,
+  DANGLING_SCAN_DEFAULT_LIMIT,
+} from "../../src/core/brain/notes/scaffold-stub.ts";
 import { LIFECYCLE_FILE_TOOLS } from "../../src/mcp/brain/lifecycle-file-tools.ts";
 import { MCPError } from "../../src/mcp/protocol.ts";
 import type { ServerContext, ToolDefinition } from "../../src/mcp/tool-contract.ts";
@@ -118,5 +121,98 @@ describe("write", () => {
 
   test("an unknown action is refused rather than falling back to one that exists", async () => {
     await expect(call({ action: "invent" })).rejects.toBeInstanceOf(MCPError);
+  });
+});
+
+describe("list cursor pagination", () => {
+  test("the input schema declares a described cursor property", () => {
+    const properties = tool.inputSchema.properties as Record<
+      string,
+      { type?: string; maxLength?: number; description?: string }
+    >;
+    expect(properties["cursor"]).toMatchObject({ type: "string", maxLength: 32 });
+    expect(properties["cursor"]?.description).toBeTruthy();
+  });
+
+  test("the targets walk by cursor to exhaustion", async () => {
+    note("One.md", "[[dangling-one]]\n");
+    note("Two.md", "[[dangling-two]]\n");
+    note("Three.md", "[[dangling-three]]\n");
+    const { indexVault, resolveSearchConfig } = await import("../../src/core/search/index.ts");
+    await indexVault(resolveSearchConfig({ vault, configPath: ctx.configPath! }), { force: true });
+
+    // The index knows exactly three dangling targets; bound the walk by that
+    // arithmetic: ceil(total/limit) pages plus one slack step, so a
+    // next_cursor that never turns null exhausts the budget and fails here
+    // instead of hanging the suite.
+    const total = 3;
+    const limit = 2;
+    const maxSteps = Math.ceil(total / limit) + 1;
+    const walked: string[] = [];
+    let cursor: string | null = null;
+    for (let step = 0; step < maxSteps; step += 1) {
+      const res = await call({
+        action: "list",
+        limit,
+        ...(cursor !== null ? { cursor } : {}),
+      });
+      expect(res["state"]).toBe("measured");
+      // Guard the walk protocol: an ignored cursor is a shape violation,
+      // not a stop condition.
+      const next = res["next_cursor"];
+      expect(next === null || typeof next === "string").toBe(true);
+      walked.push(...(res["targets"] as ReadonlyArray<{ target: string }>).map((t) => t.target));
+      cursor = next as string | null;
+      if (cursor === null) break;
+    }
+    expect(cursor).toBeNull();
+    expect(walked.map((t) => t.replace(/^\[\[|\/.*$/g, "")).toSorted()).toEqual([
+      "dangling-one",
+      "dangling-three",
+      "dangling-two",
+    ]);
+    expect(new Set(walked).size).toBe(3);
+  });
+
+  test("a malformed cursor is refused as invalid params", async () => {
+    await expect(call({ action: "list", cursor: "!!!" })).rejects.toThrow(/malformed cursor/);
+  });
+
+  test("limit 0 is an empty page with an exhausted walk, not an internal error", async () => {
+    // The schema admits limit: 0 (minimum: 0, "maximum targets returned"),
+    // and before cursors existed a zero limit answered an empty list. The
+    // offset-cursor helper only takes positive limits, so the pagination
+    // adoption must not turn a schema-valid zero into an unhandled
+    // OffsetCursorError surfacing as INTERNAL_ERROR.
+    note("One.md", "[[dangling-one]]\n");
+    note("Two.md", "[[dangling-two]]\n");
+    const { indexVault, resolveSearchConfig } = await import("../../src/core/search/index.ts");
+    await indexVault(resolveSearchConfig({ vault, configPath: ctx.configPath! }), { force: true });
+
+    const res = await call({ action: "list", limit: 0 });
+    expect(res["state"]).toBe("measured");
+    expect(res["targets"]).toEqual([]);
+    expect(res["total"]).toBe(2);
+    expect(res["next_cursor"]).toBeNull();
+  });
+});
+
+describe("brain_scaffold_stub list default answer size (M10)", () => {
+  test("no limit returns DANGLING_SCAN_DEFAULT_LIMIT targets and issues a cursor", async () => {
+    const extra = 5;
+    for (let i = 1; i <= DANGLING_SCAN_DEFAULT_LIMIT + extra; i++) {
+      note(`N${String(i).padStart(3, "0")}.md`, `[[dangling-${i}]]\n`);
+    }
+    const { indexVault, resolveSearchConfig } = await import("../../src/core/search/index.ts");
+    await indexVault(resolveSearchConfig({ vault, configPath: ctx.configPath! }), { force: true });
+
+    const res = await call({ action: "list" });
+    expect(res["state"]).toBe("measured");
+    // The historical bounded default: an unpaginated list used to answer
+    // 100 targets (DANGLING_SCAN_DEFAULT_LIMIT), not every dangling one -
+    // and the walk only starts when a next_cursor is issued.
+    expect(res["total"]).toBe(DANGLING_SCAN_DEFAULT_LIMIT + extra);
+    expect((res["targets"] as ReadonlyArray<unknown>).length).toBe(DANGLING_SCAN_DEFAULT_LIMIT);
+    expect(res["next_cursor"]).not.toBeNull();
   });
 });

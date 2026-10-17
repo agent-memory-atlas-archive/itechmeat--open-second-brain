@@ -7,9 +7,17 @@
  */
 
 import { describe, expect, test, beforeEach, afterEach, setDefaultTimeout } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, utimesSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  utimesSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
 import { runCli as baseRunCli, type RunCliOptions, type RunResult } from "../helpers/run-cli.ts";
@@ -93,8 +101,51 @@ describe("o2b install --target X (plan-only)", () => {
 });
 
 describe("o2b install --target X --apply", () => {
+  test.skipIf(process.stdin.isTTY)(
+    "the interactive y/N prompt rides stderr, not stdout (upgrade/protect/doctor convention)",
+    async () => {
+      // Reach the interactive branch: fake a TTY on the test process's
+      // stdin for one in-process run. The run's own stdin is NOT a TTY
+      // (this test is skipped when it is), so it sits at EOF:
+      // readSingleLine answers "" at once, the run cancels, and the
+      // adapter never applies - nothing touches any real HOME.
+      //
+      // This is the suite's ONE prompt-consuming test: readSingleLine
+      // answers off the shared process stdin, whose EOF fires once per
+      // bun test process, so every other interactive-ladder assertion
+      // rides here rather than in a second TTY-faked test.
+      const stdin = process.stdin as unknown as { isTTY?: boolean };
+      const saved = stdin.isTTY;
+      Object.defineProperty(stdin, "isTTY", { value: true, configurable: true });
+      try {
+        const r = await baseRunCli(["install", "--target", "gemini-cli", "--apply"], {
+          env: envBase(),
+        });
+        expect(r.returncode).toBe(0);
+        expect(r.stdout).toContain("install cancelled");
+        expect(r.stdout).not.toContain("Proceed? [y/N]");
+        expect(r.stderr).toContain("Proceed? [y/N]");
+        // M15: the consent-time plan renders beside the prompt on
+        // stderr - stdout is the payload stream, and a plan prefixed
+        // there corrupted e.g. `generic --out -` - and its header no
+        // longer says dry-run while asking for apply consent.
+        expect(r.stdout).not.toContain("dry-run");
+        expect(r.stdout).not.toContain("— plan");
+        expect(r.stderr).toContain("— plan");
+        expect(r.stderr).toContain("nothing written until you confirm");
+        expect(r.stderr).not.toContain("dry-run");
+        expect(existsSync(join(home, ".gemini", "settings.json"))).toBe(false);
+      } finally {
+        Object.defineProperty(stdin, "isTTY", { value: saved, configurable: true });
+      }
+    },
+    5000,
+  );
+
   test("writes the cursor config file", async () => {
-    const r = await runCli(["install", "--target", "cursor", "--apply"], { env: envBase() });
+    const r = await runCli(["install", "--target", "cursor", "--apply", "--yes"], {
+      env: envBase(),
+    });
     expect(r.returncode).toBe(0);
     const cfgPath = join(home, ".cursor", "mcp.json");
     expect(existsSync(cfgPath)).toBe(true);
@@ -104,7 +155,7 @@ describe("o2b install --target X --apply", () => {
   });
 
   test("user hand-edit + re-apply without --force exits 4", async () => {
-    await runCli(["install", "--target", "cursor", "--apply"], { env: envBase() });
+    await runCli(["install", "--target", "cursor", "--apply", "--yes"], { env: envBase() });
     const cfgPath = join(home, ".cursor", "mcp.json");
     const before = JSON.parse(readFileSync(cfgPath, "utf8"));
     before.mcpServers["open-second-brain"] = { command: "TAMPERED", args: [] };
@@ -113,27 +164,112 @@ describe("o2b install --target X --apply", () => {
     const future = new Date(Date.now() + 3600 * 1000);
     utimesSync(cfgPath, future, future);
 
-    const r = await runCli(["install", "--target", "cursor", "--apply"], { env: envBase() });
+    const r = await runCli(["install", "--target", "cursor", "--apply", "--yes"], {
+      env: envBase(),
+    });
     expect(r.returncode).toBe(4);
     expect(r.stderr).toContain("hand-edited");
+  });
+
+  test(
+    "--apply in --json/non-TTY without --yes exits non-zero, names --yes, " +
+      "and leaves ~/.gemini/settings.json byte-identical",
+    async () => {
+      const cfgPath = join(home, ".gemini", "settings.json");
+      // A pre-existing file with operator content must survive untouched.
+      const original = '{\n  "theme": "dark"\n}\n';
+      mkdirSync(dirname(cfgPath), { recursive: true });
+      writeFileSync(cfgPath, original);
+
+      // Both non-interactive shapes refuse: an explicit --json call and a
+      // bare call whose stdin is not a TTY (subprocess spawns never get one).
+      // M4: the --json refusal is a JSON envelope on stdout carrying the
+      // reserved `headless-refused` verdict, not bare stderr prose.
+      const jsonRun = await runCli(["install", "--target", "gemini-cli", "--apply", "--json"], {
+        env: envBase(),
+      });
+      expect(jsonRun.returncode).toBe(INSTALL_EXIT.consentRefused);
+      const envelope = JSON.parse(jsonRun.stdout) as Record<string, unknown>;
+      expect(envelope["consent"]).toBe("headless-refused");
+      expect(envelope["written"]).toBe(false);
+      expect(String(envelope["error"])).toContain("--yes");
+      expect(readFileSync(cfgPath, "utf8")).toBe(original);
+
+      const ttylessRun = await runCli(["install", "--target", "gemini-cli", "--apply"], {
+        env: envBase(),
+      });
+      expect(ttylessRun.returncode).toBe(INSTALL_EXIT.consentRefused);
+      expect(ttylessRun.stderr).toContain("--yes");
+      // Nothing was written: the operator's file is byte-identical.
+      expect(readFileSync(cfgPath, "utf8")).toBe(original);
+    },
+  );
+
+  test("--apply --yes writes and the apply JSON carries the consent verdict", async () => {
+    const r = await runCli(["install", "--target", "gemini-cli", "--apply", "--yes", "--json"], {
+      env: envBase(),
+    });
+    expect(r.returncode).toBe(0);
+    expect(existsSync(join(home, ".gemini", "settings.json"))).toBe(true);
+    const payload = JSON.parse(r.stdout) as Record<string, unknown>;
+    // M3: the verdict is derived from what happened (a --yes consent),
+    // in the one vocabulary every guarded lane records.
+    expect(payload["consent"]).toBe("yes-flag");
+  });
+
+  test("--plan prints a unified diff of the settings file", async () => {
+    const cfgPath = join(home, ".gemini", "settings.json");
+    mkdirSync(dirname(cfgPath), { recursive: true });
+    writeFileSync(cfgPath, '{\n  "theme": "dark"\n}\n');
+    const r = await runCli(["install", "--target", "gemini-cli"], { env: envBase() });
+    expect(r.returncode).toBe(0);
+    expect(r.stdout).toContain("---");
+    expect(r.stdout).toContain("+++");
+    expect(r.stdout).toContain("+ ");
+    // The operator's own key survives in the merged preview.
+    expect(r.stdout).toContain("theme");
+  });
+
+  test("a consent refusal keeps its own exit code, distinct from usage and drift", () => {
+    expect(INSTALL_EXIT.consentRefused).toBe(6);
+    const codes = Object.values(INSTALL_EXIT);
+    expect(new Set(codes).size).toBe(codes.length);
   });
 });
 
 describe("o2b install --target generic", () => {
   test("--out <path> writes the JSON payload to that path", async () => {
     const outPath = join(home, "snippet.json");
-    const r = await runCli(["install", "--target", "generic", "--apply", "--out", outPath], {
-      env: envBase(),
-    });
+    const r = await runCli(
+      ["install", "--target", "generic", "--apply", "--yes", "--out", outPath],
+      {
+        env: envBase(),
+      },
+    );
     expect(r.returncode).toBe(0);
     expect(existsSync(outPath)).toBe(true);
     const parsed = JSON.parse(readFileSync(outPath, "utf8"));
     expect(parsed.mcpServers["open-second-brain"]).toBeDefined();
   });
 
+  test("--out - with --yes writes the snippet first on stdout, no plan header (M15)", async () => {
+    // Non-TTY with --yes: no prompt, so the run needs no interactive
+    // stdin - and the payload pin holds without one. The apply consent
+    // was given, so nothing may prefix the snippet on stdout (the
+    // plain-text receipt after it is the apply close's own channel).
+    const r = await runCli(["install", "--target", "generic", "--apply", "--yes", "--out", "-"], {
+      env: envBase(),
+    });
+    expect(r.returncode).toBe(0);
+    expect(r.stdout.startsWith("{")).toBe(true);
+    expect(r.stdout).not.toContain("dry-run");
+    expect(r.stdout).not.toContain("— plan");
+    expect(r.stdout).toContain('"open-second-brain"');
+  });
+
   test("--format yaml emits YAML to stdout", async () => {
     const r = await runCli(
-      ["install", "--target", "generic", "--apply", "--out", "-", "--format", "yaml"],
+      ["install", "--target", "generic", "--apply", "--yes", "--out", "-", "--format", "yaml"],
       { env: envBase() },
     );
     expect(r.returncode).toBe(0);
@@ -149,7 +285,7 @@ describe("o2b install --check", () => {
   });
 
   test("after install --apply, reports ok and exits 0", async () => {
-    await runCli(["install", "--target", "cursor", "--apply"], { env: envBase() });
+    await runCli(["install", "--target", "cursor", "--apply", "--yes"], { env: envBase() });
     const r = await runCli(["install", "--check", "--target", "cursor"], { env: envBase() });
     expect(r.returncode).toBe(0);
     expect(r.stdout).toContain("ok");
@@ -167,7 +303,7 @@ describe("o2b install --check", () => {
   });
 
   test("after partial-key drift, exits 3", async () => {
-    await runCli(["install", "--target", "cursor", "--apply"], { env: envBase() });
+    await runCli(["install", "--target", "cursor", "--apply", "--yes"], { env: envBase() });
     const cfgPath = join(home, ".cursor", "mcp.json");
     const parsed = JSON.parse(readFileSync(cfgPath, "utf8"));
     delete parsed.mcpServers["open-second-brain-writer"];
@@ -178,7 +314,7 @@ describe("o2b install --check", () => {
   });
 
   test("after canonical payload drift, exits 3", async () => {
-    await runCli(["install", "--target", "cursor", "--apply"], { env: envBase() });
+    await runCli(["install", "--target", "cursor", "--apply", "--yes"], { env: envBase() });
     const cfgPath = join(home, ".cursor", "mcp.json");
     const parsed = JSON.parse(readFileSync(cfgPath, "utf8"));
     parsed.mcpServers["open-second-brain"].command = "TAMPERED";
@@ -227,7 +363,7 @@ describe("o2b install --check exit codes distinguish the verify states", () => {
 
 describe("o2b uninstall --target X", () => {
   test("dry-run prints what would be removed but does nothing", async () => {
-    await runCli(["install", "--target", "cursor", "--apply"], { env: envBase() });
+    await runCli(["install", "--target", "cursor", "--apply", "--yes"], { env: envBase() });
     const r = await runCli(["uninstall", "--target", "cursor"], { env: envBase() });
     expect(r.returncode).toBe(0);
     expect(r.stdout).toContain("dry-run");
@@ -237,7 +373,7 @@ describe("o2b uninstall --target X", () => {
   });
 
   test("--apply removes OSB keys", async () => {
-    await runCli(["install", "--target", "cursor", "--apply"], { env: envBase() });
+    await runCli(["install", "--target", "cursor", "--apply", "--yes"], { env: envBase() });
     const r = await runCli(["uninstall", "--target", "cursor", "--apply"], { env: envBase() });
     expect(r.returncode).toBe(0);
     const parsed = JSON.parse(readFileSync(join(home, ".cursor", "mcp.json"), "utf8"));

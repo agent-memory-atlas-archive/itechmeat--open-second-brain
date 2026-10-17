@@ -30,12 +30,14 @@ import {
   type NoteLifecycleResult,
 } from "../../core/brain/notes/lifecycle.ts";
 import {
+  DANGLING_SCAN_DEFAULT_LIMIT,
   listDanglingTargets,
   scaffoldStub,
   ScaffoldStubError,
 } from "../../core/brain/notes/scaffold-stub.ts";
 import { CountGuardError } from "../../core/brain/count-guard.ts";
 import { gatedOwnerScopeView } from "../../core/brain/owner-scope-view.ts";
+import { pageSlice } from "../../core/brain/offset-cursor.ts";
 import {
   CreateNoteError,
   CREATE_NOTE_IF_EXISTS,
@@ -48,6 +50,7 @@ import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { coerceBoolOptional, coerceStr, unknownOperationError } from "../coerce.ts";
 import { coerceNonNegativeInteger, readCountGuardArgs } from "./shared.ts";
 import { readableAtContextReach, readableAtContextReachOrUndefined } from "./reach-readable.ts";
+import { cursorOffsetArg, CURSOR_SCHEMA } from "./pagination.ts";
 
 const TOOL = "brain_note_lifecycle";
 
@@ -213,7 +216,7 @@ export function isStubScaffoldAction(value: unknown): value is StubScaffoldActio
  */
 const STUB_ACTION_ARGUMENTS: Readonly<Record<StubScaffoldAction, ReadonlyArray<string>>> =
   Object.freeze({
-    [STUB_SCAFFOLD_ACTION.list]: Object.freeze(["limit"]),
+    [STUB_SCAFFOLD_ACTION.list]: Object.freeze(["limit", "cursor"]),
     [STUB_SCAFFOLD_ACTION.write]: Object.freeze([
       "target",
       "path",
@@ -274,23 +277,42 @@ async function toolBrainScaffoldStub(
 
   if (action === STUB_SCAFFOLD_ACTION.list) {
     const limit = coerceNonNegativeInteger(STUB_TOOL, "limit", args["limit"]);
+    const offset = cursorOffsetArg(STUB_TOOL, args);
     // `sources` are vault-relative document paths and `target` is the
     // link spelling, so an unscoped listing published both for a note
     // this caller may not read (a-label-is-not-a-boundary, U3).
     // A source the caller may not read at its reach is dropped like one
-    // outside its owner scope.
+    // outside its owner scope. The full filtered set is read (the scan's
+    // own cap applied wide) and one page is cut here, so `total` counts
+    // every dangling target across pages and `next_cursor` continues
+    // the walk (null when exhausted).
     const readable = readableAtContextReachOrUndefined(ctx);
     const scan = await listDanglingTargets(ctx.vault, {
-      ...(limit !== undefined ? { limit } : {}),
+      limit: Number.MAX_SAFE_INTEGER,
       ownerScope: gatedOwnerScopeView(ctx.vault, ctx.agentName).scope,
       ...(readable !== undefined ? { readable } : {}),
     });
+    // The schema admits `limit: 0` and the pre-cursor surface answered it
+    // with an empty list, so a schema-valid zero keeps that meaning: an
+    // empty page with the walk already exhausted. `pageSlice` only takes
+    // a positive limit, and letting its OffsetCursorError escape would
+    // surface as INTERNAL_ERROR - an internal failure for a request the
+    // schema calls well-formed. Absent `limit`, the page is the scan's
+    // own historical default (DANGLING_SCAN_DEFAULT_LIMIT) - an
+    // unpaginated list used to answer 100 targets and reach a cursor,
+    // not every dangling target in one unbounded answer.
+    const page =
+      limit === 0
+        ? { items: [], total: scan.targets.length, next_cursor: null as string | null }
+        : pageSlice(scan.targets, offset, limit ?? DANGLING_SCAN_DEFAULT_LIMIT);
     return {
       action,
       state: scan.state,
-      targets: scan.targets.map((t) => ({ target: t.target, sources: [...t.sources] })),
+      total: page.total,
+      targets: page.items.map((t) => ({ target: t.target, sources: [...t.sources] })),
       detail: scan.detail,
       next_command: scan.nextCommand,
+      next_cursor: page.next_cursor,
     };
   }
 
@@ -442,6 +464,7 @@ export const LIFECYCLE_FILE_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze
           minimum: 0,
           description: "list: maximum targets returned.",
         },
+        cursor: CURSOR_SCHEMA,
       },
       required: ["action"],
       additionalProperties: false,

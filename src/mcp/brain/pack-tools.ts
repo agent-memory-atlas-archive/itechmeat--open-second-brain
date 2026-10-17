@@ -73,6 +73,8 @@ import {
 import { extractPreCompactRecords } from "../../core/brain/pre-compact-extract.ts";
 import { EventTraceSelectorError, resolveLogEventTraces } from "../../core/brain/event-trace.ts";
 import { gatedOwnerScopeView, ownerScopeView } from "../../core/brain/owner-scope-view.ts";
+import { pageSlice } from "../../core/brain/offset-cursor.ts";
+import { cursorOffsetArg, CURSOR_SCHEMA } from "./pagination.ts";
 import { resolveOwnerScopeDelivery } from "../../core/brain/preferences-collect.ts";
 import { BRAIN_LOG_EVENT_KIND_SET, type BrainLogEventKind } from "../../core/brain/types.ts";
 import { INTERNAL_ERROR, INVALID_PARAMS, MCPError } from "../protocol.ts";
@@ -507,21 +509,26 @@ async function toolBrainContextReceipts(
     const host = optionalStringArg("brain_context_receipts", args, "host");
     const sessionId = optionalStringArg("brain_context_receipts", args, "session_id");
     const limit = coercePositiveInteger("brain_context_receipts", "limit", args["limit"]);
+    const offset = cursorOffsetArg("brain_context_receipts", args);
     const local = contextReach(ctx) === TRANSPORT_REACH.local;
+    // The full filtered set is read and one page is cut here, so `total`
+    // stays the exact count matching the filter across all pages and the
+    // walk continues through `next_cursor` (null when exhausted).
     const receipts = listContextReceipts(ctx.vault, {
       ...(trigger !== undefined ? { trigger } : {}),
       ...(host !== undefined ? { host } : {}),
       ...(sessionId !== undefined ? { sessionId } : {}),
-      ...(limit !== undefined ? { limit } : {}),
       ...(local ? {} : { exclude: isRuleOnlyInjection }),
     });
     const summaries = receipts
       .map((receipt) => receiptAtReach(receipt, local))
       .map(summarizeContextReceipt);
+    const page = pageSlice(summaries, offset, limit ?? Math.max(summaries.length, 1));
     return {
       vault_path: vaultPathField(ctx),
-      total: summaries.length,
-      receipts: summaries,
+      total: page.total,
+      receipts: page.items,
+      next_cursor: page.next_cursor,
     };
   }
 
@@ -798,16 +805,31 @@ async function toolBrainEventTrace(
   const at = optionalStringArg("brain_event_trace", args, "at");
   const sessionId = optionalStringArg("brain_event_trace", args, "session_id");
   const limit = coercePositiveInteger("brain_event_trace", "limit", args["limit"]);
+  const offset = cursorOffsetArg("brain_event_trace", args);
   const keepPrivate = coerceBool(args, "keep_private");
 
   let events;
   try {
+    // The scan early-exits one event past the page's reach
+    // (`offset + limit + 1`, evaluated by the core before the
+    // trace-attachment work): the lookahead proves whether a next page
+    // exists, so `next_cursor` never lies and the full day's matching
+    // set stays reachable by walking, while one page fetch never re-runs
+    // the attachment scan past its own reach. (The cursor rollout
+    // dropped the caller cap that bounded this scan, making every page
+    // fetch attach traces for the whole day - a quadratic walk under
+    // forged cursors; the bound restores the early exit without
+    // reintroducing silent truncation.) `total`/`trace_total` are exact
+    // once the walk exhausts; before that they report the bound the
+    // page reached. A limit-less call still reads the day whole: its
+    // page is the answer, not a step of a walk.
+    const scanBound = limit !== undefined ? offset + limit + 1 : undefined;
     events = resolveLogEventTraces(ctx.vault, {
       ...(date !== undefined ? { date } : {}),
       ...(at !== undefined ? { at } : {}),
       ...(kind !== undefined ? { kind: kind as BrainLogEventKind } : {}),
       ...(sessionId !== undefined ? { sessionId } : {}),
-      ...(limit !== undefined ? { limit } : {}),
+      ...(scanBound !== undefined ? { limit: scanBound } : {}),
       ...(keepPrivate === true ? { keepPrivate: true } : {}),
       // The event body is echoed verbatim and log payloads carry
       // artifact paths (a-label-is-not-a-boundary, U3).
@@ -828,11 +850,13 @@ async function toolBrainEventTrace(
     throw new MCPError(INTERNAL_ERROR, `brain_event_trace: ${(err as Error).message}`);
   }
 
+  const page = pageSlice(events, offset, limit ?? Math.max(events.length, 1));
   return {
     vault_path: vaultPathField(ctx),
-    total: events.length,
+    total: page.total,
     trace_total: events.reduce((sum, e) => sum + e.traceCount, 0),
-    events,
+    events: page.items,
+    next_cursor: page.next_cursor,
   };
 }
 
@@ -1257,6 +1281,7 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           description:
             "Maximum summaries to return (list) or item rows to return (summary; `distinct_items` still reports the full count).",
         },
+        cursor: CURSOR_SCHEMA,
       },
       required: ["operation"],
       additionalProperties: false,
@@ -1266,7 +1291,7 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: "brain_event_trace",
     description:
-      "Join logged Brain events to the continuity records (recall telemetry, context receipts, generation reports) attached to them by shared correlation ids (session_id, turn_id, artifact refs) — the integrated 'why did the agent do this?' reader. Defaults to today's log. Read-only.",
+      "Join logged Brain events to their attached continuity records (recall telemetry, context receipts, generation reports) by shared correlation ids. Defaults to today. `total`/`trace_total` are exact once the walk exhausts; mid-walk they report the page's scan bound, never a silent cap. Read-only.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1294,6 +1319,7 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           minimum: 1,
           description: "Optional maximum number of events to return.",
         },
+        cursor: CURSOR_SCHEMA,
         keep_private: {
           type: "boolean",
           description: "Keep continuity records flagged private (default: drop them).",

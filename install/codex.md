@@ -45,7 +45,7 @@ o2b brain init --vault /path/to/vault
 
 ```bash
 o2b install --target codex --vault /path/to/vault
-o2b install --target codex --vault /path/to/vault --apply
+o2b install --target codex --vault /path/to/vault --apply --yes
 ```
 
 The first command plans and writes nothing; the second applies. With the
@@ -113,7 +113,7 @@ The bundled `hooks/hooks.json` registers a `PostToolUse` hook
 ## Machine-enforce write protection (optional)
 
 ```bash
-o2b brain protect --target codex --vault /path/to/vault --apply
+o2b brain protect --target codex --vault /path/to/vault --apply --yes
 o2b brain unprotect --target codex --vault /path/to/vault
 ```
 

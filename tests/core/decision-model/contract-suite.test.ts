@@ -1,7 +1,7 @@
 /**
  * One contract suite, run against every decision-model adapter
- * (`systemone`, `vercel-evaluate`, `llm-emulation`) through the loopback
- * fake server (issue #213, Part 7).
+ * (`systemone`, `vercel-evaluate`, `llm-emulation`, `converse`) through
+ * the loopback fake server (issue #213, Part 7).
  *
  * Each fixture is written once in adapter-neutral terms and encoded into
  * each route's own reply format, so the same judgment must come out of
@@ -220,6 +220,40 @@ const ROUTES: ReadonlyArray<Route> = [
     }),
     errorBody: { error: { message: BODY_CANARY, type: "invalid_request_error" } },
     requestsOn422: 2,
+  },
+  {
+    adapter: "converse",
+    // The Converse protocol names the model in the path, and the shared
+    // config below pins `fake-model-1`.
+    path: "/model/fake-model-1/converse",
+    // A generative model behind the gateway writes its own probabilities:
+    // uncalibrated, like llm-emulation.
+    calibrated: false,
+    // A Converse gateway answers with generated text carrying the same
+    // answer JSON a decision server returns, wrapped in the Bedrock-style
+    // reply shape: `output.message.content` text blocks, a `stopReason`,
+    // camelCase usage, `metrics`.
+    encode: (answers) => ({
+      output: {
+        message: {
+          role: "assistant",
+          content: [
+            {
+              text: JSON.stringify(
+                Object.fromEntries(
+                  Object.entries(answers).map(([id, a]) => [id, systemoneItem(a)]),
+                ),
+              ),
+            },
+          ],
+        },
+      },
+      stopReason: "end_turn",
+      usage: { inputTokens: 40, outputTokens: 3 },
+      metrics: { latencyMs: 12 },
+    }),
+    errorBody: { __type: "ValidationException", message: BODY_CANARY },
+    requestsOn422: 1,
   },
 ];
 

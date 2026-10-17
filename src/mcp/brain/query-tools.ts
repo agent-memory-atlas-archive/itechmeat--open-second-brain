@@ -71,6 +71,8 @@ import { normalizeAgentScope } from "../../core/graph/agent-scope.ts";
 import { isPreferenceVisible } from "../../core/brain/owner-scoped-facts.ts";
 import { reachView } from "../../core/brain/reach-view.ts";
 import { logEntriesAtReach, recordRefs } from "../../core/brain/log-events-at-reach.ts";
+import { pageSlice } from "../../core/brain/offset-cursor.ts";
+import { cursorOffsetArg, CURSOR_SCHEMA } from "./pagination.ts";
 
 /** Accepted `at` forms, named in every refusal so the exit is actionable. */
 const AS_OF_FORMS = "an ISO-8601 instant or YYYY-MM-DD date";
@@ -295,7 +297,12 @@ async function toolBrainAgentQuery(
   // provenance view reads the same preference and retired pages the
   // delivery surfaces do, so it honours the same ownership rule.
   const ownerScope = coerceAgentScope(ctx, args, false);
-  return queryAgentSources(ctx.vault, {
+  const limit = coerceInt(args, "limit", 50, 1, 500);
+  const offset = cursorOffsetArg("brain_agent_query", args);
+  // Cursor paging is cut at this layer: the core query slices from the
+  // first match, so the full matched set is fetched (the collection pass
+  // already reads every page) and one offset window is taken here.
+  const full = queryAgentSources(ctx.vault, {
     agents: coerceStrList(args, "agents"),
     ...(topic !== null ? { topic } : {}),
     ...(query !== null ? { query } : {}),
@@ -305,8 +312,25 @@ async function toolBrainAgentQuery(
     // the page's digest and size: a page the caller may not read at its
     // reach is withheld exactly as an absent one.
     view: reachView(ctx.vault, contextReach(ctx)),
-    limit: coerceInt(args, "limit", 50, 1, 500),
-  }) as unknown as Record<string, unknown>;
+    limit: Number.MAX_SAFE_INTEGER,
+  });
+  const page = pageSlice(full.contributions, offset, limit);
+  return {
+    mode: full.mode,
+    // `filters.limit` echoes the PAGE size the caller asked for, not the
+    // internal fetch-all width the core query ran at.
+    filters: { ...full.filters, limit },
+    available_agents: full.available_agents,
+    unknown_agents: full.unknown_agents,
+    total_matched: full.total_matched,
+    returned: page.items.length,
+    contributions: page.items,
+    // The core already computed the summary over the WHOLE matched set
+    // (the fetch-all above), so it does not move between pages - the
+    // same whole-set semantics the sibling `brain_agent_diff` keeps.
+    summary: full.summary,
+    next_cursor: page.next_cursor,
+  };
 }
 
 /**
@@ -359,6 +383,7 @@ async function toolBrainWrites(
   const since = coerceStr(args, "since", false);
   const until = coerceStr(args, "until", false);
   const limit = coerceInt(args, "limit", BRAIN_WRITES_DEFAULT_LIMIT, 1, BRAIN_WRITES_MAX_LIMIT);
+  const offset = cursorOffsetArg("brain_writes", args);
 
   const result = listNoteWrites(ctx.vault, {
     ...(agent !== null ? { agent } : {}),
@@ -379,17 +404,19 @@ async function toolBrainWrites(
     : result.writes.filter((w) => view.visible(w.target));
   // `total_matched` beside `returned` so a truncated answer is legible as
   // one: a list capped at the limit and a list that IS the whole history
-  // are otherwise the same shape.
+  // are otherwise the same shape. `next_cursor` continues the walk.
+  const page = pageSlice(writes, offset, limit);
   return {
     action: BRAIN_WRITES_ACTION.list,
-    total_matched: writes.length,
-    returned: Math.min(writes.length, limit),
-    writes: writes.slice(0, limit).map((w) => ({ ...w })),
+    total_matched: page.total,
+    returned: page.items.length,
+    writes: page.items.map((w) => ({ ...w })),
     warnings: result.warnings.map((w) => ({
       path: w.path,
       line: w.lineNumber,
       message: w.message,
     })),
+    next_cursor: page.next_cursor,
   };
 }
 
@@ -473,7 +500,15 @@ async function toolBrainAgentDiff(
   // identity, which is `null` unless the operator set
   // `integrity.owner_scope_delivery: fail` (a-label-is-not-a-boundary, U3).
   const ownerScope = gatedOwnerScopeView(ctx.vault, ctx.agentName).scope;
-  return diffAgentSources(ctx.vault, {
+  const limit = coerceInt(args, "limit", 50, 1, 500);
+  const offset = cursorOffsetArg("brain_agent_diff", args);
+  // Like `brain_agent_query`, the page is cut at this layer: the core
+  // fold slices from the first match, so the full matched set is fetched
+  // and one offset window is taken. The aggregates (per-agent rollup,
+  // topic map, shared/unique topics) are computed over the whole matched
+  // set, so they do not move between pages: the limit bounds the
+  // returned contributions and the paging, never the comparison.
+  const result = diffAgentSources(ctx.vault, {
     ...(mode !== null ? { mode } : {}),
     ...(ownerScope !== null ? { ownerScope } : {}),
     view: reachView(ctx.vault, contextReach(ctx)),
@@ -481,8 +516,24 @@ async function toolBrainAgentDiff(
     ...(topic !== null ? { topic } : {}),
     ...(query !== null ? { query } : {}),
     ...(kind !== null ? { kind } : {}),
-    limit: coerceInt(args, "limit", 50, 1, 500),
-  }) as unknown as Record<string, unknown>;
+    limit: Number.MAX_SAFE_INTEGER,
+  });
+  const page = pageSlice(result.contributions, offset, limit);
+  return {
+    mode: result.mode,
+    diff_mode: result.diff_mode,
+    agents: result.agents,
+    unknown_agents: result.unknown_agents,
+    per_agent: result.per_agent,
+    shared_topics: result.shared_topics,
+    unique_topics: result.unique_topics,
+    topic_map: result.topic_map,
+    total_matched: result.total_matched,
+    returned: page.items.length,
+    contributions: page.items,
+    summary: result.summary,
+    next_cursor: page.next_cursor,
+  };
 }
 
 function coerceAgentContributionKind(
@@ -610,6 +661,11 @@ async function toolBrainSources(
   };
 }
 
+// ----- brain_unlinked_mentions ------------------------------------------------
+
+/** Page size when no `limit` is sent: the core scanner's own default. */
+const UNLINKED_MENTIONS_DEFAULT_LIMIT = 100;
+
 /**
  * Raw-text mentions of a target's title / aliases that are NOT
  * already inside `[[...]]` wikilinks. Read-only walker over
@@ -625,6 +681,7 @@ async function toolBrainUnlinkedMentions(
     throw new MCPError(INVALID_PARAMS, "brain_unlinked_mentions: id must be a non-empty string");
   }
   const targetId = normaliseWikilinkTarget(idRaw);
+  const offset = cursorOffsetArg("brain_unlinked_mentions", args);
   // Limit coercion mirrors the v0.10.16 `brain_operator_summary`
   // precedent: accept either a number or a strict integer-literal
   // string (`"5"` ok; `"abc"`, `"3abc"`, `"2.5"` rejected). This
@@ -665,20 +722,34 @@ async function toolBrainUnlinkedMentions(
   }
   // `context` is the source artifact's own line of prose, so an
   // unscoped scan republished an owner-private body (U3, recon C3).
+  // The scanner early-exits one mention past the page's reach
+  // (`offset + limit + 1`): the lookahead proves whether a next page
+  // exists, so `next_cursor` never lies and the full visible set stays
+  // reachable by walking, while one page fetch never rescans the
+  // directory walk past its own reach. (The cursor rollout replaced the
+  // scanner's caller cap with `MAX_SAFE_INTEGER`, which made every page
+  // fetch re-walk every preference and retired file - a quadratic walk
+  // under forged cursors; the bound restores the early exit without
+  // reintroducing silent truncation.) `total` is exact once the walk
+  // exhausts; before that it reports the bound the page reached.
+  const pageSize = limit ?? UNLINKED_MENTIONS_DEFAULT_LIMIT;
   const mentions = findUnlinkedMentions(ctx.vault, targetId, {
-    ...(limit !== undefined ? { limit } : {}),
+    limit: offset + pageSize + 1,
     ownerScope: gatedOwnerScopeView(ctx.vault, ctx.agentName).scope,
     reachView: reachView(ctx.vault, contextReach(ctx)),
   });
+  const page = pageSlice(mentions, offset, pageSize);
   return {
     vault_path: vaultPathField(ctx),
     target_id: targetId,
-    mentions: mentions.map((m) => ({
+    total: page.total,
+    mentions: page.items.map((m) => ({
       source: m.source,
       line: m.line,
       term: m.term,
       context: m.contextSnippet,
     })),
+    next_cursor: page.next_cursor,
   };
 }
 
@@ -882,6 +953,7 @@ export const QUERY_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           maximum: 500,
           description: "Maximum contributions returned. Defaults to 50.",
         },
+        cursor: CURSOR_SCHEMA,
         agent_scope: {
           type: "string",
           description:
@@ -937,6 +1009,7 @@ export const QUERY_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           maximum: 500,
           description: "Maximum writes returned. Defaults to 50.",
         },
+        cursor: CURSOR_SCHEMA,
       },
       additionalProperties: false,
     },
@@ -978,8 +1051,10 @@ export const QUERY_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           type: "integer",
           minimum: 1,
           maximum: 500,
-          description: "Maximum contributions returned before comparison. Defaults to 50.",
+          description:
+            "Maximum contributions returned per page; the per-agent and topic aggregates always cover the whole matched set, not just this page. Defaults to 50.",
         },
+        cursor: CURSOR_SCHEMA,
       },
       additionalProperties: false,
     },
@@ -1038,7 +1113,7 @@ export const QUERY_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
     name: "brain_unlinked_mentions",
     previewBudget: MCP_PREVIEW_BUDGET,
     description:
-      "Raw-text mentions of a target's title / aliases that are NOT already inside `[[...]]`. Walks Brain/preferences and Brain/retired; match boundary is Unicode-aware (codepoint class), language-agnostic. Read-only.",
+      "Raw-text mentions of a target's title / aliases not already inside `[[...]]`; walks Brain/preferences and Brain/retired. Boundaries are Unicode-aware and language-agnostic. `total` is exact once the walk exhausts; mid-walk it reports the page's scan bound, never a silent cap. Read-only.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1051,8 +1126,9 @@ export const QUERY_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           type: "integer",
           minimum: 1,
           description:
-            "Maximum number of mentions to return. Defaults to 100; the scanner stops as soon as the cap is hit.",
+            "Maximum mentions on one page. Defaults to 100; walk further with the returned `next_cursor`.",
         },
+        cursor: CURSOR_SCHEMA,
       },
       required: ["id"],
       additionalProperties: false,

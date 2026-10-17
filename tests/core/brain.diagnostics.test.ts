@@ -75,6 +75,18 @@ function countRepairEvents(): number {
   return n;
 }
 
+/** Every logged doctor-repair event, in log order (consent assertions). */
+function repairEvents(): Array<{ body: Record<string, string | ReadonlyArray<string>> }> {
+  const events: Array<{ body: Record<string, string | ReadonlyArray<string>> }> = [];
+  for (const date of listLogDates(tmp)) {
+    for (const e of readLogDay(tmp, date).entries) {
+      if (e.eventType === "doctor-repair")
+        events.push(e as { body: Record<string, string | ReadonlyArray<string>> });
+    }
+  }
+  return events;
+}
+
 describe("diagnostics-signal model", () => {
   test("fixer codes are registered as auto-repairable with a next command", () => {
     for (const code of [REPAIR_CODE.walGap, REPAIR_CODE.orphanedReference]) {
@@ -228,5 +240,199 @@ describe("applyRepair - apply", () => {
     expect(out.applied).toEqual([]);
     expect(existsSync(path)).toBe(true);
     expect(readFileSync(path, "utf8")).toContain("pref-vanished"); // untouched
+  });
+
+  test("the apply skips a fix the approved preview did not name (M6)", () => {
+    // The interactive ladder previews, the operator answers y, and the
+    // apply re-plans. A finding that appeared in between (the mutation
+    // between preview and apply) must not be written behind an approval
+    // that never showed it: only the approved targets land.
+    writeDanglingWorkrun("run-seen");
+    const preview = applyRepair(tmp, { dryRun: true, now: new Date("2026-07-18T12:00:00Z") });
+    expect(preview.applied.length).toBe(1);
+    const seenPath = preview.applied[0]!.target;
+
+    // The mutation: a second dangling workrun appears while the prompt
+    // waits. A fresh plan names both; the approval names one.
+    const unseenPath = writeDanglingWorkrun("run-unseen");
+
+    const out = applyRepair(tmp, {
+      dryRun: false,
+      consent: "interactive-yes",
+      approvedTargets: [seenPath],
+      now: new Date("2026-07-18T12:00:05Z"),
+    });
+    // The approved fix landed; the unseen one did not.
+    expect(out.applied.length).toBe(1);
+    expect(out.applied[0]!.target).toBe(seenPath);
+    expect(readFileSync(unseenPath, "utf8")).not.toContain("interrupted");
+    expect(countRepairEvents()).toBe(1);
+
+    // A later run without the pin picks the straggler up - skipping is
+    // deferral, not deletion.
+    const next = applyRepair(tmp, { dryRun: false, now: new Date("2026-07-18T12:00:10Z") });
+    expect(next.applied.length).toBe(1);
+    expect(readFileSync(unseenPath, "utf8")).toContain("interrupted");
+  });
+});
+
+describe("applyRepair - consent receipt (t_b6bcd984)", () => {
+  test("the doctor-repair event body carries the consent verdict", () => {
+    writeDanglingWorkrun("run-consent");
+    const out = applyRepair(tmp, {
+      dryRun: false,
+      consent: "yes-flag",
+      now: new Date("2026-07-18T12:00:00Z"),
+    });
+    expect(out.applied.length).toBe(1);
+    const events = repairEvents();
+    expect(events.length).toBe(1);
+    expect(events[0]!.body["consent"]).toBe("yes-flag");
+  });
+
+  test("the MCP provenance value records as caller-apply", () => {
+    writeDanglingWorkrun("run-caller");
+    applyRepair(tmp, {
+      dryRun: false,
+      consent: "caller-apply",
+      now: new Date("2026-07-18T12:00:00Z"),
+    });
+    expect(repairEvents()[0]!.body["consent"]).toBe("caller-apply");
+  });
+
+  test("a dry run records nothing, with or without a verdict", () => {
+    writeDanglingWorkrun("run-dry-consent");
+    const out = applyRepair(tmp, {
+      dryRun: true,
+      consent: "yes-flag",
+      now: new Date("2026-07-18T12:00:00Z"),
+    });
+    expect(out.dryRun).toBe(true);
+    expect(countRepairEvents()).toBe(0);
+  });
+
+  test("the apply outcome carries the consent verdict (M4)", () => {
+    writeDanglingWorkrun("run-outcome-consent");
+    const out = applyRepair(tmp, {
+      dryRun: false,
+      consent: "yes-flag",
+      now: new Date("2026-07-18T12:00:00Z"),
+    });
+    expect(out.applied.length).toBe(1);
+    expect(out.consent).toBe("yes-flag");
+  });
+
+  test("a no-op apply downgrades the verdict to unchanged (M3/M4)", () => {
+    writeDanglingWorkrun("run-noop-consent");
+    // First apply closes the gap. The idempotent second apply has nothing
+    // to do, so no consent was consumed: the outcome reports `unchanged`
+    // rather than the caller's verdict.
+    const first = applyRepair(tmp, {
+      dryRun: false,
+      consent: "interactive-yes",
+      now: new Date("2026-07-18T12:00:00Z"),
+    });
+    expect(first.applied.length).toBe(1);
+    const again = applyRepair(tmp, {
+      dryRun: false,
+      consent: "interactive-yes",
+      now: new Date("2026-07-18T12:05:00Z"),
+    });
+    expect(again.applied).toEqual([]);
+    expect(again.consent).toBe("unchanged");
+  });
+});
+
+describe("applyRepair - dry-run diff preview (t_b6bcd984)", () => {
+  test("the preview carries a unified diff of the fixable file", () => {
+    const wrPath = writeDanglingWorkrun("run-diff");
+    const before = readFileSync(wrPath, "utf8");
+    const out = applyRepair(tmp, { dryRun: true, now: new Date("2026-07-18T12:00:00Z") });
+    expect(out.applied.length).toBe(1);
+    const diff = out.applied[0]!.diff!;
+    expect(diff).toContain("---");
+    expect(diff).toContain("+++");
+    // The appended terminal marker is the change the preview shows; the
+    // untouched lines are summarized as matching context, not repeated
+    // (no removal line - the header's `---` is not a removal).
+    expect(diff).toContain("+ ");
+    expect(diff.split("\n").some((l) => l.startsWith("- "))).toBe(false);
+    // A preview writes nothing.
+    expect(readFileSync(wrPath, "utf8")).toBe(before);
+  });
+
+  test("the evidence-prune preview diffs the pruned frontmatter", () => {
+    writePreference(tmp, {
+      slug: "delta",
+      topic: "delta",
+      principle: "rule",
+      created_at: "2026-05-14T10:00:00Z",
+      unconfirmed_until: "2026-05-28T10:00:00Z",
+      status: "unconfirmed",
+      evidenced_by: ["[[sig-never-existed]]"],
+    });
+    const out = applyRepair(tmp, { dryRun: true, now: new Date("2026-07-18T12:00:00Z") });
+    const fix = out.applied.find((f) => f.code === REPAIR_CODE.orphanedReference);
+    expect(fix).toBeDefined();
+    expect(fix!.diff).toBeDefined();
+    expect(fix!.diff).toContain("---");
+    // The dead evidence entry is what the diff removes.
+    expect(fix!.diff).toMatch(/-\s+.*sig-never-existed/);
+  });
+
+  test("the evidence-prune preview shows the normalization the write performs (M5)", () => {
+    // A non-canonical page: the topic scalar is quoted and the body sits
+    // directly after the closing fence. The write re-renders the whole
+    // file through formatFrontmatter, which de-quotes the scalar and
+    // inserts the blank line - so the preview must diff the RAW bytes
+    // against the formatted result, or the operator approves a one-line
+    // change and the write lands a third. The page starts canonical (the
+    // writer's shape, so the doctor detects it) and is then
+    // de-canonicalized at the byte level.
+    writePreference(tmp, {
+      slug: "noncanon",
+      topic: "noncanon",
+      principle: "rule",
+      created_at: "2026-05-14T10:00:00Z",
+      unconfirmed_until: "2026-05-28T10:00:00Z",
+      status: "unconfirmed",
+      evidenced_by: ["[[sig-never-existed]]"],
+    });
+    const page = join(brainDirs(tmp).preferences, "pref-noncanon.md");
+    const canonical = readFileSync(page, "utf8");
+    const noncanonical = canonical
+      .replace("topic: noncanon", 'topic: "noncanon"')
+      .replace("---\n\n", "---\n");
+    expect(noncanonical).not.toBe(canonical);
+    writeFileSync(page, noncanonical, "utf8");
+    const rawBefore = readFileSync(page, "utf8");
+    const out = applyRepair(tmp, { dryRun: true, now: new Date("2026-07-18T12:00:00Z") });
+    const fix = out.applied.find((f) => f.code === REPAIR_CODE.orphanedReference);
+    expect(fix).toBeDefined();
+    const diff = fix!.diff!;
+    // The normalization the write performs is IN the diff: the quoted
+    // scalar round-trips to a bare one (the before side quotes, the
+    // after side does not - the old formatted-vs-formatted diff hid
+    // this line entirely).
+    expect(diff).toContain('- topic: "noncanon"');
+    expect(diff).toContain("+ topic: noncanon");
+
+    // Landing exactly the preview: the write normalized what the preview
+    // showed, pruned what it removed - and a follow-up preview finds
+    // nothing left to do, so the bytes on disk ARE the state the diff
+    // described.
+    applyRepair(tmp, {
+      dryRun: false,
+      consent: "yes-flag",
+      now: new Date("2026-07-18T12:00:05Z"),
+    });
+    const landed = readFileSync(page, "utf8");
+    expect(landed).toContain("topic: noncanon");
+    expect(landed).not.toContain('topic: "noncanon"');
+    expect(landed).not.toContain("sig-never-existed");
+    expect(landed).toContain("---\n\n## Origin");
+    const settled = applyRepair(tmp, { dryRun: true, now: new Date("2026-07-18T12:00:10Z") });
+    expect(settled.applied).toEqual([]);
+    expect(landed).not.toBe(rawBefore);
   });
 });

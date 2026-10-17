@@ -20,6 +20,7 @@
  *   3  --check found drift
  *   4  user-modified-block conflict on apply (use --force to override)
  *   5  --check found a runtime it proved unreachable
+ *   6  apply refused for want of consent in non-interactive mode (use --yes)
  *
  * Code 5 exists because 0 was wrong. `--check` used to exit 0 for both
  * `not-installed` and `mcp-unreachable`, so `o2b install --check` reported
@@ -29,6 +30,9 @@
  */
 
 import { parseFlags } from "../argparse.ts";
+import { ok } from "../output.ts";
+import { readSingleLine } from "../brain/helpers.ts";
+import type { LaneConsentVerdict } from "../../core/brain/diagnostics.ts";
 import { defaultConfigPath, discoverConfig, resolveVault } from "../../core/config.ts";
 import { defaultRegistry } from "../../core/install/registry.ts";
 import { VAULT_NOT_CONFIGURED_REASON, buildInstallEnv } from "../../core/install/env.ts";
@@ -76,11 +80,13 @@ export const INSTALL_EXIT = Object.freeze({
   drift: 3,
   userModifiedBlock: 4,
   mcpUnreachable: 5,
+  consentRefused: 6,
 } as const);
 
 interface ParsedInstallArgs {
   readonly target: string | null;
   readonly apply: boolean;
+  readonly yes: boolean;
   readonly check: boolean;
   readonly friction: boolean;
   readonly base: string | null;
@@ -98,6 +104,7 @@ function parseInstallArgs(argv: string[]): ParsedInstallArgs {
   const { flags } = parseFlags(argv, {
     target: { type: "string" },
     apply: { type: "boolean" },
+    yes: { type: "boolean" },
     check: { type: "boolean" },
     friction: { type: "boolean" },
     base: { type: "string" },
@@ -121,6 +128,7 @@ function parseInstallArgs(argv: string[]): ParsedInstallArgs {
   return {
     target: (flags["target"] as string | undefined) ?? null,
     apply: Boolean(flags["apply"]),
+    yes: Boolean(flags["yes"]),
     check: Boolean(flags["check"]),
     friction: Boolean(flags["friction"]),
     base: (flags["base"] as string | undefined) ?? null,
@@ -261,7 +269,7 @@ export async function cmdInstall(argv: string[]): Promise<number> {
   if (!args.target) return runDetect(args);
 
   // --target X with or without --apply.
-  return runTarget(args);
+  return await runTarget(args);
 }
 
 function runDetect(args: ParsedInstallArgs): number {
@@ -367,7 +375,7 @@ function runFriction(args: ParsedInstallArgs): number {
   return INSTALL_EXIT.ok;
 }
 
-function runTarget(args: ParsedInstallArgs): number {
+async function runTarget(args: ParsedInstallArgs): Promise<number> {
   const adapter = defaultRegistry.get(args.target!);
   if (!adapter) return refuseUnknownTarget("--target", args.target!);
   const env = installEnvForArgs(args);
@@ -404,6 +412,55 @@ function runTarget(args: ParsedInstallArgs): number {
     return INSTALL_EXIT.ok;
   }
 
+  // t_b6bcd984: fail-closed consent above the write lane, the canonical
+  // ladder of `brain upgrade --apply`. Without --yes, a --json or
+  // non-TTY run refuses before anything is written (the drift guard
+  // below still fires on an explicit yes); an interactive run sees the
+  // plan with the file diff and is asked once. A consent gate sits
+  // above the write guard and never gates dry runs - this path only
+  // runs with --apply.
+  if (!args.yes) {
+    if (args.json || !process.stdin.isTTY) {
+      const refusal =
+        `error: o2b install --target ${args.target} --apply requires --yes in ` +
+        "non-interactive mode (--json or non-TTY stdin); nothing was written";
+      // M4: under --json the refusal is a JSON envelope on the payload
+      // stream carrying the reserved `headless-refused` verdict, so a
+      // headless consumer reads the answer from the channel it parses.
+      if (args.json) {
+        process.stdout.write(
+          JSON.stringify(
+            { consent: "headless-refused", written: false, error: refusal.replace(/^error: /, "") },
+            null,
+            2,
+          ) + "\n",
+        );
+      } else {
+        process.stderr.write(refusal + "\n");
+      }
+      return INSTALL_EXIT.consentRefused;
+    }
+    // M15: the consent-time plan renders to stderr, where the prompt
+    // already rides - stdout is the payload stream, and for
+    // `--target generic --out -` the plan prefixed the snippet made it
+    // unparsable. The header drops the dry-run wording: this render is
+    // asking for apply consent, not previewing a dry run. The plain
+    // print-only plan (no --apply) keeps its stdout dry-run render
+    // below.
+    process.stderr.write(renderPlan(plan, { consent: true }));
+    process.stderr.write("Proceed? [y/N] ");
+    const ans = await readSingleLine();
+    if (ans.toLowerCase() !== "y" && ans.toLowerCase() !== "yes") {
+      ok("install cancelled");
+      return INSTALL_EXIT.ok;
+    }
+  }
+
+  // M3: the verdict is derived from what happened, not hard-coded - a
+  // `--yes` consent and an interactive yes stay distinguishable, in the
+  // same vocabulary protect/unprotect/doctor record.
+  const consent: LaneConsentVerdict = args.yes ? "yes-flag" : "interactive-yes";
+
   try {
     const result = adapter.apply(plan, payload, env, opts);
     // An apply that returned changed the machine, so the close fires
@@ -411,9 +468,9 @@ function runTarget(args: ParsedInstallArgs): number {
     // runtime nobody installed.
     const ownership = ownershipFor(env, args.config);
     if (args.json) {
-      process.stdout.write(renderApplyJson(result, ownership));
+      process.stdout.write(renderApplyJson(result, ownership, consent));
     } else {
-      process.stdout.write(renderApplyResult(result));
+      process.stdout.write(renderApplyResult(result, consent));
       process.stdout.write(renderDataOwnership(ownership));
     }
     return INSTALL_EXIT.ok;

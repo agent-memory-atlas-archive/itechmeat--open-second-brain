@@ -48,9 +48,11 @@ import { join } from "node:path";
 
 import { normalizeAgentArgument } from "../agent-identity.ts";
 import { resolveAgentName } from "../config.ts";
+import { renderUnifiedDiff } from "../diff.ts";
 import type { TransportReach } from "../graph/transport-reach.ts";
 import { pathIsInside, vaultRelative } from "../path-safety.ts";
-import { parseFrontmatter, writeFrontmatterAtomic } from "../vault.ts";
+import { formatFrontmatter, parseFrontmatter, writeFrontmatterAtomic } from "../vault.ts";
+import type { FrontmatterMap } from "../types.ts";
 
 import { UnclassifiedRepairCodeError, requireMechanicalRepair } from "./applier-capability.ts";
 
@@ -1086,6 +1088,15 @@ interface Fixer {
   plan(vault: string, findings: ReadonlyArray<DoctorIssue>): RepairItem[];
   /** Apply one applicable item. Returns null on an idempotent no-op. */
   apply(vault: string, item: RepairItem): AppliedFix | null;
+  /**
+   * The consent preview (t_b6bcd984): what `apply` would write to the
+   * item's file, as raw before/after bytes for the shared unified-diff
+   * renderer. Read-only and best-effort - `null` when the target is
+   * gone or the item's shape is not one this fixer can draw. The dry
+   * run renders it per applied item; the write path re-derives under
+   * its lock and stays the authority.
+   */
+  preview?(vault: string, item: RepairItem): { before: string; after: string } | null;
 }
 
 /** Doctor field name for the evidence list; its raw key is `_evidenced_by`. */
@@ -1104,6 +1115,22 @@ function isBrokenBrainRef(raw: string, known: ReadonlySet<string>): string | nul
   return target;
 }
 
+/** The terminal marker line a wal-gap close appends (fresh timestamp). */
+function interruptedMarkerLine(): string {
+  return (
+    JSON.stringify({
+      phase: WORKRUN_PHASE.interrupted,
+      at: new Date().toISOString(),
+      reason: "closed by doctor --repair",
+    }) + "\n"
+  );
+}
+
+/** Separator before an appended marker on a file not ending in a newline. */
+function danglingClosePrefix(existing: string): string {
+  return existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+}
+
 const walGapFixer: Fixer = {
   code: REPAIR_CODE.walGap,
   coversDoctorCode: "dangling-workrun",
@@ -1118,6 +1145,15 @@ const walGapFixer: Fixer = {
         detail: `close dangling workrun ${rel} with a terminal 'interrupted' marker`,
       };
     });
+  },
+  preview(vault: string, item: RepairItem): { before: string; after: string } | null {
+    const path = join(vault, item.target);
+    if (!existsSync(path)) return null;
+    const existing = readFileSync(path, "utf8");
+    return {
+      before: existing,
+      after: existing + danglingClosePrefix(existing) + interruptedMarkerLine(),
+    };
   },
   apply(vault: string, item: RepairItem): AppliedFix | null {
     const path = join(vault, item.target);
@@ -1135,15 +1171,8 @@ const walGapFixer: Fixer = {
       if (!scanDanglingWorkruns(vault).some((p) => vaultRelative(p, vault) === item.target)) {
         return null;
       }
-      const line =
-        JSON.stringify({
-          phase: WORKRUN_PHASE.interrupted,
-          at: new Date().toISOString(),
-          reason: "closed by doctor --repair",
-        }) + "\n";
       const existing = readFileSync(path, "utf8");
-      const prefix = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
-      appendFileSync(path, prefix + line, "utf8");
+      appendFileSync(path, danglingClosePrefix(existing) + interruptedMarkerLine(), "utf8");
       return {
         code: item.code,
         target: item.target,
@@ -1154,6 +1183,37 @@ const walGapFixer: Fixer = {
     }
   },
 };
+
+/**
+ * The evidence prune derived in memory: the parsed frontmatter and body
+ * plus the pruned replacements. One derivation shared by the consent
+ * preview (which formats both sides into a diff) and the apply path
+ * (which writes the pruned side under its lock), so the two cannot
+ * drift. `null` on a page without a list-shaped `_evidenced_by` or when
+ * nothing would change (idempotent no-op).
+ */
+function evidencePruneDerived(
+  vault: string,
+  path: string,
+  dead: string,
+): { meta: FrontmatterMap; body: string; next: FrontmatterMap; nextBody: string } | null {
+  const [meta, body] = parseFrontmatter(path);
+  const arr = meta[EVIDENCED_BY_KEY];
+  if (!Array.isArray(arr)) return null;
+  const known = collectAllBasenames(vault);
+  const next = arr.filter((raw) => {
+    if (typeof raw !== "string") return true;
+    const broken = isBrokenBrainRef(raw, known);
+    return broken !== dead; // drop exactly the still-dead target
+  });
+  if (next.length === arr.length) return null; // idempotent no-op
+  return {
+    meta,
+    body,
+    next: { ...meta, [EVIDENCED_BY_KEY]: next },
+    nextBody: removeOriginBullet(body, dead),
+  };
+}
 
 const orphanedReferenceFixer: Fixer = {
   code: REPAIR_CODE.orphanedReference,
@@ -1177,12 +1237,30 @@ const orphanedReferenceFixer: Fixer = {
     }
     return items;
   },
+  preview(vault: string, item: RepairItem): { before: string; after: string } | null {
+    const [rel, field, dead] = item.target.split(TARGET_SEP);
+    if (rel === undefined || field !== EVIDENCED_BY_KEY || dead === undefined) return null;
+    const path = join(vault, rel);
+    if (!existsSync(path)) return null;
+    const derived = evidencePruneDerived(vault, path, dead);
+    if (derived === null) return null;
+    // M5: `before` is the file's raw bytes, not a re-serialization of the
+    // parsed frontmatter. The write lands `formatFrontmatter(next)`, whose
+    // normalization (de-quoting scalars, the blank line after the closing
+    // fence) is invisible in a diff whose both sides were formatted - so
+    // the operator approved a two-line change and got a fourth one. The
+    // raw before against the formatted after shows every byte the write
+    // moves, which is the preview's contract.
+    return {
+      before: readFileSync(path, "utf8"),
+      after: formatFrontmatter(derived.next, derived.nextBody),
+    };
+  },
   apply(vault: string, item: RepairItem): AppliedFix | null {
     const [rel, field, dead] = item.target.split(TARGET_SEP);
     if (rel === undefined || field !== EVIDENCED_BY_KEY || dead === undefined) return null;
     const path = join(vault, rel);
     if (!existsSync(path)) return null;
-    const known = collectAllBasenames(vault);
 
     let handle: ReturnType<typeof acquireLockSync>;
     try {
@@ -1191,21 +1269,12 @@ const orphanedReferenceFixer: Fixer = {
       return null; // contended: leave for a later run
     }
     try {
-      const [meta, body] = parseFrontmatter(path);
-      const arr = meta[EVIDENCED_BY_KEY];
-      if (!Array.isArray(arr)) return null;
-      const next = arr.filter((raw) => {
-        if (typeof raw !== "string") return true;
-        const broken = isBrokenBrainRef(raw, known);
-        return broken !== dead; // drop exactly the still-dead target
-      });
-      if (next.length === arr.length) return null; // idempotent no-op
-      meta[EVIDENCED_BY_KEY] = next;
+      const derived = evidencePruneDerived(vault, path, dead);
+      if (derived === null) return null; // unreadable list or idempotent no-op
       // Keep the human `## Origin` prose consistent: drop the matching
       // `- [[dead]]` bullet so the same dead target cannot re-surface as a
       // body-side broken-backlink after the frontmatter is pruned.
-      const nextBody = removeOriginBullet(body, dead);
-      writeFrontmatterAtomic(path, meta, nextBody, { overwrite: true });
+      writeFrontmatterAtomic(path, derived.next, derived.nextBody, { overwrite: true });
       return { code: item.code, target: item.target, detail: item.detail };
     } finally {
       handle.release();
@@ -1369,7 +1438,49 @@ export interface AppliedFix {
   readonly detail: string;
   /** Absolute path of the log file the typed event landed in (apply only). */
   readonly logPath?: string;
+  /**
+   * Unified diff of the fix, rendered by the shared core leaf against
+   * the fixer's consent preview (t_b6bcd984). Dry-run only: it shows
+   * what `--apply` would write. Absent when the fixer cannot draw one.
+   */
+  readonly diff?: string;
 }
+
+/**
+ * How a repair write was authorised, recorded verbatim in each
+ * doctor-repair event body (t_b6bcd984). The CLI passes `yes-flag` for
+ * an explicit `--yes` and `interactive-yes` for a confirmed y/N prompt;
+ * the MCP tool passes `caller-apply` - `apply: true` is the machine
+ * consent, and no new required argument is added to the tool. A dry run
+ * writes no event, so it records nothing.
+ *
+ * `unchanged` (M3) is the no-op verdict: the run had nothing to apply, so
+ * no gate ran, nobody was asked and nothing was written. It never reaches
+ * an event body - a no-op logs none - and rides only the run-level
+ * {@link RepairOutcome.consent}, where the hard-coded absence (or a
+ * stale carried verdict) would otherwise report a consent nobody gave.
+ */
+export type RepairConsent = "yes-flag" | "interactive-yes" | "caller-apply" | "unchanged";
+
+/**
+ * The two reserved refusal verdicts (CONSENT_VERDICTS in src/core/trust.ts):
+ * an interactive operator answered no (`refused`), and a `--json`/non-TTY
+ * run was refused fail-closed for want of `--yes` (`headless-refused`).
+ * Under `--json` the guarded CLI lanes emit their refusal as a JSON
+ * envelope `{ consent, written: false, error }` carrying one of these, so
+ * a headless consumer reads the verdict from the payload stream.
+ */
+export const REFUSAL_VERDICTS = ["refused", "headless-refused"] as const;
+
+export type RefusalVerdict = (typeof REFUSAL_VERDICTS)[number];
+
+/**
+ * Every verdict a guarded CLI lane's receipt may carry: the consent
+ * values ({@link RepairConsent}) plus the two refusal spellings. The
+ * vocabulary is one set across install, protect, unprotect and doctor so
+ * a receipt from any lane reads the same way.
+ */
+export type LaneConsentVerdict = RepairConsent | RefusalVerdict;
 
 export interface RepairOutcome {
   readonly dryRun: boolean;
@@ -1379,11 +1490,36 @@ export interface RepairOutcome {
   readonly needsReview: ReadonlyArray<RepairItem>;
   /** Detected classes no fixer addresses. */
   readonly unfixable: ReadonlyArray<UnfixableClass>;
+  /**
+   * How the write was authorised (M4): every apply's JSON carries the
+   * consent verdict, exactly as each fix's event body does. Absent on a
+   * dry run, which writes nothing and records nothing. A no-op apply -
+   * nothing to fix, so no consent was consumed - reports `unchanged`
+   * rather than the caller's verdict, keeping a confirmed write
+   * distinguishable from an automatic run.
+   */
+  readonly consent?: RepairConsent;
 }
 
 export interface ApplyRepairOptions {
   /** True previews without writing; false performs the fixes. */
   readonly dryRun: boolean;
+  /**
+   * How the write was authorised ({@link RepairConsent}). Recorded in
+   * each doctor-repair event body; absent on internal callers, which
+   * keeps the event's old shape.
+   */
+  readonly consent?: RepairConsent;
+  /**
+   * The targets the consent preview showed (t_b6bcd984; the CLI's pin
+   * between the approved preview and the write, M6 - the sibling of the
+   * protect/unprotect PREVIEW_DRIFT refusal). Present, the apply skips
+   * any applicable fix whose target the preview did not name: a finding
+   * that appears between the operator's preview and their yes stays for
+   * the next run instead of being written behind an approval that never
+   * showed it. Absent, every planned fix applies - the pre-pin callers.
+   */
+  readonly approvedTargets?: ReadonlyArray<string>;
   /** Wall clock for the typed event timestamps. Defaults to `new Date()`. */
   readonly now?: Date;
   /** Agent identity recorded on each event. Resolver default when blank. */
@@ -1515,7 +1651,21 @@ export function applyRepair(vault: string, opts: ApplyRepairOptions): RepairOutc
   const applicable = fixes.filter((f) => f.applicable);
 
   if (opts.dryRun) {
-    const applied = applicable.map((f) => ({ code: f.code, target: f.target, detail: f.detail }));
+    const applied = applicable.map((f) => {
+      // The consent preview (t_b6bcd984): what this fix would write to
+      // the file, drawn by the fixer and rendered by the shared core
+      // leaf. Best-effort - a fixer that cannot draw one omits the key.
+      const fixer = FIXER_BY_CODE.get(f.code);
+      const preview = fixer?.preview?.(vault, f) ?? null;
+      return {
+        code: f.code,
+        target: f.target,
+        detail: f.detail,
+        ...(preview === null
+          ? {}
+          : { diff: renderUnifiedDiff(preview.before, preview.after, f.target) }),
+      };
+    });
     return Object.freeze({
       dryRun: true,
       applied: Object.freeze(applied),
@@ -1526,8 +1676,15 @@ export function applyRepair(vault: string, opts: ApplyRepairOptions): RepairOutc
 
   const agent = normalizeAgentArgument(opts.agent ?? null) ?? resolveAgentName(opts.configPath);
   const timestamp = isoSecond(opts.now ?? new Date());
+  const approved = opts.approvedTargets === undefined ? null : new Set(opts.approvedTargets);
   const applied: AppliedFix[] = [];
   for (const item of applicable) {
+    // The approved-preview pin (M6): a fix the consent preview did not
+    // show is skipped, never written. It stays a finding for the next
+    // run - skipping (rather than refusing the whole apply, as the
+    // protect/unprotect PREVIEW_DRIFT twin does) keeps the answers the
+    // operator DID see still landing when the vault merely moved.
+    if (approved !== null && !approved.has(item.target)) continue;
     // The capability table is the published statement that this code has
     // a mechanical repair; the registry is the thing that performs it.
     // Consulting the table first turns a disagreement between the two
@@ -1542,7 +1699,14 @@ export function applyRepair(vault: string, opts: ApplyRepairOptions): RepairOutc
     const res = appendLogEvent(vault, {
       timestamp,
       eventType: BRAIN_LOG_EVENT_KIND.doctorRepair,
-      body: { code: result.code, target: result.target, detail: result.detail, agent },
+      body: {
+        code: result.code,
+        target: result.target,
+        detail: result.detail,
+        agent,
+        // t_b6bcd984: the receipt names how the write was authorised.
+        ...(opts.consent === undefined ? {} : { consent: opts.consent }),
+      },
     });
     applied.push({ ...result, logPath: res.logPath });
   }
@@ -1552,5 +1716,12 @@ export function applyRepair(vault: string, opts: ApplyRepairOptions): RepairOutc
     applied: Object.freeze(applied),
     needsReview: Object.freeze(needsReview),
     unfixable: plan.unfixable,
+    // The run-level verdict (M4): every apply's JSON carries how the
+    // write was authorised, downgraded to `unchanged` when nothing was
+    // written - a no-op consumed no consent, and reporting the caller's
+    // verdict there would make an automatic run read as a confirmed one.
+    ...(opts.consent === undefined
+      ? {}
+      : { consent: applied.length === 0 ? "unchanged" : opts.consent }),
   });
 }

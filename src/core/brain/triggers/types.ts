@@ -16,6 +16,12 @@
  * it. It is a member of {@link TRIGGER_TERMINAL_STATUSES}, and that
  * membership - not a branch anywhere - is what hides it from `list` and
  * shows it in `history`.
+ *
+ * `snoozed` is the time-boxed sibling: a deferral that ends by itself
+ * when its window elapses or the finding's grounding moves, whichever
+ * comes first. It is terminal too, so the same partition membership
+ * hides it from `list` - but its window, not the TTL expiry clock, is
+ * what wakes it.
  */
 export const TRIGGER_STATUS = Object.freeze({
   pending: "pending",
@@ -25,6 +31,7 @@ export const TRIGGER_STATUS = Object.freeze({
   dismissed: "dismissed",
   expired: "expired",
   suppressed: "suppressed",
+  snoozed: "snoozed",
 } as const);
 
 export type TriggerStatus = (typeof TRIGGER_STATUS)[keyof typeof TRIGGER_STATUS];
@@ -42,6 +49,7 @@ export const TRIGGER_STATUSES: ReadonlyArray<TriggerStatus> = Object.freeze([
   TRIGGER_STATUS.dismissed,
   TRIGGER_STATUS.expired,
   TRIGGER_STATUS.suppressed,
+  TRIGGER_STATUS.snoozed,
 ]);
 
 export function isTriggerStatus(value: unknown): value is TriggerStatus {
@@ -70,6 +78,7 @@ export const TRIGGER_TERMINAL_STATUSES: ReadonlySet<TriggerStatus> = new Set([
   TRIGGER_STATUS.dismissed,
   TRIGGER_STATUS.expired,
   TRIGGER_STATUS.suppressed,
+  TRIGGER_STATUS.snoozed,
 ]);
 
 export const TRIGGER_URGENCIES = ["low", "medium", "high"] as const;
@@ -138,6 +147,47 @@ export interface TriggerRecord extends InsightCandidate {
    * restore refuses rather than guessing a prior state.
    */
   readonly suppressedFrom: TriggerStatus | null;
+  /**
+   * The grounding fingerprint the dismissal covers: a content hash of
+   * the finding's reason and context, taken when it was dismissed. A
+   * dismissed finding is resurrected only by movement - a re-fire that
+   * introduces an artifact the record never saw, or one whose grounding
+   * content hashes differently from this baseline - so for the kinds
+   * whose cooldown key pins their artifact ids (and whose artifact set
+   * can therefore never change) a re-evidenced finding still comes back.
+   * `null` on a record dismissed before the field existed: absence is
+   * the neutral reading, and the artifact arm of the gate still works
+   * without it.
+   */
+  readonly dismissedFingerprint: string | null;
+  /** When the trigger was snoozed, or `null` while it is not. */
+  readonly snoozedAt: string | null;
+  /**
+   * The grounding fingerprint the snooze baseline covers: a content hash
+   * of the finding's reason and context, taken when it was snoozed. The
+   * early wake fires on movement since that baseline - a re-fire that
+   * introduces an artifact the record never saw, or one whose grounding
+   * content hashes differently - never on a bare re-sighting, because
+   * the detectors report state and a still-true condition re-fires on
+   * every scan. `null` while the trigger is not snoozed, or on a record
+   * snoozed before the field existed: absence is the neutral reading,
+   * and the artifact arm of the wake still works without it.
+   */
+  readonly snoozedFingerprint: string | null;
+  /**
+   * When the snooze window ends. The store always writes it alongside
+   * `snoozedAt`, so `null` means a hand-edited record - and one without
+   * a window never wakes by the clock, only by grounding movement.
+   */
+  readonly snoozedUntil: string | null;
+  /**
+   * The status the snooze interrupted, restored once the window ends or
+   * the finding's grounding moves, whichever comes first. Seeded from
+   * the record's computed status at snooze time, so it is open by
+   * construction and never `snoozed` - a snooze cannot restore into
+   * snoozed. `null` while the trigger is not snoozed.
+   */
+  readonly snoozedFrom: TriggerStatus | null;
   /**
    * How many times this finding has been observed: once when the trigger
    * was created, plus once for every later SCAN in which the finding
