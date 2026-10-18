@@ -2277,6 +2277,7 @@ __export(exports_config, {
   resolveHygieneDigestEnabled: () => resolveHygieneDigestEnabled,
   resolveInstallationSecret: () => resolveInstallationSecret,
   resolveLinkOutputFormat: () => resolveLinkOutputFormat,
+  resolveLogCatchupEnabled: () => resolveLogCatchupEnabled,
   resolveMaintenanceCustomTasksSwitch: () => resolveMaintenanceCustomTasksSwitch,
   resolveMaintenanceEmbeddings: () => resolveMaintenanceEmbeddings,
   resolveMcpRouteMetricsEnabled: () => resolveMcpRouteMetricsEnabled,
@@ -2881,6 +2882,9 @@ function resolveGapLoopEnabled(configPath) {
 }
 function resolveBacklogNudgeEnabled(configPath) {
   return resolveConfigFlag("OPEN_SECOND_BRAIN_BACKLOG_NUDGE_ENABLED", "backlog_nudge_enabled", configPath);
+}
+function resolveLogCatchupEnabled(configPath) {
+  return resolveConfigFlag("OPEN_SECOND_BRAIN_LOG_CATCHUP_ENABLED", "log_catchup_enabled", configPath);
 }
 function resolveGapLoopThreshold(configPath) {
   const env = process.env["OPEN_SECOND_BRAIN_GAP_LOOP_THRESHOLD"]?.trim();
@@ -5910,6 +5914,7 @@ function clipNoticeLine(line) {
   return line.length <= NOTICE_LINE_MAX ? line : line.slice(0, NOTICE_LINE_MAX) + NOTICE_LINE_ELLIPSIS;
 }
 var LIST_VAULT_PAGES_SITE = "vault.listVaultPages";
+var COLLATOR = new Intl.Collator("en", { numeric: true });
 var UNMEASURABLE_PAGE_VISIBILITY = Object.freeze([
   REMOTE_DENY_VISIBILITY_TOKEN
 ]);
@@ -5922,7 +5927,7 @@ function listVaultPages(vaultDir, opts) {
     site: opts.site ?? LIST_VAULT_PAGES_SITE
   });
   const pages = walked.filter((w) => isRemotelyReadable(w.unreadable ? UNMEASURABLE_PAGE_VISIBILITY : pageVisibility(w.page.metadata), opts.reach)).map((w) => w.page);
-  pages.sort((a, b) => a.title.toLowerCase().localeCompare(b.title.toLowerCase()));
+  pages.sort((a, b) => COLLATOR.compare(a.title.toLowerCase(), b.title.toLowerCase()));
   return pages;
 }
 function walk(root, dir, skipDirs, skipFiles, out, notices) {

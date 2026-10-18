@@ -6,7 +6,16 @@ import {
   type NoteRevertEntry,
   type NoteRevertSelector,
 } from "../../../core/brain/notes/revert.ts";
-import { listNoteWrites, type NoteWriteRecord } from "../../../core/brain/notes/write-log.ts";
+import {
+  listNoteWrites,
+  isLegacyPairDevice,
+  type NoteWriteRecord,
+} from "../../../core/brain/notes/write-log.ts";
+import { LogWindowBoundError } from "../../../core/brain/notes/log-window.ts";
+import {
+  listWriteDestinations,
+  type WriteDestinationRow,
+} from "../../../core/brain/notes/write-destinations.ts";
 import {
   NOTE_WRITE_OP,
   WRITE_IMAGE_RETENTION_DAYS,
@@ -23,6 +32,7 @@ import {
   parse,
   usageError,
 } from "../helpers.ts";
+import { shellWord } from "../../cron-recipe.ts";
 
 /**
  * `o2b brain writes` - the operator's view of who wrote what
@@ -30,6 +40,7 @@ import {
  *
  * Subcommands:
  *   list          (default)  recorded note writes, newest first
+ *   destinations             the ledger folded into one row per target
  *   revert                   plan, and with --apply run, a per-agent undo
  *   prune-images             bound the before-image store by age
  *
@@ -49,6 +60,7 @@ export async function cmdBrainWrites(argv: string[]): Promise<number> {
     until: { type: "string" },
     op: { type: "string" },
     "older-than-days": { type: "string" },
+    limit: { type: "string" },
     "dry-run": { type: "boolean" },
     apply: { type: "string" },
     json: { type: "boolean" },
@@ -58,6 +70,9 @@ export async function cmdBrainWrites(argv: string[]): Promise<number> {
   if (sub === undefined || sub.startsWith("--") || sub === "list") {
     return listWrites(flags, json);
   }
+  if (sub === "destinations") {
+    return destinations(flags, json);
+  }
   if (sub === "revert") {
     return revert(flags, json);
   }
@@ -65,7 +80,7 @@ export async function cmdBrainWrites(argv: string[]): Promise<number> {
     return pruneImages(flags, json);
   }
   return usageError(
-    `unknown brain writes subcommand '${sub}' - expected list, revert or prune-images`,
+    `unknown brain writes subcommand '${sub}' - expected list, destinations, revert or prune-images`,
   );
 }
 
@@ -74,6 +89,37 @@ const DIGEST_PREVIEW_LENGTH = 8;
 
 /** What the table prints where a fact is absent rather than empty. */
 const ABSENT_COLUMN = "-";
+
+/**
+ * Run one ledger read, mapping the shared window parser's named error to
+ * a usage error that blames the mistyped flag. The readers throw
+ * `LogWindowBoundError` for a `--since` / `--until` in neither accepted
+ * spelling; here - where the flags came from a human - that is a usage
+ * error, not a crash and never a silent empty.
+ */
+function ledgerResult<T>(read: () => T): T | number {
+  try {
+    return read();
+  } catch (err) {
+    if (err instanceof LogWindowBoundError) return usageError(err.message);
+    throw err;
+  }
+}
+
+/**
+ * One device selector from a flag. The empty (or whitespace-only) string
+ * is the legacy un-sharded pair and IS a filter value, so it is read
+ * through the shared {@link isLegacyPairDevice} before
+ * `normalizeFlagString`, which treats emptiness as absence - the schema
+ * and the help text both promise `--device ""` selects the un-sharded
+ * log, and a coercion-first reading made that unreachable.
+ */
+function deviceSelector(
+  flags: Record<string, string | boolean | string[] | undefined>,
+): string | null {
+  if (isLegacyPairDevice(flags["device"])) return "";
+  return normalizeFlagString(flags["device"]);
+}
 
 function listWrites(
   flags: Record<string, string | boolean | string[] | undefined>,
@@ -88,19 +134,22 @@ function listWrites(
   const op: NoteWriteOp | null = rawOp;
   const { vault } = brainVerbContext(flags);
   const agent = normalizeFlagString(flags["agent"]);
-  const device = normalizeFlagString(flags["device"]);
+  const device = deviceSelector(flags);
   const path = normalizeFlagString(flags["path"]);
   const since = normalizeFlagString(flags["since"]);
   const until = normalizeFlagString(flags["until"]);
 
-  const result = listNoteWrites(vault, {
-    ...(agent !== null ? { agent } : {}),
-    ...(device !== null ? { device } : {}),
-    ...(path !== null ? { path } : {}),
-    ...(since !== null ? { since } : {}),
-    ...(until !== null ? { until } : {}),
-    ...(op !== null ? { op } : {}),
-  });
+  const result = ledgerResult(() =>
+    listNoteWrites(vault, {
+      ...(agent !== null ? { agent } : {}),
+      ...(device !== null ? { device } : {}),
+      ...(path !== null ? { path } : {}),
+      ...(since !== null ? { since } : {}),
+      ...(until !== null ? { until } : {}),
+      ...(op !== null ? { op } : {}),
+    }),
+  );
+  if (typeof result === "number") return result;
 
   if (json) {
     okJson({
@@ -142,6 +191,122 @@ function renderRow(write: NoteWriteRecord): string {
     write.target,
     `${before} -> ${after}`,
   ].join("  ");
+}
+
+/**
+ * `destinations` - the destination-keyed aggregate over the same ledger
+ * `list` reads (actionable-now batch, A4): one row per target path the
+ * recorded write events name, across BOTH the note-write and the
+ * write-session kinds, with the contributing agents and devices. Read
+ * only, like every subcommand here; the default window is the last
+ * seven days, and `--since` / `--until` narrow the walk.
+ */
+function destinations(
+  flags: Record<string, string | boolean | string[] | undefined>,
+  json: boolean,
+): number {
+  const rawLimit = normalizeFlagString(flags["limit"]);
+  let limit: number | undefined;
+  if (rawLimit !== null) {
+    const parsed = Number.parseInt(rawLimit, 10);
+    if (!Number.isInteger(parsed) || String(parsed) !== rawLimit || parsed < 1) {
+      return usageError(`--limit must be a positive integer, got '${rawLimit}'`);
+    }
+    limit = parsed;
+  }
+  const { vault } = brainVerbContext(flags);
+  const agent = normalizeFlagString(flags["agent"]);
+  const device = deviceSelector(flags);
+  const path = normalizeFlagString(flags["path"]);
+  const since = normalizeFlagString(flags["since"]);
+  const until = normalizeFlagString(flags["until"]);
+
+  const result = ledgerResult(() =>
+    listWriteDestinations(vault, {
+      ...(agent !== null ? { agent } : {}),
+      ...(device !== null ? { device } : {}),
+      ...(path !== null ? { path } : {}),
+      ...(since !== null ? { since } : {}),
+      ...(until !== null ? { until } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    }),
+  );
+  if (typeof result === "number") return result;
+
+  const warnings = result.warnings.map((w) => ({
+    path: w.path,
+    line: w.lineNumber,
+    message: w.message,
+  }));
+  if (json) {
+    okJson({
+      destinations: result.destinations.map((d) => ({
+        ...d,
+        kinds: [...d.kinds],
+        agents: [...d.agents],
+        devices: [...d.devices],
+      })),
+      total_matched: result.total_matched,
+      returned: result.destinations.length,
+      coverage_note: result.coverage_note,
+      // The window the walk actually covered, both ends completed to
+      // timestamps: the default lower bound is computed, not sent, so a
+      // caller reading only its own arguments would misread the coverage.
+      window: { since: result.window.since, until: result.window.until },
+      warnings,
+    });
+    return 0;
+  }
+
+  if (result.destinations.length === 0) {
+    ok("no recorded write destinations in this window");
+  } else {
+    for (const row of result.destinations) ok(renderDestinationRow(row));
+  }
+  ok(windowLine(result.window));
+  // The coverage note is part of the answer, not a footnote: derived
+  // write sites emit no event of either kind, so a short list must not
+  // read as a complete one.
+  ok(`note: ${result.coverage_note}`);
+  for (const warning of result.warnings) {
+    ok(`warning: ${warning.path}:${warning.lineNumber}: ${warning.message}`);
+  }
+  return 0;
+}
+
+/** One provenance value: an empty string is absent, not a blank cell. */
+function provenanceCell(value: string): string {
+  return value === "" ? ABSENT_COLUMN : value;
+}
+
+/**
+ * One row: target, both kinds' counts, who and on what, newest touch.
+ * A row always has at least one contributing agent and device - the fold
+ * creates it from a touch that contributed both - so the empties that
+ * need the dash are the VALUES (the legacy un-sharded pair, an event
+ * with no agent), not the lists.
+ */
+function renderDestinationRow(row: WriteDestinationRow): string {
+  return [
+    row.target,
+    `${row.note_writes} note-write(s)`,
+    `${row.write_sessions} write-session(s)`,
+    `agent: ${row.agents.map(provenanceCell).join(",")}`,
+    `device: ${row.devices.map(provenanceCell).join(",")}`,
+    `last ${row.last_write}`,
+  ].join("  ");
+}
+
+/**
+ * The covered window as one line, beside the JSON payload's `window`:
+ * both ends completed to timestamps, because the default lower bound is
+ * computed from the anchor rather than sent - the reader always
+ * completes the lower end, so only the upper end can be null, and a
+ * null upper end means the walk ran to the present, which the line
+ * spells `now`.
+ */
+function windowLine(window: { readonly since: string; readonly until: string | null }): string {
+  return `window: ${window.since} .. ${window.until ?? "now"}`;
 }
 
 function pruneImages(
@@ -206,9 +371,14 @@ function revert(
   flags: Record<string, string | boolean | string[] | undefined>,
   json: boolean,
 ): number {
+  // The device rides the same empty-aware selector as list and
+  // destinations: `--device ""` names the legacy un-sharded pair, and a
+  // selector that dropped the empty string beside `--path` would revert
+  // the path's writes from EVERY device while looking device-scoped.
+  const device = deviceSelector(flags);
   const selector: NoteRevertSelector = {
     ...selectorField(flags, "agent"),
-    ...selectorField(flags, "device"),
+    ...(device !== null ? { device } : {}),
     ...selectorField(flags, "path"),
     ...selectorField(flags, "since"),
     ...selectorField(flags, "until"),
@@ -224,6 +394,9 @@ function revert(
     // The code first, then the sentence: an operator scripting around
     // this reads one token, and the rest of the line is for the human.
     if (err instanceof NoteRevertError) return fail(`${err.code}: ${err.message}`);
+    // The planner reads the same window bounds as the list surface, so a
+    // malformed --since / --until is the same usage error here.
+    if (err instanceof LogWindowBoundError) return usageError(err.message);
     throw err;
   }
 }
@@ -231,7 +404,7 @@ function revert(
 /** One selector field, present only when the flag carried a value. */
 function selectorField(
   flags: Record<string, string | boolean | string[] | undefined>,
-  key: "agent" | "device" | "path" | "since" | "until",
+  key: "agent" | "path" | "since" | "until",
 ): Partial<Record<typeof key, string>> {
   const value = normalizeFlagString(flags[key]);
   return value === null ? {} : { [key]: value };
@@ -240,7 +413,9 @@ function selectorField(
 /** The plan's own `--apply` line, so the digest never has to be retyped. */
 function applyInvocation(selector: NoteRevertSelector, digest: string): string {
   const parts = ["o2b", "brain", "writes", "revert"];
-  for (const [key, value] of Object.entries(selector)) parts.push(`--${key}`, String(value));
+  for (const [key, value] of Object.entries(selector)) {
+    parts.push(`--${key}`, shellWord(value));
+  }
   parts.push("--apply", digest);
   return parts.join(" ");
 }

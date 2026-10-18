@@ -37,6 +37,7 @@ import {
 } from "./ledger-shards.ts";
 import { brainDirs, validateIsoDate } from "./paths.ts";
 import { parseLogDayFile, type BrainLogEntry, type BrainLogParseWarning } from "./log.ts";
+import { neutralizeSingleLine } from "./untrusted-source.ts";
 import { BRAIN_LOG_EVENT_KIND_SET, type BrainLogEventKind } from "./types.ts";
 
 export interface ReadLogDayResult {
@@ -54,6 +55,24 @@ export interface ReadLogDayResult {
    * in the payload.
    */
   readonly entryShardIds: ReadonlyArray<string>;
+  /**
+   * The 0-based index each entry in {@link entries} occupies among its
+   * own shard's PARSED entries, in file order - not the merge position,
+   * and not the physical file line: rows that fail to parse (reported
+   * as warnings) are uncounted, so a shard with skipped rows numbers
+   * its entries against a shorter prefix than the file really has. The
+   * merge orders by (timestamp, shardId, line), so when a shard's
+   * timestamps go backwards (backfill, clock skew) its merge positions
+   * diverge from these; a consumer that must name a durable position
+   * within one shard's read (the log catch-up watermark) reads this,
+   * because appends only ever extend a shard file and the parsed-entry
+   * index never needs retraction.
+   *
+   * A parallel array for the same reason {@link entryShardIds} is: the
+   * shard-internal line belongs beside the shard id, and neither is a
+   * field every `BrainLogEntry` producer can fill.
+   */
+  readonly entryLines: ReadonlyArray<number>;
   readonly source: "jsonl" | "markdown-fallback";
   readonly warnings: ReadonlyArray<BrainLogParseWarning>;
 }
@@ -72,6 +91,23 @@ export interface ReadLogDayResult {
 // do not share a constant — drift in either direction would silently
 // break the contract of the other surface.
 const ISO_UTC_TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+
+/**
+ * The longest stretch of a log-controlled value a parse warning carries.
+ * Warnings are model-facing - they ride MCP tool output and the CLI write
+ * reports - so the value is fenced here at the source: neutralized to one
+ * line by {@link neutralizeSingleLine}, then capped. The row's `path` and
+ * `lineNumber` fields identify it; the message never needs the full bytes.
+ */
+const MAX_WARNING_VALUE_CHARS = 120;
+
+/** Fence one log-controlled value for interpolation into a warning. */
+function fenceWarningValue(value: string): string {
+  const neutralized = neutralizeSingleLine(value);
+  return neutralized.length > MAX_WARNING_VALUE_CHARS
+    ? `${neutralized.slice(0, MAX_WARNING_VALUE_CHARS)}…`
+    : neutralized;
+}
 
 /**
  * One log file name: `<date>.jsonl`, `<date>.md`, or the sharded
@@ -184,7 +220,7 @@ export function readLogDay(
   const validDate = validateIsoDate(date);
   const shards = (preloadedShards ?? listLogShardFiles(vault)).filter((f) => f.date === validDate);
   if (shards.length === 0) {
-    return { entries: [], entryShardIds: [], source: "jsonl", warnings: [] };
+    return { entries: [], entryShardIds: [], entryLines: [], source: "jsonl", warnings: [] };
   }
 
   // Group by shard id; per shard prefer .jsonl over .md.
@@ -216,15 +252,19 @@ export function readLogDay(
   }
 
   // The merge orders by (timestamp, shard id, line) and returns values
-  // only, so the shard id rides inside the value to come out beside its
-  // entry at the same index.
+  // only, so the shard id and the shard-internal file line ride inside
+  // the value to come out beside their entry at the same index.
   const merged = mergeShardedRows(
-    tagged.map((row) => ({ ...row, value: { entry: row.value, shardId: row.shardId } })),
+    tagged.map((row) => ({
+      ...row,
+      value: { entry: row.value, shardId: row.shardId, line: row.line },
+    })),
     (row) => row.entry.timestamp,
   );
   return {
     entries: merged.map((row) => row.entry),
     entryShardIds: merged.map((row) => row.shardId),
+    entryLines: merged.map((row) => row.line),
     source: usedMarkdown ? "markdown-fallback" : "jsonl",
     warnings,
   };
@@ -330,7 +370,9 @@ function readJsonl(path: string): ReadJsonlResult {
       warnings.push({
         path,
         lineNumber: i + 1,
-        message: `malformed JSONL line: ${line.slice(0, 80)}`,
+        // The least trusted value in the parser: any bytes that failed
+        // JSON.parse, so the preview rides the same fence as ts/kind.
+        message: `malformed JSONL line: ${fenceWarningValue(line.slice(0, 80))}`,
       });
       continue;
     }
@@ -364,11 +406,11 @@ function coerceEntry(
   // `BrainLogEntry.timestamp` and break downstream consumers that
   // assume the strict format (e.g. `parseIsoUtc` in `log.ts`).
   if (!ISO_UTC_TS_RE.test(ts)) {
-    warnings.push({ path, lineNumber, message: `invalid ts format: ${ts}` });
+    warnings.push({ path, lineNumber, message: `invalid ts format: ${fenceWarningValue(ts)}` });
     return null;
   }
   if (!BRAIN_LOG_EVENT_KIND_SET.has(kind)) {
-    warnings.push({ path, lineNumber, message: `unknown event kind: ${kind}` });
+    warnings.push({ path, lineNumber, message: `unknown event kind: ${fenceWarningValue(kind)}` });
     return null;
   }
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
@@ -389,7 +431,7 @@ function coerceEntry(
       warnings.push({
         path,
         lineNumber,
-        message: `JSONL payload key '${k}' has unsupported value type`,
+        message: `JSONL payload key '${fenceWarningValue(k)}' has unsupported value type`,
       });
     }
   }

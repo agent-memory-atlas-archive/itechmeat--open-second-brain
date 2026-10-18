@@ -28,6 +28,13 @@ import { listLogDates, listLogShardFiles, readLogDay, type LogShardFile } from "
 import type { BrainLogEntry, BrainLogParseWarning } from "../log.ts";
 import { BRAIN_LOG_EVENT_KIND } from "../types.ts";
 import { ORIGIN_CHANNEL_FIELD } from "../../origin-channel.ts";
+import {
+  DATE_LENGTH,
+  DAY_END_SUFFIX,
+  DAY_START_SUFFIX,
+  parseWindowBound,
+  timestampInWindow,
+} from "./log-window.ts";
 import { isNoteWriteOp, type NoteWriteOp } from "./write-record.ts";
 
 /** One recorded note write, projected from its log event. */
@@ -59,7 +66,13 @@ export interface NoteWriteRecord {
 export interface ListNoteWritesFilter {
   /** Exact agent identity. */
   readonly agent?: string;
-  /** Exact device id; the empty string selects the legacy un-sharded pair. */
+  /**
+   * Exact device id; the empty string selects the legacy un-sharded pair.
+   * Read one raw flag or argument into this field through
+   * {@link isLegacyPairDevice}: a coercion that treats emptiness as
+   * absence turns the pair's name into "no filter", and a device-scoped
+   * read or revert silently widens to every device.
+   */
   readonly device?: string;
   /** Exact vault-relative target path. */
   readonly path?: string;
@@ -77,26 +90,17 @@ export interface ListNoteWritesResult {
   readonly warnings: ReadonlyArray<BrainLogParseWarning>;
 }
 
-/** Characters of an ISO-8601 timestamp that spell its date. */
-const DATE_LENGTH = 10;
-
-/** A bare `YYYY-MM-DD`, which both bounds accept as shorthand for a day. */
-const ISO_DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
-
-/** How a bare date is completed at each end of the window. */
-const DAY_START_SUFFIX = "T00:00:00Z";
-const DAY_END_SUFFIX = "T23:59:59Z";
-
 /**
- * Complete a bound to a comparable timestamp.
- *
- * A bare `--until 2026-03-04` means "through the end of the fourth", not
- * "up to midnight starting it" - the second reading would return nothing
- * for the very day an operator just named, which is the kind of empty
- * that reads as "no writes" rather than as "wrong bound".
+ * Whether one raw `--device` / `device` argument names the legacy
+ * un-sharded pair: an empty or whitespace-only string. The pair's name
+ * IS a filter value ({@link ListNoteWritesFilter.device}), so every
+ * surface must test this before any coercion that treats emptiness as
+ * absence - the shared rule behind the CLI's `deviceSelector` and the
+ * MCP `deviceArg`, which the revert selector once skipped and silently
+ * reverted every device's writes.
  */
-function completeBound(value: string, suffix: string): string {
-  return ISO_DATE_ONLY_RE.test(value) ? `${value}${suffix}` : value;
+export function isLegacyPairDevice(raw: unknown): raw is string {
+  return typeof raw === "string" && raw.trim() === "";
 }
 
 /** Payload value as a string, or null when the key is absent or a list. */
@@ -171,8 +175,10 @@ export function listNoteWrites(
   vault: string,
   filter: ListNoteWritesFilter = {},
 ): ListNoteWritesResult {
-  const since = filter.since === undefined ? null : completeBound(filter.since, DAY_START_SUFFIX);
-  const until = filter.until === undefined ? null : completeBound(filter.until, DAY_END_SUFFIX);
+  const since =
+    filter.since === undefined ? null : parseWindowBound(filter.since, "since", DAY_START_SUFFIX);
+  const until =
+    filter.until === undefined ? null : parseWindowBound(filter.until, "until", DAY_END_SUFFIX);
   const shards: ReadonlyArray<LogShardFile> = listLogShardFiles(vault);
   const warnings: BrainLogParseWarning[] = [];
   const writes: NoteWriteRecord[] = [];
@@ -189,8 +195,7 @@ export function listNoteWrites(
       if (filter.device !== undefined && record.device !== filter.device) return;
       if (filter.path !== undefined && record.target !== filter.path) return;
       if (filter.op !== undefined && record.op !== filter.op) return;
-      if (since !== null && record.timestamp < since) return;
-      if (until !== null && record.timestamp > until) return;
+      if (!timestampInWindow(record.timestamp, since, until)) return;
       writes.push(record);
     });
   }

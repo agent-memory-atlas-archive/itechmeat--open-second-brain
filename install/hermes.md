@@ -158,6 +158,39 @@ location shadows the plugin `hermes plugins install` and
 `hermes plugins update` manage, so an update appears to change nothing.
 Remove such a copy and restart the gateway.
 
+### How Hermes discovers the provider
+
+The primary route needs no packaging metadata at all: `hermes plugins
+install` git-clones the repo into `~/.hermes/plugins/open-second-brain/`,
+and Hermes discovers the provider by scanning that plugin directory -
+the `plugins/hermes` package ships `plugin.yaml` declaring
+`memory_provider: true`, and the loader imports `plugins.hermes` and
+finds the `register` callable there. A git clone registers no Python
+entry-point metadata, so this path never consults the entry point.
+
+The declared `hermes_agent.memory_providers` entry point group - the
+`open-second-brain` entry names the same `plugins.hermes` module - is an
+extra discovery route for pip or wheel installs only: entry-point
+metadata exists when the package has been installed into the
+environment, not when a checkout is cloned. That route presumes a clean
+environment - the target rides the top-level `plugins` package name,
+which only an operator-controlled install environment guarantees - so it
+is a convenience layered on top of the directory scan, never a
+requirement for the plugin install in step 1.
+
+Registering the provider is automatic; running it is not entirely. The
+provider serves memory by driving the Open Second Brain CLI over an
+internal `o2b mcp` bridge, and Bun is required in every context: the
+`o2b` wrapper on PATH (step 2 creates the links) is itself a bash script
+that checks `command -v bun` first and refuses to run without it, and
+the checkout fallback launches the repo's TypeScript entry point through
+`bun run` directly. With Bun installed, either context - `o2b` on PATH
+or a checkout - needs nothing beyond the install above. When Bun is
+missing, or neither an `o2b` binary nor a checkout is present,
+registration still succeeds and the failure surfaces later as a bridge
+start error in the gateway log, so keep step 2 in place and Bun
+installed.
+
 ## 5. Verify
 
 ```bash

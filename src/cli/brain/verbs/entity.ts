@@ -1,5 +1,5 @@
 /**
- * `o2b brain entity <set|get|list|relate|archive>` - canonical entity
+ * `o2b brain entity <set|get|list|relate|archive|merge>` - canonical entity
  * registry verbs (Memory Integrity Suite). Writes stay on the CLI;
  * the MCP surface exposes the read-only subset (`brain_entity`).
  */
@@ -13,6 +13,13 @@ import {
   upsertEntity,
 } from "../../../core/brain/entities/registry.ts";
 import {
+  EntityMergeError,
+  applyEntityMerge,
+  entityMergePlanHash,
+  planEntityMerge,
+  type EntityMergePlan,
+} from "../../../core/brain/entities/page-merge.ts";
+import {
   BRAIN_ENTITY_STATUS_VALUES,
   isBrainEntityStatus,
   type BrainEntity,
@@ -25,14 +32,17 @@ import {
 } from "../../../core/brain/entities/lexicon.ts";
 import {
   brainVerbContext,
+  CliError,
   fail,
   info,
   normalizeFlagString,
   ok,
   okJson,
   parse,
+  readSingleLine,
   usageError,
 } from "../helpers.ts";
+import { shellWord } from "../../cron-recipe.ts";
 
 function entityPayload(entity: BrainEntity): Record<string, unknown> {
   return {
@@ -74,11 +84,14 @@ export async function cmdBrainEntity(argv: string[]): Promise<number> {
       return entityPrune(rest);
     case "lexicon":
       return entityLexicon(rest);
+    case "merge":
+      return await entityMerge(rest);
     default:
       return usageError(
         "brain entity requires a subcommand: set <category> <name> | get <name> | list | " +
           "relate <from> <relation> <to> | archive <name> [--restore] | " +
-          "prune [--confirm] [--include-advisory] | lexicon rebuild [--apply]",
+          "prune [--confirm] [--include-advisory] | lexicon rebuild [--apply] | " +
+          "merge <keep> <drop> [--dry-run] [--expect-hash <hash>]",
       );
   }
 }
@@ -378,5 +391,239 @@ function entityArchive(argv: string[]): number {
       return 2;
     }
     return fail(`brain entity archive failed: ${message}`);
+  }
+}
+
+/** One plan line an operator (or a TTY prompt) reads before consenting. */
+function mergePlanLines(plan: EntityMergePlan, hash: string, applyCommand: string): string[] {
+  return [
+    "merge plan:",
+    `  keep: ${plan.keep_id} (${plan.keep_name})`,
+    `  drop: ${plan.drop_id} (${plan.drop_name}) -> ${plan.drop_path}`,
+    `  alias added: ${plan.alias_added ?? "none - the survivor already answers to that name"}`,
+    `  body: ${plan.body_folded ? "folded into the survivor" : "archived (nothing to fold)"}`,
+    `  relations absorbed: ${plan.relations_absorbed}; inbound edges retargeted: ` +
+      `${plan.inbound_edges_retargeted}; cyclic edges removed: ${plan.cyclic_edges_removed}`,
+    // The bypass is a fact about this plan, stated where the consent is
+    // given - never left to be inferred from a flag in the echo.
+    ...(plan.guard_bypassed
+      ? ["  guard: --force bypasses the text-level merge guard for this merge"]
+      : []),
+    `  plan-hash: ${hash}`,
+    `  apply: ${applyCommand}`,
+  ];
+}
+
+/** Refusals carry the CODE first, then the sentence an agent can skip. */
+function entityMergeRefusal(exc: unknown, json: boolean): number {
+  if (exc instanceof EntityMergeError) {
+    if (json) {
+      okJson({ ok: false, code: exc.code, message: exc.message });
+      return 1;
+    }
+    return fail(`brain entity merge: ${exc.message}`);
+  }
+  // Not a merge refusal - vault identity, snapshot gate, fs. Rethrow so
+  // the verb-level wrapper answers a JSON caller on stdout.
+  throw exc;
+}
+
+/** Refusal code for a merge nobody consented to: consent missing, not wrong. */
+const CONSENT_REQUIRED_CODE = "consent-required";
+
+/** The parsed-flag shape `parse` returns, restated for the run helper. */
+type EntityMergeFlags = Record<string, string | boolean | string[] | undefined>;
+
+/**
+ * `o2b brain entity merge <keep> <drop>` (actionable-now batch, A2 /
+ * t_28a8789d): preview-and-apply repair for two entity pages that denote
+ * one subject - the doctor's `duplicate-entity` collision, or an opt-in
+ * `entity-alias-candidate` nomination. Both subjects accept ids, names
+ * and aliases, so either finding resolves.
+ *
+ * The gate is the plan hash: `--dry-run` renders the plan and echoes its
+ * hash; apply requires `--expect-hash <hash>` and re-plans, refusing
+ * before any write when the live vault no longer produces the plan the
+ * caller read. Consent is a TTY y/N prompt, `--force` for agents, and
+ * `--json` refuses without `--force` because the prompt cannot render.
+ * The apply itself never bare-deletes: the old page is archived behind
+ * the destructive-snapshot gate, the old name becomes an alias on the
+ * survivor, and no claim is rewritten.
+ *
+ * The body runs under one more gate: a failure below the verb's own
+ * refusal vocabulary (vault identity, the snapshot gate, the filesystem)
+ * still owes a `--json` caller a structured line on stdout instead of
+ * prose on a channel the caller never reads.
+ */
+async function entityMerge(argv: string[]): Promise<number> {
+  const { flags, positional } = parse(argv, {
+    vault: { type: "string" },
+    "dry-run": { type: "boolean" },
+    "expect-hash": { type: "string" },
+    force: { type: "boolean" },
+    agent: { type: "string" },
+    json: { type: "boolean" },
+  });
+  const json = flags["json"] === true;
+  try {
+    return await runEntityMerge(flags, positional, json);
+  } catch (exc) {
+    // A missing or empty --vault stays a usage-level CliError with its own
+    // top-level formatting; everything else is an internal failure, and
+    // the message travels alone - never a stack.
+    if (exc instanceof CliError) throw exc;
+    const message = exc instanceof Error ? exc.message : String(exc);
+    if (json) {
+      okJson({ ok: false, code: "internal-error", message });
+      return 1;
+    }
+    return fail(`brain entity merge failed: ${message}`);
+  }
+}
+
+async function runEntityMerge(
+  flags: EntityMergeFlags,
+  positional: string[],
+  json: boolean,
+): Promise<number> {
+  if (positional.length !== 2) {
+    return fail("brain entity merge requires <keep> and <drop> (ids, names or aliases)");
+  }
+  const { config, vault } = brainVerbContext(flags);
+  const refs = { keep: positional[0]!, drop: positional[1]! };
+  const force = flags["force"] === true;
+  const dryRun = flags["dry-run"] === true;
+  const expectHash = normalizeFlagString(flags["expect-hash"]);
+  // The acting identity, resolved the way the sibling entity verbs do:
+  // an explicit --agent wins, a blank one normalizes away, and the
+  // configured agent_name attributes what is left - never "unknown"
+  // while a config names an agent, and never a null actor at all.
+  const agent = normalizeFlagString(flags["agent"]) ?? resolveAgentName(config);
+
+  let plan: EntityMergePlan;
+  try {
+    // `--force` is the consent for the text-level merge guard bypass, so it
+    // reaches the preview too: a guarded pair must be previewable (to get
+    // its plan hash) exactly as it is applicable. The plan-hash gate below
+    // is separate and stays unbypassable.
+    plan = planEntityMerge(vault, refs, { bypassEntityGuard: force });
+  } catch (exc) {
+    return entityMergeRefusal(exc, json);
+  }
+  const hash = entityMergePlanHash(plan);
+  // The echo is a command an operator (or an agent) pastes back, so every
+  // argument a shell would split is quoted: subjects AND the vault. An
+  // explicit --vault rides along - against a synced copy with identical
+  // ids and paths, an echo that dropped it would apply to whichever vault
+  // the paste resolved instead of the one that was previewed.
+  const vaultFlag = normalizeFlagString(flags["vault"]);
+  const applyCommand =
+    `o2b brain entity merge ${shellWord(refs.keep)} ${shellWord(refs.drop)}` +
+    (vaultFlag !== null ? ` --vault ${shellWord(vaultFlag)}` : "") +
+    ` --expect-hash ${hash}` +
+    (force ? " --force" : "");
+  const planLines = mergePlanLines(plan, hash, applyCommand);
+
+  if (dryRun) {
+    if (json) {
+      okJson({ dry_run: true, plan, plan_hash: hash, apply: applyCommand });
+    } else {
+      for (const line of planLines) ok(line);
+      ok("dry-run; no changes written");
+    }
+    return 0;
+  }
+
+  // The hash gate is a fact-check, not a consent gate: it runs before the
+  // prompt and refuses regardless of --force, because a stale plan is a
+  // vault that moved under the operator.
+  if (expectHash === null) {
+    return entityMergeRefusal(
+      new EntityMergeError(
+        "hash-required",
+        "no --expect-hash given; run the --dry-run preview first and present the plan hash " +
+          "it echoes",
+      ),
+      json,
+    );
+  }
+  if (expectHash !== hash) {
+    // One story, whatever the stance history: the plan hash seals the
+    // vault state the preview saw (a guard-passing pair hashes
+    // identically at either --force stance - only an override the guard
+    // would have refused stamps differently, and a pair the guard
+    // refuses cannot be re-planned without it), so a mismatch means the
+    // vault moved under the operator, and the refusal says so plainly.
+    return entityMergeRefusal(
+      new EntityMergeError(
+        "hash-mismatch",
+        `--expect-hash ${expectHash} does not describe this vault's merge plan any more ` +
+          `(${hash}); the vault changed since the preview - re-run the preview and apply ` +
+          "the hash it echoes",
+      ),
+      json,
+    );
+  }
+
+  if (!force) {
+    // Either consent refusal keeps its prose line for a human, but a JSON
+    // caller gets the structured shape on stdout - same contract as every
+    // other refusal this verb emits.
+    const consentRefusal = (message: string): number => {
+      if (json) {
+        okJson({ ok: false, code: CONSENT_REQUIRED_CODE, message });
+        return 1;
+      }
+      return fail(message);
+    };
+    if (json) {
+      return consentRefusal(
+        "brain entity merge: --json without --force is not supported (interactive prompt " +
+          "cannot render)",
+      );
+    }
+    if (!process.stdin.isTTY) {
+      return consentRefusal(
+        "brain entity merge: --force required when stdin is not a TTY (cannot prompt for " +
+          "confirmation)",
+      );
+    }
+    for (const line of planLines) process.stderr.write(line + "\n");
+    process.stderr.write("Proceed? [y/N] ");
+    const ans = (await readSingleLine()).toLowerCase();
+    if (ans !== "y" && ans !== "yes") {
+      ok("merge cancelled");
+      return 0;
+    }
+  }
+
+  try {
+    const result = applyEntityMerge(vault, refs, {
+      expectHash,
+      bypassEntityGuard: force,
+      now: new Date(),
+      agent,
+    });
+    if (json) {
+      okJson({
+        applied: true,
+        keep_id: result.plan.keep_id,
+        drop_id: result.plan.drop_id,
+        alias_added: result.plan.alias_added,
+        body_folded: result.plan.body_folded,
+        dropped_path: result.dropped_path,
+        plan_hash: result.verified_hash,
+        snapshot_run_id: result.snapshot_run_id,
+        snapshot_path: result.snapshot_path,
+      });
+    } else {
+      ok(`merged: ${result.plan.drop_id} -> ${result.plan.keep_id}`);
+      if (result.plan.alias_added !== null) ok(`  alias added: ${result.plan.alias_added}`);
+      ok(`  recovery point: snapshot ${result.snapshot_run_id}`);
+      if (result.snapshot_path) info(`    ${result.snapshot_path}`);
+    }
+    return 0;
+  } catch (exc) {
+    return entityMergeRefusal(exc, json);
   }
 }

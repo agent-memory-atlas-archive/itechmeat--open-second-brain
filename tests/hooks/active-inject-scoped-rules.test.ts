@@ -30,6 +30,11 @@ import {
   readScopedRules,
 } from "../../src/core/brain/scoped-rules.ts";
 import { budgetActiveBody } from "../../src/core/brain/active-budget.ts";
+import {
+  neutralizeUntrustedText,
+  untrustedBindingFramingHeader,
+} from "../../src/core/brain/untrusted-source.ts";
+import { SOURCE_ACTIVE_BODY } from "../../hooks/lib/active-context.ts";
 import { writeVaultPointer } from "../../src/core/brain/portability/pointer.ts";
 import { homeEnv } from "../helpers/platform.ts";
 import { waitForSelfHealChildren } from "../helpers/self-heal-children.ts";
@@ -221,8 +226,16 @@ describe("active-inject scoped rules - budget", () => {
     expect(context).toContain(expected.text);
 
     const trimmedActive = longActive.slice(longActive.indexOf(ACTIVE_HEAD)).trim();
-    const activeBudget = Math.max(0, 1000 - expected.text.length);
-    expect(context.endsWith(budgetActiveBody(trimmedActive, activeBudget))).toBe(true);
+    // The framed guarded body: the header's overhead comes out of the
+    // budget the scoped block left, then the neutralized body is budgeted
+    // into the rest, exactly as the assembly composes it.
+    const framedHeader = untrustedBindingFramingHeader(SOURCE_ACTIVE_BODY);
+    const activeBudget = Math.max(0, 1000 - expected.text.length - (framedHeader.length + 1));
+    expect(
+      context.endsWith(
+        `${framedHeader}\n${budgetActiveBody(neutralizeUntrustedText(trimmedActive), activeBudget)}`,
+      ),
+    ).toBe(true);
 
     const receipts = injectionReceipts();
     expect(receipts.length).toBe(1);
@@ -306,6 +319,52 @@ describe("active-inject scoped rules - gaps closed by the test audit", () => {
   });
 
   test("the header and the notices ride inside a tight injection budget", async () => {
+    // 800, not the 500 floor: the scoped-rules charge here still leaves
+    // more room than the memory framing costs, so the header fits and the
+    // budget math below is the pinned contract. The tighter case - a
+    // charge that leaves LESS room than the framing - is the next test.
+    writeFileSync(
+      join(vault, "Brain", "_brain.yaml"),
+      "schema_version: 1\nactive:\n  inject_budget_chars: 800\n  scoped_rules_max_chars: 200\n",
+      "utf8",
+    );
+    writeScoped("project", "proj-x", `${MARKER} ${"x".repeat(5000)}`);
+    const lines = Array.from({ length: 60 }, (_, i) => `- \`pref-${i}\` — rule body number ${i}`);
+    const longActive = `---\nkind: brain-active\ngenerated_at: 2026-05-15T10:00:00Z\n---\n\n${ACTIVE_HEAD}\n\n## Confirmed (60)\n\n${lines.join("\n")}\n`;
+    writeFileSync(join(vault, "Brain", "active.md"), longActive, "utf8");
+
+    const context = injected(await runHook({ hook_event_name: "SessionStart", cwd: projectX }));
+
+    const scopedStart = context.indexOf(SCOPED_RULES_HEADER);
+    // The memory body opens with its framing header, not the digest title.
+    const activeStart = context.indexOf(untrustedBindingFramingHeader(SOURCE_ACTIVE_BODY));
+    expect(scopedStart).toBeGreaterThan(-1);
+    expect(activeStart).toBeGreaterThan(scopedStart);
+    const scopedBlock = context.slice(scopedStart, activeStart).trimEnd();
+    // A one-line rule that cannot fit is dropped whole, never left as a
+    // bare heading, and the notice says so.
+    expect(scopedBlock).not.toContain("### Project: proj-x");
+    expect(scopedBlock).toContain("1 file(s) dropped");
+    expect(scopedBlock.length).toBeLessThanOrEqual(800);
+    // The budgeted output (the constitution excluded) stays within the
+    // budget plus the memory body's own truncation notice.
+    const budgeted = context.slice(scopedStart);
+    const trimmedActive = longActive.slice(longActive.indexOf(ACTIVE_HEAD)).trim();
+    const framedHeader = untrustedBindingFramingHeader(SOURCE_ACTIVE_BODY);
+    const activeBudget = 800 - scopedBlock.length - (framedHeader.length + 1);
+    const activeOut = `${framedHeader}\n${budgetActiveBody(neutralizeUntrustedText(trimmedActive), activeBudget)}`;
+    expect(budgeted.endsWith(activeOut)).toBe(true);
+    const activeNotice = activeOut.slice(activeOut.lastIndexOf("\n\n") + 2);
+    expect(budgeted.length).toBeLessThanOrEqual(800 + "\n\n".length + activeNotice.length);
+  });
+
+  test("a scoped charge that leaves less room than the memory framing skips the memory source whole", async () => {
+    // At the 500 config floor the scoped block's own header and notices
+    // can consume enough of the budget that what remains cannot hold the
+    // memory body's framing header. Emitting the header alone would push
+    // the framed remainder past the very budget it is charged against, so
+    // the memory source is skipped whole: no bare header, no body, and
+    // nothing metered after the scoped block.
     writeFileSync(
       join(vault, "Brain", "_brain.yaml"),
       "schema_version: 1\nactive:\n  inject_budget_chars: 500\n  scoped_rules_max_chars: 200\n",
@@ -319,23 +378,25 @@ describe("active-inject scoped rules - gaps closed by the test audit", () => {
     const context = injected(await runHook({ hook_event_name: "SessionStart", cwd: projectX }));
 
     const scopedStart = context.indexOf(SCOPED_RULES_HEADER);
-    const activeStart = context.indexOf(ACTIVE_HEAD);
     expect(scopedStart).toBeGreaterThan(-1);
-    const scopedBlock = context.slice(scopedStart, activeStart).trimEnd();
-    // A one-line rule that cannot fit is dropped whole, never left as a
-    // bare heading, and the notice says so.
-    expect(scopedBlock).not.toContain("### Project: proj-x");
-    expect(scopedBlock).toContain("1 file(s) dropped");
-    expect(scopedBlock.length).toBeLessThanOrEqual(500);
-    // The budgeted output (the constitution excluded) stays within the
-    // budget plus the memory body's own truncation notice.
+    // The scoped block still renders, dropped file named, inside budget.
     const budgeted = context.slice(scopedStart);
-    const trimmedActive = longActive.slice(longActive.indexOf(ACTIVE_HEAD)).trim();
-    const activeBudget = 500 - scopedBlock.length;
-    const activeOut = budgetActiveBody(trimmedActive, activeBudget);
-    expect(budgeted.endsWith(activeOut)).toBe(true);
-    const activeNotice = activeOut.slice(activeOut.lastIndexOf("\n\n") + 2);
-    expect(budgeted.length).toBeLessThanOrEqual(500 + "\n\n".length + activeNotice.length);
+    expect(budgeted).toContain("1 file(s) dropped");
+    expect(budgeted.length).toBeLessThanOrEqual(500);
+    // The memory framing does not fit what is left: no header, no body,
+    // nothing after the scoped block at all.
+    expect(context.indexOf(untrustedBindingFramingHeader(SOURCE_ACTIVE_BODY))).toBe(-1);
+    expect(context).not.toContain(ACTIVE_HEAD);
+    expect(context.trimEnd()).toBe(
+      context.slice(0, scopedStart).trimEnd() + "\n\n" + budgeted.trimEnd(),
+    );
+    // The receipt carries the scoped measurement but no memory body: the
+    // floor returns before the memory source is metered.
+    const receipts = injectionReceipts();
+    const items = receipts[receipts.length - 1]!.payload["items"] as ReadonlyArray<
+      Record<string, unknown>
+    >;
+    expect(items.map((item) => item["id"])).toEqual(["standing-rules", "scoped-rules"]);
   });
 
   test("a degraded run keeps the scoped-rules item in the receipt", async () => {

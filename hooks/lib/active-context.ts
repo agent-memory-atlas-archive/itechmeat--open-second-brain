@@ -31,7 +31,11 @@ import { existsSync, readFileSync } from "node:fs";
 
 import { parseFrontmatterText } from "../../src/core/vault.ts";
 import { brainActivePath, brainLessonsPath } from "../../src/core/brain/paths.ts";
-import { budgetActiveBody } from "../../src/core/brain/active-budget.ts";
+import { budgetActiveBody, isTruncationNoticeOnly } from "../../src/core/brain/active-budget.ts";
+import {
+  neutralizeUntrustedText,
+  untrustedBindingFramingHeader,
+} from "../../src/core/brain/untrusted-source.ts";
 import {
   INJECT_BUDGET_CHARS_DEFAULT,
   loadBrainConfig,
@@ -75,6 +79,33 @@ export const BLOCK_SEPARATOR = "\n\n";
 /** Join the non-empty blocks in order; an all-empty list yields "". */
 export function joinBlocks(blocks: ReadonlyArray<string>): string {
   return blocks.filter((block) => block.length > 0).join(BLOCK_SEPARATOR);
+}
+
+/**
+ * Set one budgeted memory body under the light untrusted framing header:
+ * the header line, then the body. A full fence is deliberately not used
+ * here - the wrapper pair would be charged to `inject_budget_chars` and
+ * the tier ladder would answer by evicting sections - so the provenance
+ * rides as the shared one-line header instead. The clause is the MEMORY
+ * lanes' binding clause, not the foreign lanes' records-not-instructions
+ * disclaimer: these bodies ARE the product's rules lane, and a preamble
+ * telling the model to read them as data would have it ignore the
+ * preferences the lane exists to deliver. The header line IS part of the
+ * metered source, so per-source attribution names the guarded bytes.
+ */
+function frameMemoryBody(origin: string, body: string): string {
+  return `${untrustedBindingFramingHeader(origin)}\n${body}`;
+}
+
+/**
+ * The characters one framed body costs beyond its inner body: the header
+ * line plus the newline that carries the body. Charged against the
+ * injection budget before the tier ladder runs (the recall-inject
+ * fenceOverhead precedent), so the ladder never evicts a section merely
+ * to pay for the framing.
+ */
+function framingOverhead(origin: string): number {
+  return untrustedBindingFramingHeader(origin).length + 1;
 }
 
 /** A fresh, empty meter for one assembly run. */
@@ -255,6 +286,16 @@ function readActiveBody(
   const trimmed = fmBody.trim();
   if (trimmed.length === 0) return "";
 
+  // A budget that cannot hold even the framing header skips the source
+  // whole: emitting the header alone would push the framed remainder
+  // past the very budget it is charged against, and metering it would
+  // name bytes that never reached the payload. The floor is `<=` - at
+  // exactly the overhead the inner budget is 0 and the budgeter answers
+  // with the truncation notice alone, which is over budget framed. The
+  // lessons reader applies the same floor to its own header.
+  const overhead = framingOverhead(SOURCE_ACTIVE_BODY);
+  if (budget <= overhead) return "";
+
   // Injection budget (token-diet): a large preference set must not flood
   // the session preamble. Resolved once in `resolveInjectionLimits`,
   // which also carries the reasoning for why a config failure lands on
@@ -265,7 +306,6 @@ function readActiveBody(
   // ceiling is recorded, not the `budget` argument: that is what is left
   // after the scoped rules were charged, and the receipt reports the two
   // separately (`inject_budget_chars`, `scoped_rules_chars`).
-  meter.budgetChars = meter.configuredBudgetChars;
 
   // Auto-load the lessons digest alongside active.md so the agent gets
   // the unified, signed, recency-scored corpus (preferences + dead-ends)
@@ -274,13 +314,32 @@ function readActiveBody(
   // the active-preferences injection above.
   const lessonsBody = readLessonsBody(brainLessonsPath(vault), budget);
 
-  const budgetedActive = budgetActiveBody(trimmed, budget);
-  meter.sources.push({
-    name: SOURCE_ACTIVE_BODY,
-    text: budgetedActive,
-    lane: LANE_BUDGETED,
-    outsideBoundary: false,
-  });
+  // Untrusted vault content: neutralize (control/bidi/zero-width strip,
+  // delimiter escape) BEFORE budgeting, and set under the light
+  // framing header. The header's overhead comes out of this body's budget
+  // first, so the tier ladder works on the room that is actually left and
+  // the framed whole stays within the budget it is charged against.
+  const innerBudget = budget - overhead;
+  const inner = budgetActiveBody(neutralizeUntrustedText(trimmed), innerBudget);
+  // A budgeted body that is ONLY the truncation notice carries no
+  // content at all: framed, header + notice would land over the budget
+  // the source is charged against, so the ACTIVE source skips with it -
+  // the same honesty the sub-header floor practices, one rung up. The
+  // skip is this source's alone: the lessons body read above answers to
+  // its own header's overhead and its own budgeted remainder, so what
+  // it produced still emits and meters. "" is for a run where no block
+  // was produced at all.
+  const activeBlock = isTruncationNoticeOnly(inner)
+    ? ""
+    : frameMemoryBody(SOURCE_ACTIVE_BODY, inner);
+  if (activeBlock.length > 0) {
+    meter.sources.push({
+      name: SOURCE_ACTIVE_BODY,
+      text: activeBlock,
+      lane: LANE_BUDGETED,
+      outsideBoundary: false,
+    });
+  }
   if (lessonsBody !== null) {
     meter.sources.push({
       name: SOURCE_LESSONS_BODY,
@@ -289,14 +348,21 @@ function readActiveBody(
       outsideBoundary: false,
     });
   }
-
-  return lessonsBody === null ? budgetedActive : joinBlocks([budgetedActive, lessonsBody]);
+  // A budgeted source was measured under the configured ceiling, so the
+  // receipt carries the budget block whenever any memory body emitted -
+  // a lessons-only assembly measured itself against the same number.
+  if (activeBlock.length > 0 || lessonsBody !== null) {
+    meter.budgetChars = meter.configuredBudgetChars;
+  }
+  return joinBlocks([activeBlock, lessonsBody ?? ""]);
 }
 
 /**
  * Read and budget the `Brain/lessons.md` body for injection. Returns
  * `null` on any failure mode (missing file, unreadable, empty body) so
- * the caller falls back to injecting active.md alone.
+ * the caller falls back to injecting active.md alone. The body is
+ * neutralized and framed like the active body, with the same
+ * budget-charged header overhead.
  */
 function readLessonsBody(lessonsPath: string, budget: number): string | null {
   if (!existsSync(lessonsPath)) return null;
@@ -305,7 +371,17 @@ function readLessonsBody(lessonsPath: string, budget: number): string | null {
     const [, body] = parseFrontmatterText(raw);
     const trimmed = body.trim();
     if (trimmed.length === 0) return null;
-    return budgetActiveBody(trimmed, budget);
+    // The active body's floor, applied to this header: a body whose
+    // framing cannot fit - or whose budgeted remainder would be nothing
+    // but the truncation notice - is skipped rather than emitted over
+    // budget. The floor is `<=` for the same reason: at exactly the
+    // overhead the inner budget is 0 and the budgeter answers with the
+    // notice alone.
+    const overhead = framingOverhead(SOURCE_LESSONS_BODY);
+    if (budget <= overhead) return null;
+    const inner = budgetActiveBody(neutralizeUntrustedText(trimmed), budget - overhead);
+    if (isTruncationNoticeOnly(inner)) return null;
+    return frameMemoryBody(SOURCE_LESSONS_BODY, inner);
   } catch {
     return null;
   }

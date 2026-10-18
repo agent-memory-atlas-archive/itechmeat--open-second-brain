@@ -296,8 +296,8 @@ export const REASONS_REACHING_OWNER_CONTENT: ReadonlySet<string> = new Set([REAS
  * `docs/mcp.md` and the release notes. Equalities, not floors - see the
  * test that reads them.
  */
-export const PROBE_ENTRY_COUNT = 103;
-export const PROBE_RECIPE_COUNT = 240;
+export const PROBE_ENTRY_COUNT = 104;
+export const PROBE_RECIPE_COUNT = 241;
 export const PROBE_TWO_SIDED_COUNT = 32;
 
 /**
@@ -362,6 +362,15 @@ export const UNSCOPED_CONTENT: ReadonlyArray<ProbeEntry> = [
         args: { action: "plan_revert", path: "notes/shared.md" },
         reason: REASON.noteRevertPlan,
       },
+    ],
+  },
+  {
+    name: "brain_write_destinations",
+    // Both bounds, quoted from the fixture's log day: the probe pins the
+    // window explicitly instead of leaning on the default, so the rows it
+    // proves never depend on when the run happens to execute.
+    calls: [
+      { args: { since: LOG_EVENT_DATE, until: LOG_EVENT_DATE }, reason: REASON.noteWriteLedger },
     ],
   },
   {

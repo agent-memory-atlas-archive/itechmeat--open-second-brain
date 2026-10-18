@@ -61,7 +61,7 @@ Brain verbs (observing memory):
   query            Read by --preference, --topic, or --since
   agent-query      Read Brain provenance by source agent (--agent; --json)
   agent-diff       Compare source-agent coverage (browse/search/diff/map)
-  writes           Recorded note writes: list (default), revert, prune-images
+  writes           Recorded note writes: list (default), destinations, revert, prune-images
   reject           Move a preference to retired (user-rejected); --yes if pinned
   freeze           Stop every content write on every device (--reason <text>)
   unfreeze         Lift the freeze and reopen the content lane
@@ -128,7 +128,7 @@ Brain verbs (observing memory):
   scan-inline         Capture @osb markers from folders listed under notes.read_paths in _brain.yaml
   scan-citations      Promote inline [Source: <name>, YYYY-MM-DD] markers to dated provenance events
   import-session      Replay signals from a registered agent session .jsonl (or directory)
-  entity              Canonical entity registry: set, get, list, relate, archive, prune, lexicon
+  entity              Canonical entity registry: set, get, list, relate, archive, prune, lexicon, merge
   session-hook        Capture one runtime hook payload from stdin (internal hook bridge)
   import-claude-memory  Import metadata.type:feedback MEMORY entries as confirmed preferences
   page-dedup          Detect (and optionally merge) near-duplicate vault pages
@@ -432,6 +432,8 @@ export const VERB_HELP: Record<string, string> = {
     "usage: o2b brain writes [list] [--agent <id>] [--device <id>] [--path <note>]\n" +
     "                        [--since <date>] [--until <date>] [--op create|update|append|revert]\n" +
     "                        [--vault <path>] [--json]\n" +
+    "       o2b brain writes destinations [--agent <id>] [--device <id>] [--path <note>]\n" +
+    "                        [--since <date>] [--until <date>] [--limit <n>] [--vault <path>] [--json]\n" +
     "       o2b brain writes revert (--agent <id> | --device <id> | --path <note>)\n" +
     "                        [--since <date>] [--until <date>] [--apply <digest>]\n" +
     "                        [--vault <path>] [--json]\n" +
@@ -448,6 +450,15 @@ export const VERB_HELP: Record<string, string> = {
     "refuses a digest that no longer describes the vault before any byte moves, takes a\n" +
     "note-revert snapshot, and records each restored or deleted target as a note write of\n" +
     "operation revert, so a revert is itself attributable and revertible.\n" +
+    "destinations folds the same ledger by target path: one row per destination the recorded\n" +
+    "write events name, across the note-write and write-session kinds (only committed - done\n" +
+    "- sessions count; a failed session landed nothing), with per-kind counts,\n" +
+    "the contributing agents and devices, and a kinds coverage field that names which kinds\n" +
+    "spoke. The default window is the last 7 days ending now. --until sets the end and, when\n" +
+    "--since is absent, the 7-day lower bound is measured back from --until, so a query\n" +
+    "about a past period stays a 7-day one; --since replaces the lower bound outright.\n" +
+    "Derived write sites (signal slugs, daily logs) emit neither kind, so the rows carry a\n" +
+    "coverage note instead of implying completeness.\n" +
     "prune-images bounds the before-image store by file age; the default window is 30 days.\n",
   "agent-diff":
     "usage: o2b brain agent-diff [--mode browse|search|diff|map] [--agent <id>...]\n" +
@@ -892,7 +903,7 @@ export const VERB_HELP: Record<string, string> = {
     "Default is --dry-run; --apply requires --yes and --approval-digest in\n" +
     "non-interactive mode.\n",
   entity:
-    "usage: o2b brain entity <set|get|list|relate|archive|prune|lexicon> [args]\n" +
+    "usage: o2b brain entity <set|get|list|relate|archive|prune|lexicon|merge> [args]\n" +
     "  set <category> <name> [--alias <a>]... [--body <md>] [--confidence <c>] [--json]\n" +
     "  get <name-or-alias> [--category <c>] [--json]      exit 2 when not found\n" +
     "  list [--category <c>] [--status active|archived] [--json]\n" +
@@ -902,9 +913,17 @@ export const VERB_HELP: Record<string, string> = {
     "                                                     advisory verdicts need the opt-in\n" +
     "  lexicon rebuild [--apply] [--json]                 dry-run default; writes only the\n" +
     "                                                     derived Brain/entities/lexicon.json\n" +
+    "  merge <keep> <drop> [--dry-run] [--expect-hash <hash>] [--force] [--json]\n" +
+    "                                                     preview echoes the plan hash; apply\n" +
+    "                                                     verifies it before any write; a TTY gets\n" +
+    "                                                     a y/N prompt, agents pass --force\n" +
+    "                                                     (--json needs it); --force also\n" +
+    "                                                     bypasses the text-level merge guard\n" +
     "One canonical entity per (category, name); aliases resolve to the canonical record.\n" +
     "Labels are decoration-stripped and quality-gated on set; prune removes historical\n" +
-    "malformed nodes and their edges. Denylist: entities.label_denylist config key. The\n" +
+    "malformed nodes and their edges. merge folds a duplicate page into the survivor: the\n" +
+    "old name becomes an alias, the old page is archived behind a recovery point, and no\n" +
+    "claim is rewritten. Denylist: entities.label_denylist config key. The\n" +
     "store-learned lexicon artifact feeds the tightened creation verdicts; rebuild it\n" +
     "after corpus edits (a stale artifact degrades admission fail-open, never mis-rejects).",
   "design-note":

@@ -27,7 +27,9 @@ import {
   planNoteRevert,
   type NoteRevertSelector,
 } from "../../core/brain/notes/revert.ts";
-import { listNoteWrites } from "../../core/brain/notes/write-log.ts";
+import { listNoteWrites, isLegacyPairDevice } from "../../core/brain/notes/write-log.ts";
+import { listWriteDestinations } from "../../core/brain/notes/write-destinations.ts";
+import { LogWindowBoundError } from "../../core/brain/notes/log-window.ts";
 import {
   NOTE_WRITE_OP,
   NOTE_WRITE_OPS,
@@ -357,6 +359,38 @@ const BRAIN_WRITES_ACTIONS: ReadonlyArray<string> = Object.freeze(
 const BRAIN_WRITES_DEFAULT_LIMIT = 50;
 const BRAIN_WRITES_MAX_LIMIT = 500;
 
+/**
+ * Run one write-ledger read, mapping the shared window parser's named
+ * error to `INVALID_PARAMS` blaming the mistyped argument. The readers
+ * throw `LogWindowBoundError` for a `since`/`until` in neither accepted
+ * spelling; that is client-resolvable input, and an uncaught throw here
+ * would surface as a server fault instead of the caller's mistake.
+ */
+function ledgerRead<T>(tool: string, read: () => T): T {
+  try {
+    return read();
+  } catch (err) {
+    if (err instanceof LogWindowBoundError) {
+      throw new MCPError(INVALID_PARAMS, `${tool}: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+/**
+ * One device selector from an argument, shared by `brain_writes`,
+ * `brain_write_destinations` and the `plan_revert` selector. The empty
+ * (or whitespace-only) string is the legacy un-sharded pair and IS a
+ * filter value, so it is read through the shared
+ * {@link isLegacyPairDevice} before `coerceStr`, which treats emptiness
+ * as absence - both schemas promise `device: ""` selects the un-sharded
+ * log, and a coercion-first reading made that unreachable.
+ */
+function deviceArg(args: Record<string, unknown>): string | null {
+  if (isLegacyPairDevice(args["device"])) return "";
+  return coerceStr(args, "device", false);
+}
+
 async function toolBrainWrites(
   ctx: ServerContext,
   args: Record<string, unknown>,
@@ -378,21 +412,23 @@ async function toolBrainWrites(
     );
   }
   const agent = coerceStr(args, "agent", false);
-  const device = coerceStr(args, "device", false);
+  const device = deviceArg(args);
   const path = coerceStr(args, "path", false);
   const since = coerceStr(args, "since", false);
   const until = coerceStr(args, "until", false);
   const limit = coerceInt(args, "limit", BRAIN_WRITES_DEFAULT_LIMIT, 1, BRAIN_WRITES_MAX_LIMIT);
   const offset = cursorOffsetArg("brain_writes", args);
 
-  const result = listNoteWrites(ctx.vault, {
-    ...(agent !== null ? { agent } : {}),
-    ...(device !== null ? { device } : {}),
-    ...(path !== null ? { path } : {}),
-    ...(since !== null ? { since } : {}),
-    ...(until !== null ? { until } : {}),
-    ...(rawOp !== null ? { op: rawOp } : {}),
-  });
+  const result = ledgerRead("brain_writes", () =>
+    listNoteWrites(ctx.vault, {
+      ...(agent !== null ? { agent } : {}),
+      ...(device !== null ? { device } : {}),
+      ...(path !== null ? { path } : {}),
+      ...(since !== null ? { since } : {}),
+      ...(until !== null ? { until } : {}),
+      ...(rawOp !== null ? { op: rawOp } : {}),
+    }),
+  );
   // The log never opens the notes it names, so the reach rule is asked
   // per target here: at remote reach a write to a page reserved against
   // remote reads (or one whose file is gone - an unreadable claim fails
@@ -432,9 +468,14 @@ async function toolBrainWrites(
  * operator's terminal.
  */
 function planRevert(ctx: ServerContext, args: Record<string, unknown>): Record<string, unknown> {
+  // The device rides the same empty-aware selector as the list action:
+  // `device: ""` names the legacy un-sharded pair, and a selector that
+  // dropped the empty string beside a path would revert that path's
+  // writes from EVERY device while looking device-scoped.
+  const device = deviceArg(args);
   const selector: NoteRevertSelector = {
     ...selectorArg(args, "agent"),
-    ...selectorArg(args, "device"),
+    ...(device !== null ? { device } : {}),
     ...selectorArg(args, "path"),
     ...selectorArg(args, "since"),
     ...selectorArg(args, "until"),
@@ -445,6 +486,11 @@ function planRevert(ctx: ServerContext, args: Record<string, unknown>): Record<s
   } catch (err) {
     if (err instanceof NoteRevertError) {
       throw new MCPError(INVALID_PARAMS, `brain_writes: ${err.code}: ${err.message}`);
+    }
+    // The planner reads the same window bounds as the list surface, so a
+    // malformed since / until is the same client-resolvable mistake here.
+    if (err instanceof LogWindowBoundError) {
+      throw new MCPError(INVALID_PARAMS, `brain_writes: ${err.message}`);
     }
     throw err;
   }
@@ -476,10 +522,86 @@ function planRevert(ctx: ServerContext, args: Record<string, unknown>): Record<s
   };
 }
 
-/** One selector field, present only when the caller supplied it. */
+/**
+ * Default and maximum rows one `brain_write_destinations` call returns.
+ */
+const BRAIN_WRITE_DESTINATIONS_DEFAULT_LIMIT = 50;
+const BRAIN_WRITE_DESTINATIONS_MAX_LIMIT = 500;
+
+/**
+ * The destination-keyed aggregate over the write ledger (actionable-now
+ * batch, A4): one row per vault-relative target the recorded write
+ * events name, across BOTH the note-write and the write-session kinds,
+ * with the kinds coverage field stating honestly which kinds spoke. The
+ * log never opens the pages it names, so the reach rule is asked per row
+ * here exactly as `brain_writes` asks it: at remote reach a destination
+ * whose page is reserved against remote reads - or unreadable, which
+ * fails closed - is dropped from the rows AND from `total_matched`, so a
+ * withheld page moves no count. Read-only.
+ */
+async function toolBrainWriteDestinations(
+  ctx: ServerContext,
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const agent = coerceStr(args, "agent", false);
+  const device = deviceArg(args);
+  const path = coerceStr(args, "path", false);
+  const since = coerceStr(args, "since", false);
+  const until = coerceStr(args, "until", false);
+  const limit = coerceInt(
+    args,
+    "limit",
+    BRAIN_WRITE_DESTINATIONS_DEFAULT_LIMIT,
+    1,
+    BRAIN_WRITE_DESTINATIONS_MAX_LIMIT,
+  );
+  const offset = cursorOffsetArg("brain_write_destinations", args);
+
+  const result = ledgerRead("brain_write_destinations", () =>
+    listWriteDestinations(ctx.vault, {
+      ...(agent !== null ? { agent } : {}),
+      ...(device !== null ? { device } : {}),
+      ...(path !== null ? { path } : {}),
+      ...(since !== null ? { since } : {}),
+      ...(until !== null ? { until } : {}),
+    }),
+  );
+  const view = reachView(ctx.vault, contextReach(ctx));
+  const rows = view.filtersNothing
+    ? result.destinations
+    : result.destinations.filter((d) => view.visible(d.target));
+  // `total_matched` beside `returned`, and `next_cursor` continuing the
+  // walk, so a truncated answer is legible as one.
+  const page = pageSlice(rows, offset, limit);
+  return {
+    total_matched: page.total,
+    returned: page.items.length,
+    destinations: page.items.map((d) => ({
+      ...d,
+      kinds: [...d.kinds],
+      agents: [...d.agents],
+      devices: [...d.devices],
+    })),
+    coverage_note: result.coverage_note,
+    // The window the walk actually covered, both ends completed to
+    // timestamps: the default lower bound is computed, not sent, so a
+    // caller reading only its own arguments would misread the coverage.
+    window: { since: result.window.since, until: result.window.until },
+    warnings: result.warnings.map((w) => ({
+      path: w.path,
+      line: w.lineNumber,
+      message: w.message,
+    })),
+    next_cursor: page.next_cursor,
+  };
+}
+
+/** One selector field, present only when the caller supplied it. The
+ *  device is NOT read here: it goes through {@link deviceArg}, whose
+ *  empty string is the legacy un-sharded pair, not absence. */
 function selectorArg(
   args: Record<string, unknown>,
-  key: "agent" | "device" | "path" | "since" | "until",
+  key: "agent" | "path" | "since" | "until",
 ): Partial<Record<typeof key, string>> {
   const value = coerceStr(args, key, false);
   return value === null ? {} : { [key]: value };
@@ -1014,6 +1136,49 @@ export const QUERY_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
       additionalProperties: false,
     },
     handler: toolBrainWrites,
+  },
+  {
+    name: "brain_write_destinations",
+    description:
+      "One row per vault-relative destination the note-write and write-session events " +
+      "name, with per-kind counts, contributing agents and devices, newest touch, and a " +
+      "kinds coverage field (derived write sites emit neither kind). Filters: agent, " +
+      "device, path, since/until; default 7-day window. Read-only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent: {
+          type: "string",
+          description: "Exact agent identity that recorded the write.",
+        },
+        device: {
+          type: "string",
+          description: "Exact device id; the empty string is the legacy un-sharded log.",
+        },
+        path: {
+          type: "string",
+          description: "Exact vault-relative target path of the note.",
+        },
+        since: {
+          type: "string",
+          description:
+            "Inclusive lower bound: YYYY-MM-DD or an ISO-8601 UTC timestamp. Default window is the last 7 days.",
+        },
+        until: {
+          type: "string",
+          description: "Inclusive upper bound, same two spellings; a bare date covers its day.",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 500,
+          description: "Maximum destination rows returned. Defaults to 50.",
+        },
+        cursor: CURSOR_SCHEMA,
+      },
+      additionalProperties: false,
+    },
+    handler: toolBrainWriteDestinations,
   },
   {
     name: "brain_agent_diff",
