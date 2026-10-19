@@ -68,14 +68,48 @@ test("rename moves the note and reports the index freshness in its receipt", asy
   const body = JSON.parse(res.stdout) as {
     applied: boolean;
     to: string;
-    references: { files_rewritten: number; index: { state: string; next_command: string } };
+    references: {
+      files_rewritten: number;
+      rewritten_spellings: Array<{ from: string; to: string }>;
+      index: { state: string; next_command: string };
+      refresh: string;
+      refresh_reason: string | null;
+    };
   };
   expect(body.applied).toBe(true);
   expect(body.to).toBe("Projects/New.md");
   expect(body.references.files_rewritten).toBe(1);
+  // The spellings the rewrite carried out, minimal forms included.
+  expect(body.references.rewritten_spellings).toEqual([
+    { from: "Projects/Old.md", to: "New" },
+    { from: "Projects/Old", to: "New" },
+    { from: "Old", to: "New" },
+  ]);
+  // Freshening is off suite-wide, so the write claimed nothing and the
+  // next command remains the reconciliation - and the refusal carries
+  // its reason, so `not_claimed` is not mistaken for a broken spawn.
+  expect(body.references.refresh).toBe("not_claimed");
+  expect(body.references.refresh_reason).toBe("no_index");
   expect(body.references.index.state).toBe("absent");
   expect(body.references.index.next_command.length).toBeGreaterThan(0);
   expect(existsSync(join(vault, "Projects/New.md"))).toBe(true);
+});
+
+test("the refusal reason reaches a terminal reader too, not only the JSON", async () => {
+  note("Projects/Old.md", "x\n");
+  const res = await runCli([
+    "brain",
+    "note-lifecycle",
+    "rename",
+    "Projects/Old.md",
+    "Projects/New.md",
+    "--vault",
+    vault,
+    "--apply",
+  ]);
+  expect(res.returncode).toBe(0);
+  // The human line names why nothing was started, beside the token.
+  expect(res.stdout).toContain("refresh: not_claimed (no_index)");
 });
 
 test("without --apply the verb plans and writes nothing", async () => {

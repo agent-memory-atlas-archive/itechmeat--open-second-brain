@@ -133,6 +133,247 @@ export function foldQuoteVariantsByClass(raw: string): string {
 }
 
 /**
+ * The separators whose RUNS are interchangeable at match time, folded to
+ * the one canonical join. Space, hyphen and underscore only: a
+ * `notes/link-candidates.ts` basename is a slug, so those three are the
+ * spellings one token sequence answers to in this store; dot and slash
+ * carry structure (`Node.js`, a path) and are never folded.
+ */
+const MATCH_SEPARATOR_RUN_RE = /[-_ ]+/;
+
+/**
+ * Minimum normalized form length that participates in substring matching.
+ * The anchoring kernels gate the FULL forms they compare with this floor,
+ * and {@link matchFormVariants} gates the slug tail it emits - the tail is
+ * an emitted needle in its own right, and an unfloored one would anchor
+ * standalone words no full form ever matched (`AC/DC` must not mint `dc`).
+ * One constant here so the kernels and the generator cannot drift.
+ */
+export const MIN_ANCHOR_FORM_LENGTH = 3;
+
+/**
+ * The entity-type folders of the canonical entity registry: the category
+ * slugs entity pages (`Brain/entities/<category>/<id>.md`) and entity ids
+ * (`ent-<category>-<slug>`) are minted from. Declared here - the leaf
+ * kernel every anchoring consumer shares - so the registry names its own
+ * folder vocabulary exactly once and every reader derives from the one
+ * list: {@link matchFormVariants} gates the slug tail on it, and the
+ * merge guard's default guarded categories ARE this list (re-exported
+ * there under its guard-facing name).
+ */
+export const ENTITY_TYPE_FOLDERS: ReadonlyArray<string> = Object.freeze([
+  "people",
+  "person",
+  "org",
+  "organization",
+  "organisation",
+  "company",
+  "team",
+]);
+
+/** Set form of {@link ENTITY_TYPE_FOLDERS} for the tail gate's lookups. */
+const ENTITY_TYPE_FOLDER_SET: ReadonlySet<string> = new Set(ENTITY_TYPE_FOLDERS);
+
+/**
+ * Fold a string's separator runs to the ONE canonical join: the tokens
+ * the string splits into, joined by single spaces (the tokens keep their
+ * slashes and dots - only the three foldable separators run together).
+ * Edge separator runs vanish with their empty edge tokens, exactly as
+ * they always did.
+ */
+function canonicalMatchJoin(s: string): string {
+  return s
+    .split(MATCH_SEPARATOR_RUN_RE)
+    .filter((token) => token !== "")
+    .join(" ");
+}
+
+/**
+ * Expand one ALREADY-NORMALIZED match form into the match variants the
+ * anchoring kernels compare with (note-change truth maintenance, F3;
+ * grid reduced per M2 of the PR 268 review). At most TWO variants:
+ *
+ *   - The form's CANONICAL JOIN ({@link canonicalMatchJoin}): runs of
+ *     space, hyphen and underscore (in any mix) fold to one space, so
+ *     `ada lovelace`, `ada-lovelace`, `ada_lovelace` and
+ *     `ada -_ lovelace` all expand to the one same variant. The kernels
+ *     fold the needle AND the haystack through the same function, and
+ *     one space-joined comparison answers for the whole variant class:
+ *     tokens never contain separators, every join character counts as a
+ *     non-word neighbour at the leading edge, and both the old grid and
+ *     the folded one compare token sequences - so the fold is verdict-
+ *     equivalent, at one scan instead of nine.
+ *   - When the form's LAST `/`-segment (the slug itself) has a registry
+ *     entity-type folder for its parent segment ({@link
+ *     ENTITY_TYPE_FOLDERS} - the categories entity pages and ids are
+ *     minted from; the parent SEGMENT gates, so the registry's deeper
+ *     spellings `entities/people/ada_lovelace` and
+ *     `Brain/entities/people/ada_lovelace` mint the tail too), the
+ *     CANONICAL JOIN of that segment, so `people/ada_lovelace` also
+ *     occurs in a text that only says `ada lovelace`. The segment prefix
+ *     is registry
+ *     decoration, not part of the mentioned name - and because the tail
+ *     is an emitted needle in its own right, the tail meets
+ *     {@link MIN_ANCHOR_FORM_LENGTH}, the same floor the kernels apply
+ *     to full forms (`AC/DC` emits no `dc` for a standalone word to
+ *     match). The FULL form is never floored or gated here: gating it
+ *     stays the caller's call, unchanged. A slash after any other prefix
+ *     carries no registry decoration - "Warner/Chappell" is one name
+ *     with a slash in it, not a directory path - so `Warner/Chappell`
+ *     mints no `chappell` and `Sony/ATV` no `atv` (M1, PR 268 review).
+ *
+ * The output is deterministic (the folded full form first, the folded
+ * tail after) and never empty for a non-empty separator-free form of at
+ * least {@link MIN_ANCHOR_FORM_LENGTH}. Deliberately NOT part of
+ * identity: the input is never re-normalized, `normalizeEntityName` is
+ * untouched, and nothing this returns may be persisted - identity keys
+ * keep their separators, which is exactly why two spellings can be two
+ * identities and one match class. Pure: no I/O, no state.
+ */
+export function matchFormVariants(form: string): string[] {
+  const out: string[] = [];
+  const full = canonicalMatchJoin(form);
+  if (full === "") return out;
+  out.push(full);
+  const lastSlash = form.lastIndexOf("/");
+  if (lastSlash >= 0) {
+    // The gate is the slug's OWN parent segment - the category folder an
+    // entity page's id sits in - not the whole prefix before the slash:
+    // a form that still carries the registry's deeper path
+    // (`Brain/entities/people/ada_lovelace`) has `people` as its
+    // immediate parent and mints its tail the same as the bare
+    // `people/ada_lovelace`, while `Warner/Chappell` has `warner` there
+    // and mints nothing (M1, PR 268 review).
+    const prefix = form.slice(0, lastSlash);
+    const folder = prefix.slice(prefix.lastIndexOf("/") + 1).toLowerCase();
+    if (ENTITY_TYPE_FOLDER_SET.has(folder)) {
+      const tail = canonicalMatchJoin(form.slice(lastSlash + 1));
+      if (tail.length >= MIN_ANCHOR_FORM_LENGTH) out.push(tail);
+    }
+  }
+  return out;
+}
+
+/**
+ * A letter or digit in ANY script: the word characters a match must not
+ * sit inside. The fold is deliberately NOT on this list - a separator is
+ * exactly where one token ends and the next begins, so `ada` may anchor
+ * inside `ada-lovelace` but never inside `canada`.
+ */
+const MATCH_WORD_CHAR_RE = /[\p{L}\p{N}]/u;
+
+/**
+ * The scripts written WITHOUT word spaces - Han, Hiragana, Katakana,
+ * Thai, Lao, Khmer, Myanmar. In a run of such text every letter touches
+ * a letter, so a LEADING letter is not evidence of a mid-word hit the
+ * way it is in a spaced script: `田中太郎` never occurs in
+ * `鈴木花子と田中太郎` at a word boundary, and a boundary rule applied
+ * there verbatim would have silenced every CJK mention the pre-rule
+ * literal `includes` matching anchored. For a leading neighbour from one
+ * of these scripts the boundary requirement is therefore suspended - the
+ * script keeps its literal behavior back, spaced scripts keep the rule
+ * (a Latin neighbour blocks even inside otherwise-CJK text). Korean is
+ * deliberately NOT on this list: it writes spaces between words, so a
+ * leading Hangul letter keeps blocking - Korean attaches no prefixes,
+ * and `박철수` must not anchor `철수`.
+ */
+const NO_SPACE_SCRIPT_RE =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
+
+/**
+ * True when `codePoint` belongs to a script written without word spaces
+ * (see {@link NO_SPACE_SCRIPT_RE}): a leading neighbour from one of
+ * these scripts never blocks an occurrence, because adjacency there
+ * carries no word-boundary information.
+ */
+function boundaryNotRequiredForScripts(codePoint: string): boolean {
+  return NO_SPACE_SCRIPT_RE.test(codePoint);
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+
+/**
+ * The code point ending just before index `i`, or null at the string
+ * edge. Steps over a surrogate pair so an astral letter comes back
+ * whole rather than as a lone (always non-word) code unit.
+ */
+function codePointBefore(s: string, i: number): string | null {
+  if (i <= 0) return null;
+  const start =
+    i >= 2 && isLowSurrogate(s.charCodeAt(i - 1)) && isHighSurrogate(s.charCodeAt(i - 2))
+      ? i - 2
+      : i - 1;
+  return s.slice(start, i);
+}
+
+/**
+ * True when `variant` occurs in one folded haystack string with a clean
+ * LEADING edge: some occurrence of it has no letter or digit directly
+ * before it - UNLESS that neighbour belongs to a script written without
+ * word spaces (see {@link NO_SPACE_SCRIPT_RE}), whose adjacency suspends
+ * the requirement. The trailing side is unchecked (H1, PR 268 review):
+ * every language that attaches endings to a name with no space - Russian
+ * `Ивана`, the German genitive `Annas`, a Korean particle run like
+ * `김철수는` - lost those mentions under a two-sided rule, and a
+ * trailing character is an inflection until proven otherwise. The
+ * leading-side rule is what keeps the separator fold from planting
+ * mid-word hits nothing anchored before (`canada` never anchors `ada`:
+ * the letter before the hit blocks it, folded spellings included); an
+ * occurrence beside a separator or the string edge is a token edge and
+ * anchors.
+ */
+function variantOccursAtWordBoundary(variant: string, haystack: string): boolean {
+  // An empty variant occurs everywhere and nowhere - refuse it rather
+  // than let a boundary-less occurrence anchor.
+  if (variant === "") return false;
+  let at = haystack.indexOf(variant);
+  while (at >= 0) {
+    const before = codePointBefore(haystack, at);
+    const blockedBefore =
+      before !== null && MATCH_WORD_CHAR_RE.test(before) && !boundaryNotRequiredForScripts(before);
+    if (!blockedBefore) return true;
+    at = haystack.indexOf(variant, at + 1);
+  }
+  return false;
+}
+
+/**
+ * True when ANY of the needle's match variants occurs with a clean
+ * leading edge in ANY of the haystack's match variants - the one
+ * comparison the anchoring kernels and their twins share. Both arrays
+ * come from {@link matchFormVariants}: the needle's variants are
+ * precomputed by the caller where it already precomputes forms, and the
+ * haystack's variants are expanded once per text, never once per entity.
+ * Pure: no I/O.
+ */
+export function matchVariantsOccurIn(
+  formVariants: ReadonlyArray<string>,
+  haystackVariants: ReadonlyArray<string>,
+): boolean {
+  return formVariants.some((variant) =>
+    haystackVariants.some((haystack) => variantOccursAtWordBoundary(variant, haystack)),
+  );
+}
+
+/**
+ * One-shot convenience over {@link matchFormVariants} and
+ * {@link matchVariantsOccurIn}: does the single normalized form `form`
+ * occur, separator-folded and leading-edge-checked, in the normalized
+ * haystack text? For callers that match one form at a time; a caller
+ * holding precomputed variant lists calls {@link matchVariantsOccurIn}
+ * directly so the haystack expands once, not once per form.
+ */
+export function matchFormOccursIn(form: string, normalizedHaystack: string): boolean {
+  return matchVariantsOccurIn(matchFormVariants(form), matchFormVariants(normalizedHaystack));
+}
+
+/**
  * The kernel's shape pass, WITHOUT the quote fold: NFC, trim, collapse
  * whitespace runs, lowercase. Separated from {@link normalizeEntityName}
  * so {@link differsOnlyByQuoteVariant} can name the difference the fold

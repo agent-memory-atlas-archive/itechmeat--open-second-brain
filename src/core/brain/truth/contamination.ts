@@ -8,7 +8,12 @@
  * mentions Bob.
  */
 
-import { normalizeEntityName } from "../entities/canonical.ts";
+import {
+  MIN_ANCHOR_FORM_LENGTH,
+  matchFormVariants,
+  matchVariantsOccurIn,
+  normalizeEntityName,
+} from "../entities/canonical.ts";
 import { ENTITY_STATUS_SCOPE, entityStatusInScope } from "../entities/status-scope.ts";
 
 /**
@@ -55,9 +60,44 @@ export interface ContaminationInput {
   readonly entities: ReadonlyArray<ContaminationEntityLike>;
 }
 
-function mentions(haystack: string, entity: ContaminationEntityLike): boolean {
-  const forms = [entity.name, ...entity.aliases].map((f) => normalizeEntityName(f));
-  return forms.some((f) => f.length >= 3 && haystack.includes(f));
+/**
+ * One entity's inclusion-test inputs, precomputed: every normalized form,
+ * each already expanded into its match variants, so an entity is
+ * tokenized ONCE per check no matter how many texts it is tested against.
+ * The length floor is not applied here - `mentions` gates each form at
+ * every use, so a short form costs one variant expansion and answers no.
+ */
+interface PreparedEntity {
+  readonly entity: ContaminationEntityLike;
+  readonly forms: ReadonlyArray<readonly [string, ReadonlyArray<string>]>;
+}
+
+function prepareEntity(entity: ContaminationEntityLike): PreparedEntity {
+  const forms = [entity.name, ...entity.aliases].map((f) => {
+    const normalized = normalizeEntityName(f);
+    return [normalized, matchFormVariants(normalized)] as const;
+  });
+  return { entity, forms };
+}
+
+/**
+ * The inclusion test behind the check - the twins' copy of
+ * fact-extraction's anchoring rule, kept verbatim through the one
+ * canonical match-form rule ({@link matchVariantsOccurIn}) since F3
+ * (note-change truth maintenance): both sides fold to their canonical
+ * (space) joins, a folder-prefixed form matching at the path-segment
+ * boundary, and every occurrence leading-edge-checked (a no-space-script
+ * neighbour suspends the requirement), so the fold never plants a
+ * mid-word hit nothing anchored before. Takes the entity ALREADY
+ * prepared through {@link prepareEntity} and a haystack ALREADY expanded
+ * through {@link matchFormVariants} - each side tokenizes once, the
+ * same hoist `entityAnchors` makes, not once per entity per source.
+ */
+function mentions(haystackVariants: ReadonlyArray<string>, prepared: PreparedEntity): boolean {
+  return prepared.forms.some(
+    ([form, variants]) =>
+      form.length >= MIN_ANCHOR_FORM_LENGTH && matchVariantsOccurIn(variants, haystackVariants),
+  );
 }
 
 /**
@@ -69,15 +109,20 @@ export function checkEntityContamination(input: ContaminationInput): Contaminati
   if (input.entities.length === 0 || input.conclusion.trim() === "") {
     return Object.freeze({ clean: true, violations: Object.freeze([]) });
   }
-  const conclusion = normalizeEntityName(input.conclusion);
-  const sources = input.sources.map((s) => normalizeEntityName(s));
+  // Each text expands through its match variants exactly once, up
+  // front, and each entity's forms are prepared exactly once: identical
+  // verdicts, the grid of entities x texts never re-tokenizes either
+  // side.
+  const conclusionVariants = matchFormVariants(normalizeEntityName(input.conclusion));
+  const sourceVariants = input.sources.map((s) => matchFormVariants(normalizeEntityName(s)));
+  const prepared = input.entities.map(prepareEntity);
 
   const violations: ContaminationViolation[] = [];
-  for (const entity of input.entities) {
-    if (!entityStatusInScope(entity.status, ENTITY_STATUS_SCOPE.canonical)) continue;
-    if (!mentions(conclusion, entity)) continue;
-    const cited = sources.some((source) => mentions(source, entity));
-    if (!cited) violations.push(Object.freeze({ entityId: entity.id, name: entity.name }));
+  for (const p of prepared) {
+    if (!entityStatusInScope(p.entity.status, ENTITY_STATUS_SCOPE.canonical)) continue;
+    if (!mentions(conclusionVariants, p)) continue;
+    const cited = sourceVariants.some((variants) => mentions(variants, p));
+    if (!cited) violations.push(Object.freeze({ entityId: p.entity.id, name: p.entity.name }));
   }
   violations.sort((a, b) => (a.entityId < b.entityId ? -1 : a.entityId > b.entityId ? 1 : 0));
   return Object.freeze({

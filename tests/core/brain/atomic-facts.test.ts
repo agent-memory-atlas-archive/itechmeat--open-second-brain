@@ -267,7 +267,112 @@ describe("lexicon-gated anchoring (recall-quality A2)", () => {
     const anchorables = buildAnchorables(vault, buildEntityIndex(vault), "test-agent", NOW);
     expect(anchorables).toHaveLength(1);
     expect(anchorables[0]!.id).toBe("ent-people-junk");
+    // The surviving alias form, expanded once into its match variants
+    // (note-change truth maintenance, F3; grid reduced per M2): the
+    // canonical space join is the ONE variant the class answers to, the
+    // haystack folds through the same join.
     expect(anchorables[0]!.forms).toEqual(["atlas prime"]);
+  });
+});
+
+/**
+ * Separator-tolerant anchoring (note-change truth maintenance, F3): the
+ * occurrence kernel matches separator-variant match forms with BOTH sides
+ * folded - runs of space, hyphen and underscore are interchangeable, a
+ * slug-prefixed form also matches at a path-segment boundary, and a
+ * word-boundary rule keeps the fold from planting mid-word hits literal
+ * matching did not already have.
+ */
+describe("anchorEntityForms - separator-tolerant matching (F3)", () => {
+  test("spaced text anchors a hyphenated form", () => {
+    expect(anchorEntityForms("Ada Lovelace wrote the first notes.", ["ada-lovelace"])).toEqual([
+      "ada-lovelace",
+    ]);
+  });
+
+  test("spaced text anchors an underscored form", () => {
+    expect(anchorEntityForms("Ada Lovelace wrote the first notes.", ["ada_lovelace"])).toEqual([
+      "ada_lovelace",
+    ]);
+  });
+
+  test("spaced text anchors a slug-prefixed form at the path-segment boundary", () => {
+    expect(
+      anchorEntityForms("Ada Lovelace wrote the first notes.", ["people/ada_lovelace"]),
+    ).toEqual(["people/ada_lovelace"]);
+  });
+
+  test("hyphenated text anchors a spaced form (the haystack folds too)", () => {
+    expect(anchorEntityForms("The ada-lovelace memoir survived.", ["Ada Lovelace"])).toEqual([
+      "ada lovelace",
+    ]);
+  });
+
+  test("underscored text anchors a hyphenated form", () => {
+    expect(anchorEntityForms("the ada_lovelace memoir", ["ada-lovelace"])).toEqual([
+      "ada-lovelace",
+    ]);
+  });
+
+  test("a mid-word occurrence never anchors, literal or folded", () => {
+    expect(anchorEntityForms("Canada borders three oceans.", ["Ada"])).toEqual([]);
+    expect(anchorEntityForms("canada lovelace ruled the charts.", ["ada lovelace"])).toEqual([]);
+  });
+
+  test("forms shorter than the minimum never participate, folded or not", () => {
+    expect(anchorEntityForms("ada-lovelace wrote.", ["lo"])).toEqual([]);
+  });
+
+  test("a boundary-occurring short form is refused by the length gate itself", () => {
+    // "lo" sits at a word boundary here, so the word-boundary rule would
+    // admit it - only MIN_ANCHOR_FORM_LENGTH refuses it. (The mid-word pin
+    // above cannot see the gate: the boundary guard refuses that shape
+    // with or without the floor.)
+    expect(anchorEntityForms("the lo fixture ran its course.", ["lo"])).toEqual([]);
+  });
+
+  test("a mixed separator run in the text anchors (the haystack folds, not just the needle)", () => {
+    // No variant of the needle occurs literally in the raw text - only the
+    // haystack's own expansion turns "ada -_ lovelace" into a spellings the
+    // needle's variant class answers to.
+    expect(anchorEntityForms("the memoir of ada -_ lovelace survived.", ["ada-lovelace"])).toEqual([
+      "ada-lovelace",
+    ]);
+  });
+
+  test("a standalone slug tail below the minimum never anchors", () => {
+    // The tail "dc" of "ac/dc" is shorter than the floor, so the entity's
+    // only emitted variant is the full form - a standalone "dc" in a text
+    // never anchors the band.
+    expect(anchorEntityForms("dc opened for the headliners tonight.", ["AC/DC"])).toEqual([]);
+  });
+
+  test("a full slug form still anchors at its own boundaries", () => {
+    expect(anchorEntityForms("the TCP/IP runbook lives in the wiki.", ["TCP/IP"])).toEqual([
+      "tcp/ip",
+    ]);
+  });
+
+  test("CJK text anchors a CJK form (no-space scripts need no word boundary)", () => {
+    // "田中太郎は" has a kana letter touching the name directly; a script
+    // written without word spaces never reads as a mid-word hit.
+    expect(anchorEntityForms("田中太郎は会議に出席した。", ["田中太郎"])).toEqual(["田中太郎"]);
+  });
+
+  test("an inflected mention anchors the base form (the boundary binds the leading side only)", () => {
+    // H1 (PR 268 review): Russian and German attach endings to names with
+    // no space, and the two-sided boundary rule refused every inflected
+    // spelling the literal `includes` matching used to anchor. Only the
+    // character before the hit must be a token edge.
+    expect(anchorEntityForms("Ивана повысили до директора.", ["Иван"])).toEqual(["иван"]);
+    expect(anchorEntityForms("Встреча с Иваном перенесена.", ["Иван"])).toEqual(["иван"]);
+    expect(anchorEntityForms("Annas Buch liegt auf dem Tisch.", ["Anna"])).toEqual(["anna"]);
+  });
+
+  test("an attached Korean particle does not block the anchor", () => {
+    // 조사 attach to a noun with no space: "김철수는" is the name plus the
+    // topic particle, not a longer word.
+    expect(anchorEntityForms("김철수는 회의에 출석했다.", ["김철수"])).toEqual(["김철수"]);
   });
 });
 

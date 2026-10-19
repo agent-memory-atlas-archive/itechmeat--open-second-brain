@@ -9,19 +9,24 @@
  * anchors) merges exactly as today.
  */
 
-import { normalizeEntityName } from "../entities/canonical.ts";
+import {
+  ENTITY_TYPE_FOLDERS,
+  MIN_ANCHOR_FORM_LENGTH,
+  matchFormVariants,
+  matchVariantsOccurIn,
+  normalizeEntityName,
+} from "../entities/canonical.ts";
 import { ENTITY_STATUS_SCOPE, entityStatusInScope } from "../entities/status-scope.ts";
 
-/** Categories guarded by default: people and organisations. */
-export const GUARDED_ENTITY_CATEGORIES: ReadonlyArray<string> = Object.freeze([
-  "people",
-  "person",
-  "org",
-  "organization",
-  "organisation",
-  "company",
-  "team",
-]);
+/**
+ * Categories guarded by default: people and organisations. The registry's
+ * own entity-type folder vocabulary ({@link ENTITY_TYPE_FOLDERS} - the
+ * categories entity ids are minted from), re-exported under its
+ * guard-facing name so the two can never drift: the same list that
+ * mints entity folders guards entity merges and gates the matcher's
+ * slug tail.
+ */
+export const GUARDED_ENTITY_CATEGORIES: ReadonlyArray<string> = ENTITY_TYPE_FOLDERS;
 
 /** The slice of a registry entity the guard needs. */
 export interface GuardEntityLike {
@@ -50,22 +55,38 @@ export interface MergeGuardVerdict {
 
 /**
  * Anchor a text against guarded entities: every active entity whose
- * normalized name or alias appears in the normalized text. The same
- * inclusion rule as fact-extraction's `entityAnchors`, restricted to
- * the guarded categories.
+ * normalized name or alias occurs in the normalized text. The same
+ * inclusion rule as fact-extraction's `entityAnchors`, restricted to the
+ * guarded categories - shared verbatim since F3 (note-change truth
+ * maintenance) through the one canonical match-form rule
+ * ({@link matchVariantsOccurIn}): both sides fold to their canonical
+ * (space) joins, a folder-prefixed form matching at the path-segment
+ * boundary, and every occurrence leading-edge-checked, so the fold never
+ * plants a mid-word hit nothing anchored before. The haystack expands
+ * ONCE per call - the same hoist `entityAnchors` makes, not once per
+ * form per entity - while an entity's forms normalize together first and
+ * expand inside the short-circuiting `.some`, so each form's variants
+ * are built at most once per entity and only for an entity already in
+ * scope (an out-of-scope entity's labels never reach the matcher).
  */
 function guardedAnchors(
   text: string,
   entities: ReadonlyArray<GuardEntityLike>,
   categories: ReadonlySet<string>,
 ): string[] {
-  const haystack = normalizeEntityName(text);
+  const haystackVariants = matchFormVariants(normalizeEntityName(text));
   const ids: string[] = [];
   for (const entity of entities) {
     if (!entityStatusInScope(entity.status, ENTITY_STATUS_SCOPE.canonical)) continue;
     if (!categories.has(entity.category.toLowerCase())) continue;
-    const forms = [entity.name, ...entity.aliases].map((f) => normalizeEntityName(f));
-    if (forms.some((f) => f.length >= 3 && haystack.includes(f))) ids.push(entity.id);
+    const anchored = [entity.name, ...entity.aliases]
+      .map((f) => normalizeEntityName(f))
+      .some(
+        (f) =>
+          f.length >= MIN_ANCHOR_FORM_LENGTH &&
+          matchVariantsOccurIn(matchFormVariants(f), haystackVariants),
+      );
+    if (anchored) ids.push(entity.id);
   }
   return ids.toSorted();
 }

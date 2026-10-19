@@ -14,6 +14,8 @@ import {
   claimFreshen,
   FRESHEN_CLAIM_FILE,
   INDEX_FRESHEN_SURFACE,
+  markFreshenPending,
+  readFreshenPending,
   readFreshenState,
 } from "../../src/core/search/freshen.ts";
 import { acquireWriterLockSync } from "../../src/core/search/store/writer-lock.ts";
@@ -134,4 +136,71 @@ test("a run that fails before it can resolve its config still records the failur
   expect(state.lastOutcome).toBe("failed");
   expect(state.failures).toBe(1);
   expect(existsSync(join(derived, FRESHEN_CLAIM_FILE))).toBe(false);
+});
+
+test("a run that cannot pass leaves a queued marker for the next run", async () => {
+  // The child that cannot run a pass (a config that never resolves)
+  // must leave the marker exactly as it stands: a settle that ran
+  // anyway would clear markers at or before the child's scan start -
+  // instants no pass of this child ever scanned past - and the queued
+  // write would lose its second pass. The marker names an instant
+  // BEFORE the scan start on purpose: that is the instant class the
+  // settle's covered branch clears, and only a pass that ran can have
+  // covered it.
+  markFreshenPending(derived, Date.now() - 60_000);
+  const token = claimFreshen(derived, Date.now())!;
+  const result = await runCli(
+    [
+      "search",
+      "index",
+      "--config",
+      join(tmp, "missing.yaml"),
+      "--freshen",
+      token,
+      "--freshen-state",
+      derived,
+    ],
+    { env: env() },
+  );
+  expect(result.returncode).not.toBe(0);
+  expect(readFreshenPending(derived)).not.toBeNull();
+  expect(existsSync(join(derived, FRESHEN_CLAIM_FILE))).toBe(false);
+});
+
+test("a run locked out of the index leaves a queued marker for the next run", async () => {
+  // INDEX_LOCKED ends the child before any pass ran, so the same rule
+  // holds: nothing this child scanned can cover the marker, and the
+  // release still happens. The marker names an instant before the scan
+  // start - the class the settle's covered branch clears.
+  markFreshenPending(derived, Date.now() - 60_000);
+  const release = acquireWriterLockSync(join(derived, "brain.sqlite"));
+  try {
+    const token = claimFreshen(derived, Date.now())!;
+    const result = await runCli(
+      ["search", "index", "--freshen", token, "--freshen-state", derived],
+      { env: env() },
+    );
+    expect(result.returncode).toBe(0);
+    expect(readFreshenPending(derived)).not.toBeNull();
+    expect(existsSync(join(derived, FRESHEN_CLAIM_FILE))).toBe(false);
+  } finally {
+    release();
+  }
+});
+
+test("a completed run clears a marker its scan covered and keeps one it cannot have seen", async () => {
+  // Both halves of the settle over a real child run. A marker older
+  // than the run's scan start is covered by the main pass and cleared;
+  // an instant AFTER the scan start is not - neither the main pass nor
+  // the bounded extra pass can prove it saw that write - so the marker
+  // survives the run for the next one.
+  markFreshenPending(derived, Date.now() - 60_000);
+  const result = await freshenRun();
+  expect(result.returncode).toBe(0);
+  expect(readFreshenPending(derived)).toBeNull();
+
+  markFreshenPending(derived, Date.now() + 60_000);
+  const second = await freshenRun();
+  expect(second.returncode).toBe(0);
+  expect(readFreshenPending(derived)).not.toBeNull();
 });

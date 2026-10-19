@@ -266,8 +266,8 @@ describe("entity read-path census", () => {
     const rows = census();
     // Floors just under the measurement, so "everything is scoped" cannot be
     // reported over a file list that was never built, and so a real loss of
-    // input cannot pass underneath. Today: 22 rows, 10 building the index,
-    // 15 scoped. The previous floors (5 index readers against a measured 10)
+    // input cannot pass underneath. Today: 29 rows, 15 building the index,
+    // 21 scoped. The previous floors (5 index readers against a measured 10)
     // would have let half the population vanish and still read as healthy.
     expect(rows.length).toBeGreaterThan(20);
     expect(rows.filter((row) => row.buildsIndex).length).toBeGreaterThan(9);

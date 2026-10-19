@@ -58,6 +58,10 @@ function renderJson(res: NoteLifecycleResult): Record<string, unknown> {
       files_scanned: res.references.filesScanned,
       inbound_files: [...res.references.inboundFiles],
       files_rewritten: res.references.filesRewritten,
+      rewritten_spellings: res.references.rewrittenSpellings.map((s) => ({
+        from: s.from,
+        to: s.to,
+      })),
       rewrite_failures: res.references.rewriteFailures.map((f) => ({
         path: f.path,
         reason: f.reason,
@@ -68,6 +72,13 @@ function renderJson(res: NoteLifecycleResult): Record<string, unknown> {
         last_indexed_at: res.references.index.lastIndexedAt,
         next_command: res.references.index.nextCommand,
       },
+      // `claimed` says a detached refresh run is IN FLIGHT, never that it
+      // has landed; every other value names why nothing was started, and
+      // `refresh_reason` spells that reason - the freshen machinery's own
+      // skip token, or the error it raised - so `not_claimed` is never
+      // the whole answer a caller receives.
+      refresh: res.references.refresh,
+      refresh_reason: res.references.refreshReason,
     },
     cascade:
       res.cascade === null
@@ -84,7 +95,8 @@ function renderJson(res: NoteLifecycleResult): Record<string, unknown> {
  * The human line. It names the index state and the command that fixes it
  * on every run, because the operator reading a terminal is exactly the
  * person who has to decide whether the search index still describes the
- * vault they just changed.
+ * vault they just changed - and it names whether the write claimed the
+ * detached refresh, so "claimed" is never read as "already caught up".
  */
 function renderText(res: NoteLifecycleResult): string {
   const where = res.to === null ? res.from : `${res.from} -> ${res.to}`;
@@ -122,6 +134,11 @@ function renderText(res: NoteLifecycleResult): string {
     "\n" +
     `  search index: ${refs.index.state}` +
     (refs.index.lastIndexedAt === null ? "" : ` since ${refs.index.lastIndexedAt}`) +
+    // The reason rides the token in prose too: an operator reading a
+    // terminal is exactly the person who has to tell a deliberate
+    // config-off from a held claim or a broken spawn.
+    `; refresh: ${refs.refresh}` +
+    (refs.refreshReason === null ? "" : ` (${refs.refreshReason})`) +
     `; next: ${refs.index.nextCommand}`
   );
 }
@@ -169,6 +186,12 @@ export async function cmdBrainNoteLifecycle(argv: string[]): Promise<number> {
       deleteLinked: flags["delete-linked"] === true,
       expect: expectCount,
       strict: flags["strict"] === true,
+      // The post-write refresh resolves through the config file this
+      // invocation already resolved the vault from, the same rule the
+      // search verbs read (`--config`, else the default): a non-default
+      // config's index path and freshen settings are the ones the claim
+      // reads and the child spawns with.
+      refreshConfigPath: config,
     });
     if (flags["json"] === true) okJson(renderJson(res));
     else ok(renderText(res));

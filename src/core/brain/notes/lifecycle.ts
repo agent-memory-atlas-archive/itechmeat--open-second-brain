@@ -26,24 +26,30 @@
  * A rename that reports success and stops is a lie, and it is worth being
  * precise about which lie. The Brain backlink index (`backlinks.ts`) is a
  * full scan and Brain-scoped. The vault-wide `links` table is only as
- * fresh as the last `indexVault` pass, and there is no write-to-index
- * hook anywhere in this codebase. So a rename can truthfully say only
- * this: of the Markdown files it READ during this call, these are the
- * ones whose `[[...]]` spellings it rewrote - and the derived index still
- * holds the old path until something re-indexes.
+ * fresh as the last `indexVault` pass. An applied relocation or delete
+ * now CLAIMS one detached, claim-guarded refresh of that index - the
+ * freshen-on-read machinery run at force - so the window in which the
+ * index still holds the old paths starts closing at the write itself,
+ * and the claim rides the report beside the evidence. The claim is not
+ * an invariant: until the detached run lands, a search can still answer
+ * from the old paths. So a rename can truthfully say only this: of the
+ * Markdown files it READ during this call, these are the ones whose
+ * `[[...]]` spellings it rewrote, and the derived index holds the old
+ * path until the claimed run - or the command on the report - lands.
  *
  * Three consequences are load-bearing and each is reported rather than
  * assumed:
  *
- *   - the bare-basename spelling `[[Old]]` is rewritten only when
- *     exactly one note in the scanned population carries the OLD
- *     basename and none carries the new one. Two notes named `Old.md` in
- *     different folders make `[[Old]]` a reference to whichever one
- *     Obsidian resolves, and rewriting it would re-point a link that
- *     never pointed here; a note already named `New.md` elsewhere makes
- *     `[[New]]` ambiguous the moment the rename lands, and by this
- *     project's own ladder an ambiguous basename resolves to nothing at
- *     all. The verdict token says which of the three happened.
+ *   - the bare-basename spelling `[[Old]]` is rewritten whenever it
+ *     uniquely resolved to the source before the move - the source is
+ *     the basename's only carrier, or the source is top-level and owns
+ *     the spelling through the exact-path rung - and the rewrite aims at
+ *     the minimal spelling of the destination, which is unambiguous by
+ *     construction whatever note count the move creates. Two nested
+ *     notes named `Old.md` in different folders still withhold it:
+ *     there `[[Old]]` named whichever one Obsidian resolves, and
+ *     rewriting it would re-point a link that never pointed here. The
+ *     verdict token says which of the three happened.
  *   - the search index's state travels back on the result as an
  *     {@link IndexEvidence}, with the instant of its last pass and the
  *     command that makes it agree with the vault again.
@@ -155,10 +161,9 @@ import { pathCovers } from "../../vault-scope/defaults.ts";
 import { assertExpectedCount } from "../count-guard.ts";
 import { DERIVATION_SCAN_SCOPE, traceNoteDerivations } from "../source-cleanup.ts";
 import { BRAIN_LOG_REL, BRAIN_ROOT_REL } from "../path-constants.ts";
-import { requireNextStep } from "../next-step.ts";
-import { SEARCH_INDEX_MISSING_CODE } from "../diagnostics.ts";
 import { classifyRecoverability, type RecoverabilityVerdict } from "../gates/recoverability.ts";
 import { retargetWikilinks, type WikilinkRetarget } from "../page-dedup.ts";
+import { minimalSpellingFor } from "../link-graph/minimal-spelling.ts";
 import { withDestructiveSnapshot } from "../snapshot-gate.ts";
 import { BRAIN_SNAPSHOT_REASON } from "../types.ts";
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
@@ -213,11 +218,21 @@ export function isNoteLifecycleAction(value: unknown): value is NoteLifecycleAct
  * construction.
  */
 export const BASENAME_REWRITE = Object.freeze({
-  /** Exactly one note carried the basename, so the spelling was rewritten. */
+  /**
+   * The bare spelling uniquely resolved to the source before the move,
+   * so it was rewritten - onto the minimal spelling of the destination,
+   * which is unambiguous by construction whatever the destination
+   * basename's carrier count became.
+   */
   applied: "applied",
   /** The basename did not change, so no bare spelling needed rewriting. */
   notNeeded: "not_needed",
-  /** Another note carries the same basename; rewriting could re-point its links. */
+  /**
+   * The bare spelling never uniquely named the source: a nested source
+   * with several same-basename carriers resolved, by the ladder's
+   * basename rung, to whichever one the resolver picked, and rewriting
+   * it could re-point a link that never pointed here.
+   */
   ambiguous: "ambiguous",
 } as const);
 
@@ -235,62 +250,35 @@ export function isBasenameRewrite(value: unknown): value is BasenameRewrite {
 }
 
 // ----- How stale the derived index is ---------------------------------------
+//
+// The vocabulary, the evidence read and the refresh claim live in
+// `./index-refresh.ts` - lifted out of this module so the note create and
+// content-update writers could claim the SAME refresh without importing
+// the lifecycle back (this module already imports their path envelope,
+// and a second copy of the claim is how two surfaces come to report two
+// different refusals). This module re-exports the vocabulary unchanged:
+// every report this module builds answers in the same tokens it always
+// answered in, with the refusal's reason now on the report itself.
 
-/**
- * The state of the search index at the moment this call finished.
- *
- * There is no `current` member and that is a result, not an omission: no
- * write path in this codebase updates the `links` table, so an index that
- * exists is stale with respect to a relocation that just happened, by
- * construction. Declaring a member nothing can produce would be inviting
- * a reader to believe a rename might have refreshed the index.
- *
- * `unchanged` is the plan-only counterpart, and it exists because that
- * argument has a premise: an index goes stale with respect to a
- * relocation THAT HAPPENED. A run with `apply: false` moved no byte and
- * rewrote no spelling, so the index describes the vault exactly as well
- * after the call as before it, and reporting `stale` there was a false
- * statement about the one field this module's honesty rests on. It is
- * deliberately not named `current`: the claim is only that THIS call did
- * not age the index, never that some earlier write did not.
- */
-export const INDEX_EVIDENCE = Object.freeze({
-  /** An index exists; its last pass predates this call and names the old path. */
-  stale: "stale",
-  /** An index exists and this call wrote nothing, so it is no staler. */
-  unchanged: "unchanged",
-  /** No index at the configured path, so it held no evidence either way. */
-  absent: "absent",
-  /** An index exists and could not be opened, or records no run instant. */
-  unreadable: "unreadable",
-} as const);
+export {
+  INDEX_EVIDENCE_STATES,
+  INDEX_REFRESHES,
+  isIndexEvidenceState,
+  isIndexRefresh,
+  type IndexEvidenceState,
+  type IndexRefresh,
+  type PostWriteRefreshClaim,
+} from "./index-refresh.ts";
+export { INDEX_EVIDENCE, INDEX_REFRESH, readIndexEvidence, type IndexEvidence };
 
-/** Closed union over {@link INDEX_EVIDENCE}. */
-export type IndexEvidenceState = (typeof INDEX_EVIDENCE)[keyof typeof INDEX_EVIDENCE];
-
-/** Membership list, in declaration order. */
-export const INDEX_EVIDENCE_STATES: ReadonlyArray<IndexEvidenceState> = Object.freeze(
-  Object.values(INDEX_EVIDENCE),
-);
-
-/** See {@link isNoteLifecycleAction} for why the parameter is `unknown`. */
-export function isIndexEvidenceState(value: unknown): value is IndexEvidenceState {
-  return (
-    typeof value === "string" && (INDEX_EVIDENCE_STATES as ReadonlyArray<string>).includes(value)
-  );
-}
-
-/** What the derived index knows, and how old that knowledge is. */
-export interface IndexEvidence {
-  readonly state: IndexEvidenceState;
-  /**
-   * ISO instant of the index's last pass; `null` unless the index
-   * reported one, which is the `stale` and `unchanged` states.
-   */
-  readonly lastIndexedAt: string | null;
-  /** The registered command that makes the index agree with the vault again. */
-  readonly nextCommand: string;
-}
+import {
+  claimPostWriteRefresh,
+  INDEX_EVIDENCE,
+  INDEX_REFRESH,
+  readIndexEvidence,
+  type IndexEvidence,
+  type IndexRefresh,
+} from "./index-refresh.ts";
 
 /**
  * What a lifecycle call did to the vault's inbound references, and on
@@ -334,6 +322,22 @@ export interface NoteReferenceReport {
   readonly basename: BasenameRewrite;
   /** How fresh the derived index is with respect to this call. */
   readonly index: IndexEvidence;
+  /**
+   * Whether this write started the detached index refresh. `claimed`
+   * says a run is IN FLIGHT, never that it has landed - the index
+   * evidence beside it still describes the index as this call left it.
+   */
+  readonly refresh: IndexRefresh;
+  /**
+   * Why `refresh` is `not_claimed`: the freshen machinery's own skip
+   * token, or the message of an error it raised. `null` when a run was
+   * started, and when no claim was attempted (a plan-only run refused
+   * nothing). Rendered on every report, so `not_claimed` never has to be
+   * guessed at - a deliberate config-off reads differently from a
+   * `writer_lock`, a held claim or a broken spawn, and in a multi-vault
+   * server the reason is THIS call's own decision, never another vault's.
+   */
+  readonly refreshReason: string | null;
 }
 
 /**
@@ -439,10 +443,28 @@ export interface NoteLifecycleInput {
    * rejects is reported as a vault without it would be, and a cascade
    * never deletes it. The link rewrite of an applied relocation still
    * edits it, so the readers who can see it are not left with links to a
-   * path that no longer exists. Absent, every file counts (the CLI, which
-   * reads the vault directly).
+   * path that no longer exists - and the same holds for a bare-name
+   * repair derived from a page it rejects: the repair runs, but names no
+   * pair in `rewrittenSpellings`. Absent, every file counts (the CLI,
+   * which reads the vault directly).
    */
   readonly readable?: (rel: string) => boolean;
+  /**
+   * Test seam: replaces the detached spawn of the post-write index
+   * refresh, the same seam shape the freshen-on-read callers inject.
+   * Absent, the spawn is the real detached one, and a short-lived CLI
+   * process is not its parent for long - which is why the child is
+   * detached in the first place.
+   */
+  readonly refreshSpawn?: (argv: string[]) => void;
+  /**
+   * The config file the post-write refresh resolves the search config
+   * through - the caller's `--config` (or the MCP server's config path),
+   * so the claim reads the same index and spawns the child with the same
+   * freshen settings the rest of the invocation used. Absent, the config
+   * resolves from the environment alone.
+   */
+  readonly refreshConfigPath?: string;
 }
 
 export interface NoteLifecycleResult {
@@ -509,15 +531,6 @@ const VAULT_ROOT_REL = "";
  */
 const APPEND_ONLY_REL: ReadonlyArray<string> = Object.freeze([BRAIN_LOG_REL]);
 
-/**
- * The command that reconciles the derived index with the vault. Resolved
- * from the diagnostics registry rather than written here, so the string
- * an operator is handed is the same one every other index advisory names,
- * and a registry rename fails at import instead of inside the advisory it
- * was meant to explain.
- */
-const REINDEX_COMMAND = requireNextStep(SEARCH_INDEX_MISSING_CODE).nextCommand;
-
 /** The `.md` suffix, matched case-insensitively by the path envelope. */
 const MARKDOWN_SUFFIX = ".md";
 
@@ -551,62 +564,6 @@ function withoutSuffix(relPath: string): string {
  */
 function spellingsOf(relPath: string): ReadonlyArray<string> {
   return [relPath, withoutSuffix(relPath), basenameOf(relPath)];
-}
-
-/**
- * Read the derived index's freshness. Never throws: this is evidence
- * ABOUT the operation, and an unreadable index must not fail a relocation
- * that already succeeded - it must be reported as unreadable, which is a
- * different answer from "no stale references exist".
- *
- * `wrote` is what separates {@link INDEX_EVIDENCE.stale} from
- * {@link INDEX_EVIDENCE.unchanged}: the staleness claim is about what
- * THIS call did to the vault, so a plan-only run - which moved nothing
- * and rewrote nothing - cannot have aged an index and must not say it
- * did. The other two states are facts about the index file itself and
- * read the same either way.
- *
- * The import is deferred because the search barrel reaches back into the
- * Brain tree, and a static edge from a Brain note writer into it is the
- * shape the acyclic-import ratchet exists to keep out.
- */
-async function readIndexEvidence(vault: string, wrote: boolean): Promise<IndexEvidence> {
-  try {
-    const { resolveSearchConfig } = await import("../../search/index.ts");
-    const { LAST_INDEXED_AT_STATE_KEY, Store } = await import("../../search/store.ts");
-    const config = resolveSearchConfig({ vault });
-    if (!existsSync(config.dbPath)) {
-      return Object.freeze({
-        state: INDEX_EVIDENCE.absent,
-        lastIndexedAt: null,
-        nextCommand: REINDEX_COMMAND,
-      });
-    }
-    const store = await Store.open(config, { mode: "read" });
-    try {
-      const last = store.getState(LAST_INDEXED_AT_STATE_KEY);
-      if (last === null) {
-        return Object.freeze({
-          state: INDEX_EVIDENCE.unreadable,
-          lastIndexedAt: null,
-          nextCommand: REINDEX_COMMAND,
-        });
-      }
-      return Object.freeze({
-        state: wrote ? INDEX_EVIDENCE.stale : INDEX_EVIDENCE.unchanged,
-        lastIndexedAt: last,
-        nextCommand: REINDEX_COMMAND,
-      });
-    } finally {
-      await store.close();
-    }
-  } catch {
-    return Object.freeze({
-      state: INDEX_EVIDENCE.unreadable,
-      lastIndexedAt: null,
-      nextCommand: REINDEX_COMMAND,
-    });
-  }
 }
 
 /**
@@ -681,7 +638,7 @@ function resolveDestination(
 }
 
 /**
- * Decide what to do about the bare `[[Basename]]` spelling, from the
+ * Decide what to do about the bare `[[Old]]` spelling, from the
  * population the rewrite would act on.
  *
  * `files` is the list the counting pass just walked, which is exactly the
@@ -689,15 +646,22 @@ function resolveDestination(
  * answer from a second walk under a second rule set is how the count and
  * the rewrite would come to disagree.
  *
- * BOTH basenames are counted, and the destination side is the half that
- * was missing. `[[Old]]` is safe to rewrite only when it names exactly
- * one note before the rename AND `[[New]]` names exactly one after it.
- * With `A/Old.md` and `B/New.md` both present, renaming `A/Old.md` to
- * `A/New.md` used to report `applied` and produce two `[[New]]` links -
- * and by this project's own resolution ladder (`store/links.ts:66-69`
- * resolves a bare basename only when the count is exactly one) the
- * rewritten link then resolved to NEITHER note. Withholding is the only
- * answer that leaves a working link working.
+ * The question is whether `[[Old]]` uniquely resolved to the SOURCE
+ * before the move, because that is the link this operation would
+ * otherwise strand. The rewrite target is no longer the bare new
+ * basename but {@link minimalSpellingFor}'s answer over the post-move
+ * population, which is unambiguous by construction - so the DESTINATION
+ * side of the old count, which withheld the rewrite whenever any other
+ * note carried the destination basename, no longer withholds anything:
+ * with `A/Old.md`, `B/Foo.md` and a third page's `[[Old]]`, renaming
+ * `A/Old.md` to `A/Foo.md` rewrites the link to `[[A/Foo]]`, which
+ * resolves to the same note `[[Old]]` did. What still withholds is a
+ * bare spelling that never uniquely named the source: a NESTED source
+ * with several same-basename carriers answered, by the ladder's
+ * basename rung, to whichever one Obsidian picked - rewriting it would
+ * re-point a link that never pointed here - while a TOP-LEVEL source
+ * owns its bare spelling outright through the exact-path rung whatever
+ * the nested count.
  */
 function decideBasename(
   files: ReadonlyArray<string>,
@@ -708,11 +672,8 @@ function decideBasename(
   const to = basenameOf(destinationRel);
   if (from === to) return BASENAME_REWRITE.notNeeded;
   const carriersOfFrom = files.filter((rel) => basenameOf(rel) === from).length;
-  // The destination does not exist yet, so every carrier of its basename
-  // is a DIFFERENT note that will still be there afterwards - one is
-  // already one too many.
-  const carriersOfTo = files.filter((rel) => basenameOf(rel) === to).length;
-  return carriersOfFrom > 1 || carriersOfTo > 0
+  const sourceIsTopLevel = directoryOf(sourceRel) === "";
+  return carriersOfFrom > 1 && !sourceIsTopLevel
     ? BASENAME_REWRITE.ambiguous
     : BASENAME_REWRITE.applied;
 }
@@ -860,7 +821,9 @@ function relocateBytes(
  * before the count guard runs; the count guard runs before any byte
  * moves; and the index evidence is read at the END, so the instant it
  * reports is the one a caller comparing it against the relocation will
- * actually reason about.
+ * actually reason about, with the refresh claim trailing it - the claim
+ * starts a detached run, and the evidence must stay the description of
+ * the index as this call left it.
  */
 export async function noteLifecycle(
   vault: string,
@@ -922,17 +885,42 @@ export async function noteLifecycle(
     spellingsOf(source.relPath).map((from) => ({ from })),
     { root: VAULT_ROOT_REL, apply: false },
   );
+  const reported = (rel: string): boolean => input.readable?.(rel) ?? true;
+  const basename =
+    destination === null
+      ? BASENAME_REWRITE.notNeeded
+      : decideBasename(probe.files, source.relPath, destination.relPath);
+  const mainRetargets =
+    destination === null ? [] : mainRetargetsFor(probe.files, source, destination, basename);
+  const repairs =
+    destination === null ? [] : bareNameRepairs(probe.files, source.relPath, destination.relPath);
+  // The repair pass writes files the moved note's own spellings can
+  // never match: a file mentioning ONLY the contested bare basename
+  // matches none of them, yet the repair rewrites it. Its spellings
+  // therefore run through a match-only probe of their own, and the
+  // files they hit join `inbound_files` and the count guard - the plan
+  // names every file the apply will write, and `--expect` counts the
+  // same set. A delete has no destination and so no repairs; the union
+  // below is its plain probe then.
+  const repairMatched =
+    repairs.length > 0
+      ? retargetWikilinks(
+          vault,
+          repairs.map((r) => ({ from: r.from })),
+          { root: VAULT_ROOT_REL, apply: false },
+        ).matched
+      : [];
+  const matched = [...new Set([...probe.matched, ...repairMatched])].toSorted();
   // A delete drops its own file, so a reference living inside it strands
   // nothing and is not counted. A relocation REWRITES its own file when
   // the note names its own old path, so that file is one of the writes
   // `--expect` guards and has to be in the number.
   // A file the caller may not read is absent from every list and count
   // below; see `NoteLifecycleInput.readable`.
-  const reported = (rel: string): boolean => input.readable?.(rel) ?? true;
   const inboundFiles = (
     action === NOTE_LIFECYCLE_ACTION.delete
-      ? probe.matched.filter((rel) => rel !== source.relPath)
-      : probe.matched
+      ? matched.filter((rel) => rel !== source.relPath)
+      : matched
   ).filter(reported);
   const filesScanned = probe.files.filter(reported).length;
 
@@ -954,13 +942,6 @@ export async function noteLifecycle(
     willMutate: apply,
     matchList: guarded,
   });
-
-  const basename =
-    destination === null
-      ? BASENAME_REWRITE.notNeeded
-      : decideBasename(probe.files, source.relPath, destination.relPath);
-
-  const retargets = destination === null ? [] : retargetsFor(source, destination, basename);
 
   let snapshot: NoteLifecycleResult["snapshot"] = null;
   let rewritten: ReadonlyArray<string> = [];
@@ -1011,6 +992,14 @@ export async function noteLifecycle(
         },
       );
       snapshot = Object.freeze({ runId: gated.snapshot.runId, path: gated.snapshot.path });
+      const index = await readIndexEvidence(vault, true, input.refreshConfigPath);
+      const claim = await claimPostWriteRefresh(
+        vault,
+        index,
+        input.refreshSpawn,
+        input.now,
+        input.refreshConfigPath,
+      );
       return finish(
         action,
         source.relPath,
@@ -1024,7 +1013,9 @@ export async function noteLifecycle(
         [],
         [],
         basename,
-        await readIndexEvidence(vault, true),
+        index,
+        claim.refresh,
+        claim.refreshReason,
         cascade,
       );
     }
@@ -1043,13 +1034,41 @@ export async function noteLifecycle(
     // error propagated and the caller got no result at all - no `from`,
     // no `to`, no evidence - leaving a half-applied rename
     // indistinguishable from one that never started.
-    const pass = retargetWikilinks(vault, retargets, {
+    //
+    // TWO passes, in this order. The repairs go FIRST, over each file's
+    // original link texts: a repair's `from` is the destination's own
+    // bare basename, which is exactly what the destination-collapsing
+    // pass rewrites links TO, so chaining the two rule sets through one
+    // ordered reduce let the repair rule consume the spellings the main
+    // pass had just written - repointing the renamed note's own inbound
+    // links at the third-party note the repair belonged to. With the
+    // repairs ahead of the main pass, each original link is rewritten by
+    // the one rule that names it and no rule ever sees another rule's
+    // output. Both passes obey the same never-rewrite scope.
+    const repairPass =
+      repairs.length > 0
+        ? retargetWikilinks(vault, repairs, {
+            root: VAULT_ROOT_REL,
+            apply: true,
+            neverRewrite: APPEND_ONLY_REL,
+          })
+        : null;
+    const mainPass = retargetWikilinks(vault, mainRetargets, {
       root: VAULT_ROOT_REL,
       apply: true,
       neverRewrite: APPEND_ONLY_REL,
     });
-    rewritten = pass.rewritten.filter(reported);
-    rewriteFailures = pass.failed.filter((failure) => reported(failure.path));
+    rewritten = [...new Set([...(repairPass?.rewritten ?? []), ...mainPass.rewritten])]
+      .toSorted()
+      .filter(reported);
+    const failureByPath = new Map<string, string>();
+    for (const failure of [...(repairPass?.failed ?? []), ...mainPass.failed]) {
+      if (!failureByPath.has(failure.path)) failureByPath.set(failure.path, failure.reason);
+    }
+    rewriteFailures = [...failureByPath]
+      .filter(([rel]) => reported(rel))
+      .map(([path, reason]) => ({ path, reason }))
+      .toSorted((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   }
 
   // The MOVE destroys nothing - the bytes are reachable under the
@@ -1077,6 +1096,22 @@ export async function noteLifecycle(
     },
   });
 
+  const index = await readIndexEvidence(vault, apply, input.refreshConfigPath);
+  // The refresh claim trails the evidence read on purpose: the evidence
+  // must describe the index as this call left it, and the claim starts a
+  // DETACHED run that will not have landed by any instant this call can
+  // observe. A plan-only run aged nothing and claims nothing - and
+  // refused nothing, so its reason is null rather than a borrowed token.
+  const claim = apply
+    ? await claimPostWriteRefresh(
+        vault,
+        index,
+        input.refreshSpawn,
+        input.now,
+        input.refreshConfigPath,
+      )
+    : { refresh: INDEX_REFRESH.notClaimed, refreshReason: null };
+
   return finish(
     action,
     source.relPath,
@@ -1087,10 +1122,23 @@ export async function noteLifecycle(
     filesScanned,
     inboundFiles,
     rewritten.length,
-    retargets.flatMap((r) => (r.to === undefined ? [] : [{ from: r.from, to: r.to }])),
+    // A bare-name repair derived from a page the caller may not read is
+    // applied (the readers who can see that page keep a working link)
+    // but names no pair, exactly like the rewrites inside withheld
+    // pages: the report answers as a vault without the page would. The
+    // main pairs are derived solely from the paths this call was given,
+    // so no pair of theirs can name a page the caller chose not to see.
+    // The repairs are listed first because they are applied first.
+    [...repairs, ...mainRetargets].flatMap((r) =>
+      r.to === undefined || (r.carrierRel !== undefined && !reported(r.carrierRel))
+        ? []
+        : [{ from: r.from, to: r.to }],
+    ),
     rewriteFailures,
     basename,
-    await readIndexEvidence(vault, apply),
+    index,
+    claim.refresh,
+    claim.refreshReason,
     cascade,
   );
 }
@@ -1153,22 +1201,112 @@ function planCascade(
 }
 
 /**
- * The spellings this relocation will actually rewrite. The bare basename
- * is included only when {@link decideBasename} cleared it, so the
+ * The walked population as the relocation leaves it: the source path
+ * gone, the destination present. Every judgement about the POST state -
+ * the minimal destination spelling, the basename carrier counts - is
+ * derived from this list rather than from a second walk, so the decision
+ * and the rewrite pass can never see two different vaults.
+ */
+function postRelocationPopulation(
+  files: ReadonlyArray<string>,
+  sourceRel: string,
+  destinationRel: string,
+): ReadonlyArray<string> {
+  return [...files.filter((rel) => rel !== sourceRel), destinationRel].toSorted();
+}
+
+/**
+ * One retarget pair plus, for a bare-name repair, the third-party page
+ * the pair was derived from. The carrier travels with the pair so the
+ * report can ask the caller's reach predicate about the page a withheld
+ * carrier would otherwise name - the pair itself spells only a basename
+ * and a minimal spelling, and the spelling derived from a page the
+ * caller may not read must contribute no reported pair.
+ */
+type AnnotatedRetarget = WikilinkRetarget & { readonly carrierRel?: string };
+
+/**
+ * The bare-name spellings this rename PROVABLY breaks for links that
+ * never mentioned it, and the spelling each should carry instead.
+ *
+ * The casualty is the bare spelling whose carrier count the move turns
+ * from exactly one into several: before it, the ladder's
+ * unique-carrier rung resolved that spelling to one note; after it,
+ * there are two carriers and the spelling resolves to NEITHER - the
+ * rename silently broke a third-party link. Those links are repaired to
+ * the minimal unambiguous spelling of their PRE-rename target, the
+ * chooser applied to the note that never moved. Everything else stays
+ * untouched, because nothing is provable about it: a spelling carried
+ * by several notes before the move was already ambiguous, a spelling
+ * with no carrier was already dangling (adopting it would be a guess),
+ * and a single TOP-LEVEL carrier keeps owning its spelling through the
+ * exact-path rung whatever the nested count becomes - which is why the
+ * repair target is computed through the same chooser and ladder as the
+ * main rewrite, and why a repair that comes out identical to the
+ * spelling it would "repair" is dropped as a no-op. The pre-state is
+ * the counting probe's walked population; the post-state is derived,
+ * the move relocating exactly one carrier.
+ */
+function bareNameRepairs(
+  files: ReadonlyArray<string>,
+  sourceRel: string,
+  destinationRel: string,
+): ReadonlyArray<AnnotatedRetarget> {
+  const from = basenameOf(sourceRel);
+  const to = basenameOf(destinationRel);
+  const post = postRelocationPopulation(files, sourceRel, destinationRel);
+  const repairs: AnnotatedRetarget[] = [];
+  for (const spelling of new Set([from, to])) {
+    const preCarriers = files.filter((rel) => basenameOf(rel) === spelling);
+    const delta = (spelling === to ? 1 : 0) - (spelling === from ? 1 : 0);
+    if (preCarriers.length !== 1 || preCarriers.length + delta < 2) continue;
+    const repairedTo = minimalSpellingFor(preCarriers[0]!, post);
+    if (repairedTo !== spelling) {
+      repairs.push({ from: spelling, to: repairedTo, carrierRel: preCarriers[0]! });
+    }
+  }
+  return repairs;
+}
+
+/**
+ * The destination-collapsing spellings of this relocation, aimed at the
+ * MINIMAL spelling the destination resolves under once the move has
+ * landed ({@link minimalSpellingFor} over the post-move population):
+ * every old spelling of the source collapses onto the one shortest form
+ * that stays unambiguous, so `[[Projects/Old]]` comes out `[[New]]`
+ * when `New` is unique and `[[Projects/New]]` only when it is not. A
+ * link comes out no longer than the vault still needs, and never
+ * longer than it went in. The bare basename of the SOURCE is included
+ * only when {@link decideBasename} cleared it, so the
  * `rewrittenSpellings` a caller reads back is the list that was applied
  * and not the list that was considered.
+ *
+ * The repairs {@link bareNameRepairs} derives are NOT in this list, and
+ * that is the point: a repair's `from` is the destination's own bare
+ * basename - exactly what these pairs rewrite links TO - so one ordered
+ * reduce over both would let the repair rule consume the spellings the
+ * main pass had just written, repointing the renamed note's own inbound
+ * links at the repaired third-party note. The repairs run as a pass of
+ * their own, FIRST, over each file's original link texts, so one rule's
+ * output is never another rule's input. The separate pass obeys the
+ * same never-rewrite scope as this one.
  */
-function retargetsFor(
+function mainRetargetsFor(
+  files: ReadonlyArray<string>,
   source: ResolvedNoteTarget,
   destination: ResolvedNoteTarget,
   basename: BasenameRewrite,
-): ReadonlyArray<WikilinkRetarget> {
-  const pairs: WikilinkRetarget[] = [
-    { from: source.relPath, to: destination.relPath },
-    { from: withoutSuffix(source.relPath), to: withoutSuffix(destination.relPath) },
+): ReadonlyArray<AnnotatedRetarget> {
+  const to = minimalSpellingFor(
+    destination.relPath,
+    postRelocationPopulation(files, source.relPath, destination.relPath),
+  );
+  const pairs: AnnotatedRetarget[] = [
+    { from: source.relPath, to },
+    { from: withoutSuffix(source.relPath), to },
   ];
   if (basename === BASENAME_REWRITE.applied) {
-    pairs.push({ from: basenameOf(source.relPath), to: basenameOf(destination.relPath) });
+    pairs.push({ from: basenameOf(source.relPath), to });
   }
   return Object.freeze(pairs);
 }
@@ -1188,6 +1326,8 @@ function finish(
   rewriteFailures: ReadonlyArray<{ readonly path: string; readonly reason: string }>,
   basename: BasenameRewrite,
   index: IndexEvidence,
+  refresh: IndexRefresh,
+  refreshReason: string | null,
   cascade: NoteDeleteCascade | null,
 ): NoteLifecycleResult {
   return Object.freeze({
@@ -1206,6 +1346,11 @@ function finish(
       rewriteFailures: Object.freeze([...rewriteFailures]),
       basename,
       index,
+      refresh,
+      // Rendered on every report, null included: a caller reading the
+      // field is reading an answer (nothing was refused, or nothing was
+      // attempted) rather than inferring one from an absent key.
+      refreshReason,
     }),
   });
 }

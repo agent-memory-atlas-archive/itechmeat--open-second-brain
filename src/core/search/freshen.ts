@@ -16,7 +16,7 @@
  * lock probe and one exclusive create.
  */
 import { randomUUID } from "node:crypto";
-import { readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { linkSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { appendMetric } from "../brain/metrics.ts";
@@ -30,6 +30,26 @@ export const FRESHEN_CLAIM_FILE = "freshen.claim";
 
 /** The child's outcome, failure streak and backoff. */
 export const FRESHEN_STATE_FILE = "freshen-state.json";
+
+/**
+ * The pending-write marker a forced refresh claim leaves when a run is
+ * already in flight (`freshen-pending.json`, beside the state file) -
+ * the claim held, or the index writer lock probed held, which is the
+ * same run mid-pass. The claim's exclusivity means exactly one run is in flight, and
+ * that run may have scanned past the write before it landed - its stamp
+ * cannot prove it saw the write, and until the next interval its
+ * freshness suppresses freshen-on-read. The marker is the queue: the
+ * child reads it before releasing the claim and runs one bounded extra
+ * incremental pass when the marker is newer than its scan start. See
+ * {@link settleFreshenPending}.
+ */
+export const FRESHEN_PENDING_FILE = "freshen-pending.json";
+
+/** A write waiting for a pass that can provably cover it. */
+export interface FreshenPending {
+  /** Milliseconds since the epoch: when the pending write landed. */
+  readonly since: number;
+}
 
 /**
  * Metrics surface for background runs. A row is written only when a run
@@ -263,6 +283,203 @@ export function releaseFreshen(dir: string, token: string): void {
   }
 }
 
+/**
+ * Record that a write landed at `nowMs` and is waiting for a pass that
+ * can provably cover it. Always overwrites with the newest instant: the
+ * marker must never name an instant older than the youngest uncovered
+ * write, or a pass would clear it while the newer write is still
+ * missing. Best-effort, like every other piece of freshen bookkeeping -
+ * a marker that cannot be written costs the write its second pass, not
+ * the write itself.
+ */
+export function markFreshenPending(dir: string, nowMs: number): void {
+  try {
+    atomicWriteFileSync(
+      join(dir, FRESHEN_PENDING_FILE),
+      JSON.stringify({ since: nowMs } satisfies FreshenPending) + "\n",
+    );
+  } catch {
+    // Best effort: the next forced claim re-marks.
+  }
+}
+
+/** The pending marker at an arbitrary path, or `null` when torn or absent. */
+function readPendingAt(path: string): FreshenPending | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as {
+      since?: unknown;
+    };
+    if (typeof parsed.since !== "number" || !Number.isFinite(parsed.since)) return null;
+    return { since: parsed.since };
+  } catch {
+    return null;
+  }
+}
+
+/** The pending marker, or `null` when there is none or it is torn. */
+export function readFreshenPending(dir: string): FreshenPending | null {
+  return readPendingAt(join(dir, FRESHEN_PENDING_FILE));
+}
+
+/** Drop the pending marker. An absent marker is nothing to fail a run over. */
+export function clearFreshenPending(dir: string): void {
+  try {
+    unlinkSync(join(dir, FRESHEN_PENDING_FILE));
+  } catch {
+    // Already gone.
+  }
+}
+
+/** A marker taken off its path by {@link takeFreshenPending}, held for the settle. */
+export interface TakenFreshenPending {
+  /** The marker as it stood on the path, or `null` when its file was torn. */
+  readonly pending: FreshenPending | null;
+  /**
+   * Put the taken marker back. A writer that re-marked while the settle
+   * held this take keeps the path: the link answers that atomically
+   * (EEXIST means the path is occupied again), and the newer instant
+   * supersedes the taken one, the marker naming the YOUNGEST uncovered
+   * write.
+   */
+  restore(): void;
+  /** Drop the taken marker: the pass that ran covered it. */
+  drop(): void;
+}
+
+/**
+ * Take the pending marker off its path atomically, so the settle can
+ * judge and clear it without racing the writers that mark between the
+ * settle's read and its unlink - the one window a plain
+ * read-then-clear leaves open, and exactly the lost write the marker
+ * exists to prevent. The rename moves whatever stands at the path NOW
+ * (a later writer's marker can only land after it), and `restore` puts
+ * the take back unless a newer marker claimed the path in between.
+ * `null` when there was no marker to take.
+ */
+export function takeFreshenPending(dir: string): TakenFreshenPending | null {
+  const path = join(dir, FRESHEN_PENDING_FILE);
+  const held = `${path}.${randomUUID()}.settle`;
+  try {
+    renameSync(path, held);
+  } catch {
+    return null; // No marker (or the directory refused): nothing queued.
+  }
+  const pending = readPendingAt(held);
+  return {
+    pending,
+    restore: () => {
+      try {
+        linkSync(held, path);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") {
+          // A filesystem without hard links (EPERM, ENOTSUP, EXDEV on
+          // network and exFAT mounts): the exclusive put-back is
+          // unavailable there, so the take goes back by plain rename -
+          // the small window where a writer's newer marker could be
+          // replaced is the price of not destroying the marker outright.
+          try {
+            renameSync(held, path);
+            return;
+          } catch {
+            // rename(2) replaces an occupied destination on every
+            // platform this runs on, so reaching here is a genuine I/O
+            // failure, not an occupied path: the take cannot be put
+            // back and is dropped below - the same best-effort loss a
+            // marker that cannot be written already names.
+          }
+        }
+      }
+      unlinkQuietly(held);
+    },
+    drop: () => {
+      unlinkQuietly(held);
+    },
+  };
+}
+
+/**
+ * The freshen child's settle, run before it releases the claim.
+ *
+ * A forced write that arrived while THIS run held the claim left a
+ * marker naming the instant its write landed. The run's own pass covers
+ * everything up to its scan start, so:
+ *
+ *   - a marker at or before the scan start is covered - clear it;
+ *   - a newer marker is not: run ONE more incremental pass - the bound
+ *     is one extra pass, never a loop - and take the marker only once
+ *     the pass has finished, clearing it when it still names an instant
+ *     the extra pass's own scan start covers. A still-newer marker (a
+ *     write landing during the extra pass) survives for the next run,
+ *     which covers and clears it the same way;
+ *   - a caller that cannot run a pass (a config that never resolved)
+ *     leaves the marker exactly as it stands.
+ *
+ * The marker is READ before any pass runs and TAKEN only after - never
+ * the other way round. A take that outran its pass handed a killed or
+ * thrown-away child a marker stranded in the take's hold file, where
+ * nothing reads it again: the write stood unqueued and unmarked. With
+ * the pass running against a marker that never left its path, a child
+ * that dies mid-pass leaves the queue exactly as it found it, and the
+ * take's hold window shrinks to the judge-and-clear after the pass -
+ * where {@link takeFreshenPending}'s restore still answers a writer
+ * that re-marked with newer work, superseding the take rather than
+ * being unlinked by this settle. A pass that throws covered nothing and
+ * the marker was never taken, so it stands for the next run.
+ *
+ * Returns whether the extra pass ran. Throws only what `runPass`
+ * throws, and the caller decides how a failed extra pass is reported.
+ */
+export async function settleFreshenPending(
+  dir: string,
+  scanStartedAtMs: number,
+  runPass: (() => Promise<void>) | null,
+): Promise<boolean> {
+  // Read without taking: the marker stays on its own path through every
+  // fallible step below, so a child that dies at any of them leaves the
+  // queue standing for the next run.
+  const pending = readFreshenPending(dir);
+  if (pending === null) return false;
+  if (pending.since <= scanStartedAtMs) {
+    // This run's scan began after the pending write: the pass that just
+    // finished covered it. The take judges what stands NOW, so a writer
+    // that re-marked between the read and this take keeps its newer
+    // marker - only a still-covered marker is dropped.
+    const covered = takeFreshenPending(dir);
+    if (covered !== null) {
+      if (covered.pending !== null && covered.pending.since <= scanStartedAtMs) {
+        covered.drop();
+      } else {
+        covered.restore();
+      }
+    }
+    return false;
+  }
+  if (runPass === null) {
+    // No pass to run: the marker stands untouched for the next run.
+    return false;
+  }
+  const secondStart = Date.now();
+  // A pass that throws propagates with the marker still on its path -
+  // it covered nothing, and that standing marker is the truthful queue.
+  await runPass();
+  const taken = takeFreshenPending(dir);
+  if (taken === null) return true;
+  if (taken.pending !== null && taken.pending.since <= secondStart) {
+    // The extra pass started after the marker's instant, so it covered
+    // the pending write - and the marker goes with it. A marker that
+    // outlived its own coverage would push every later run into an
+    // extra pass forever.
+    taken.drop();
+  } else {
+    // The write landed after the extra pass's scan start: this run
+    // cannot prove it saw the write, so the marker survives for the
+    // next run - superseded, not merged, if a writer re-marked during
+    // the pass.
+    taken.restore();
+  }
+  return true;
+}
+
 function str(v: unknown): string | null {
   return typeof v === "string" ? v : null;
 }
@@ -347,6 +564,17 @@ export interface MaybeFreshenOptions {
   readonly lastIndexedAt: string | null;
   /** A read-only open (cross-vault, recall sources): never write there. */
   readonly readOnly?: boolean;
+  /**
+   * Skip the freshness gate and spawn whenever the remaining guards
+   * allow. This is the post-write shape: the caller just changed the
+   * vault, so the stamp is due by definition and comparing it against
+   * the interval would answer the wrong question. Config off still
+   * means off (`intervalSeconds <= 0` refuses whatever the flag says),
+   * an index that was never stamped stays self-heal's, and the claim
+   * exclusivity, the failure backoff and the writer-lock probe all
+   * stand exactly as on the interval path.
+   */
+  readonly force?: boolean;
   readonly nowMs?: number;
   /** Test seam: replaces the detached spawn. */
   readonly spawn?: (argv: string[]) => void;
@@ -371,17 +599,38 @@ export function maybeFreshenIndex(
       lastIndexedAt: opts.lastIndexedAt,
       intervalSeconds: freshen.intervalSeconds,
     };
-    // Every search lands here: decide on the index stamp alone first and
-    // read the state file for the backoff only once the index is due.
-    const due = decideFreshen({ ...input, backoffUntilMs: null });
-    if (due.action === "skip") return due.reason;
-    const backoffUntil = readFreshenState(dir).backoffUntil;
-    const backoffMs = backoffUntil === null ? Number.NaN : Date.parse(backoffUntil);
-    const decision = decideFreshen({
-      ...input,
-      backoffUntilMs: Number.isFinite(backoffMs) ? backoffMs : null,
-    });
-    if (decision.action === "skip") return decision.reason;
+    if (opts.force === true) {
+      // The freshness comparison is the one gate force exists to skip;
+      // everything else decides for the same reasons as on the interval
+      // path. The stamp check doubles as the self-heal boundary: an
+      // index that was never stamped is rebuilt there, not here.
+      if (opts.lastIndexedAt === null) return FRESHEN_SKIP.noIndex;
+      // No freshness floor on the stamp: the stamp marks when a run
+      // FINISHED, and a run that finished after the write began may well
+      // have scanned before the write landed - its stamp cannot prove it
+      // saw the write. A forced run that skipped on such a stamp would
+      // leave the write unindexed until the next interval or the next
+      // write, silently. The collapse the floor promised is the claim
+      // machinery's: a run already in flight holds the claim, so a write
+      // landing during it starts nothing. Back-to-back applied writes
+      // spawn one run each, capped by that exclusivity and the failure
+      // backoff - the price of every run provably covering its write.
+      const backoffUntil = readFreshenState(dir).backoffUntil;
+      const backoffMs = backoffUntil === null ? Number.NaN : Date.parse(backoffUntil);
+      if (Number.isFinite(backoffMs) && backoffMs > nowMs) return FRESHEN_SKIP.backoff;
+    } else {
+      // Every search lands here: decide on the index stamp alone first and
+      // read the state file for the backoff only once the index is due.
+      const due = decideFreshen({ ...input, backoffUntilMs: null });
+      if (due.action === "skip") return due.reason;
+      const backoffUntil = readFreshenState(dir).backoffUntil;
+      const backoffMs = backoffUntil === null ? Number.NaN : Date.parse(backoffUntil);
+      const decision = decideFreshen({
+        ...input,
+        backoffUntilMs: Number.isFinite(backoffMs) ? backoffMs : null,
+      });
+      if (decision.action === "skip") return decision.reason;
+    }
     if (isWriterLockHeld(config.dbPath)) return FRESHEN_SKIP.writerLock;
     const claim = tryClaimFreshen(dir, nowMs);
     if (!("token" in claim)) return claim.skip;

@@ -11,7 +11,10 @@
  */
 
 import {
+  MIN_ANCHOR_FORM_LENGTH,
   entityMatchForms,
+  matchFormVariants,
+  matchVariantsOccurIn,
   normalizeEntityName,
   type EntityLexiconHandle,
   type ValidateEntityLabelOptions,
@@ -124,20 +127,26 @@ export function splitSentences(text: string): string[] {
   return out.map((s) => s.trim()).filter((s) => s !== "");
 }
 
-/** Minimum normalised form length that participates in substring matching. */
-const MIN_ANCHOR_FORM_LENGTH = 3;
-
 /**
  * The occurrence-anchoring kernel (truth-correctable-time-aware,
- * task 4): the quality-gated normalized match forms that literally
- * occur in `text`. Candidate labels pass through the quality gate
+ * task 4): the quality-gated normalized match forms that occur in
+ * `text`. Candidate labels pass through the quality gate
  * (sanitize decoration, then normalize, drop structurally-invalid
  * forms) before matching, and forms shorter than
- * {@link MIN_ANCHOR_FORM_LENGTH} never participate. Pure: no I/O, no
- * registry - so this layer never resolves the lexicon itself. The one
- * kernel every occurrence-anchoring caller shares - the assertion
- * decomposer and the agent-stated claim verdicts both anchor through
- * it, and each vault-aware caller resolves the SAME store-learned
+ * {@link MIN_ANCHOR_FORM_LENGTH} never participate. Since F3
+ * (note-change truth maintenance) the occurrence test itself is
+ * separator-tolerant: both the form AND the haystack fold through
+ * {@link matchFormVariants} to their canonical (space) joins - runs of
+ * space, hyphen and underscore are interchangeable, a folder-prefixed
+ * form also matches at a path-segment boundary - and every occurrence
+ * must have a clean leading edge (a no-space-script neighbour suspends
+ * the requirement), so the fold never plants a mid-word hit nothing
+ * anchored before (`canada` never anchors `ada`). The returned forms are
+ * still the gate's normalized forms, never the expanded variants. Pure:
+ * no I/O, no registry - so this layer never resolves the lexicon itself.
+ * The one kernel every occurrence-anchoring caller shares - the
+ * assertion decomposer and the agent-stated claim verdicts both anchor
+ * through it, and each vault-aware caller resolves the SAME store-learned
  * lexicon through `resolveEntityLexicon` and threads it in here
  * (recall-quality M6), so no path can drift back to anchoring a form
  * the creation gate refuses. `opts` threads the admission vocabularies
@@ -151,9 +160,18 @@ export function anchorEntityForms(
   opts: ValidateEntityLabelOptions = {},
 ): ReadonlyArray<string> {
   const haystack = normalizeEntityName(text);
+  // The haystack folds to its one canonical-join variant ONCE per call,
+  // not once per form: the same hoist entityAnchors makes, so a decompose
+  // pass over an assertion x entity grid tokenizes the text once per
+  // call instead of per form per entity. Identical verdicts -
+  // `matchFormOccursIn` is exactly this comparison with the expansion
+  // inlined.
+  const haystackVariants = matchFormVariants(haystack);
   return Object.freeze(
     entityMatchForms(forms, opts).filter(
-      (f) => f.length >= MIN_ANCHOR_FORM_LENGTH && haystack.includes(f),
+      (f) =>
+        f.length >= MIN_ANCHOR_FORM_LENGTH &&
+        matchVariantsOccurIn(matchFormVariants(f), haystackVariants),
     ),
   );
 }
@@ -171,12 +189,20 @@ function anchorEntities(
   opts: ValidateEntityLabelOptions = {},
 ): string[] {
   if (entities.length === 0) return [];
+  // The text tokenizes ONCE for the whole entity loop (M2, PR 268
+  // review): folding the haystack once per entity through
+  // `anchorEntityForms` re-derived the identical variant per iteration.
+  // The verdict is the same per-entity comparison, minus the re-fold.
+  const haystackVariants = matchFormVariants(normalizeEntityName(text));
   const ids: string[] = [];
   for (const entity of entities) {
     if (!entityStatusInScope(entity.status, ENTITY_STATUS_SCOPE.canonical)) continue;
-    if (anchorEntityForms(text, [entity.name, ...entity.aliases], opts).length > 0) {
-      ids.push(entity.id);
-    }
+    const anchored = entityMatchForms([entity.name, ...entity.aliases], opts).some(
+      (f) =>
+        f.length >= MIN_ANCHOR_FORM_LENGTH &&
+        matchVariantsOccurIn(matchFormVariants(f), haystackVariants),
+    );
+    if (anchored) ids.push(entity.id);
   }
   return ids.toSorted();
 }

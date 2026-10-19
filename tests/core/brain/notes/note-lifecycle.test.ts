@@ -27,12 +27,15 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { bootstrapBrain } from "../../../../src/core/brain/init.ts";
 import {
   BASENAME_REWRITE,
   INDEX_EVIDENCE,
+  INDEX_REFRESH,
+  INDEX_REFRESHES,
+  isIndexRefresh,
   isNoteLifecycleAction,
   NOTE_ARCHIVE_ROOT,
   NOTE_LIFECYCLE_ACTION,
@@ -43,6 +46,11 @@ import {
 import { RECOVERABILITY_STATE } from "../../../../src/core/brain/gates/recoverability.ts";
 import { CountGuardError } from "../../../../src/core/brain/count-guard.ts";
 import { atomicWriteFileSync } from "../../../../src/core/fs-atomic.ts";
+import {
+  FRESHEN_PENDING_FILE,
+  readFreshenPending,
+  settleFreshenPending,
+} from "../../../../src/core/search/freshen.ts";
 
 let vault: string;
 let configHome: string;
@@ -84,8 +92,21 @@ describe("the action vocabulary", () => {
   });
 });
 
+describe("the index-refresh vocabulary", () => {
+  // The guard ships beside its siblings' (isIndexEvidenceState,
+  // isBasenameRewrite): a token a caller reads back out of a report or a
+  // persisted payload has to survive the round trip through a string.
+  test("every declared refresh token is a member and the guard refuses everything else", () => {
+    expect([...INDEX_REFRESHES].toSorted()).toEqual(Object.values(INDEX_REFRESH).toSorted());
+    for (const token of INDEX_REFRESHES) expect(isIndexRefresh(token)).toBe(true);
+    for (const outsider of [null, 42, {}, "", "Claimed", "not-claimed", undefined]) {
+      expect(isIndexRefresh(outsider)).toBe(false);
+    }
+  });
+});
+
 describe("rename", () => {
-  test("moves the bytes and rewrites path-spelled inbound wikilinks", async () => {
+  test("moves the bytes and rewrites path-spelled inbound wikilinks to the minimal spelling", async () => {
     note("Projects/Old.md", "---\ntitle: Old\n---\n\nbody\n");
     note(
       "Projects/Ref.md",
@@ -106,11 +127,44 @@ describe("rename", () => {
     expect(read("Projects/New.md")).toContain("body");
 
     const ref = read("Projects/Ref.md");
-    expect(ref).toContain("[[Projects/New]]");
-    expect(ref).toContain("[[Projects/New.md]]");
-    expect(ref).toContain("[[Projects/New|x]]");
+    // Minimal spellings, not form preservation: the new basename is
+    // unique after the move, so every old form collapses onto `[[New]]`
+    // instead of each link keeping its original length.
+    expect(ref).toBe("see [[New]] and [[New]] and [[New|x]]\n");
     expect(ref).not.toContain("Old");
     expect(res.references?.filesRewritten).toBe(1);
+    expect(res.references?.rewrittenSpellings).toEqual([
+      { from: "Projects/Old.md", to: "New" },
+      { from: "Projects/Old", to: "New" },
+      { from: "Old", to: "New" },
+    ]);
+  });
+
+  test("rewrites path-spelled links to the suffix-less form when the destination basename is contested", async () => {
+    note("Projects/Old.md", "x\n");
+    note("Elsewhere/New.md", "another note that will still own the name\n");
+    note("Projects/Ref.md", "pathed [[Projects/Old]] and suffixed [[Projects/Old.md]]\n");
+
+    const res = await noteLifecycle(vault, {
+      action: NOTE_LIFECYCLE_ACTION.rename,
+      path: "Projects/Old.md",
+      to: "Projects/New.md",
+      apply: true,
+    });
+
+    // Bare `New` would have two carriers after the move and resolve, by
+    // the ladder's own rule, to neither - so the shortest HONEST
+    // spelling is the suffix-less path. The destination basename being
+    // contested does NOT withhold the moved note's own bare `[[Old]]`
+    // rewrite: it named exactly one note before the move, and its
+    // rewrite target is the minimal spelling `Projects/New`, which is
+    // unambiguous by construction.
+    expect(res.references?.basename).toBe(BASENAME_REWRITE.applied);
+    expect(read("Projects/Ref.md")).toBe("pathed [[Projects/New]] and suffixed [[Projects/New]]\n");
+    expect(res.references?.rewrittenSpellings).toContainEqual({
+      from: "Old",
+      to: "Projects/New",
+    });
   });
 
   test("rewrites references that live inside Brain/, not only outside it", async () => {
@@ -128,7 +182,7 @@ describe("rename", () => {
       apply: true,
     });
 
-    expect(read("Brain/reports/weekly.md")).toContain("[[Projects/New]]");
+    expect(read("Brain/reports/weekly.md")).toContain("[[New]]");
     expect(res.references?.filesRewritten).toBe(1);
   });
 
@@ -161,10 +215,10 @@ describe("rename", () => {
 
     expect(res.references?.basename).toBe(BASENAME_REWRITE.ambiguous);
     const ref = read("Projects/Ref.md");
-    // The unambiguous path spelling still moves; the bare one is left
-    // exactly as it was, because it may name the other note.
-    expect(ref).toContain("[[Projects/New]]");
-    expect(ref).toContain("[[Old]]");
+    // The path spelling collapses onto the (uncontested) new basename;
+    // the bare `[[Old]]` is left exactly as it was, because it may name
+    // the other note.
+    expect(ref).toBe("bare [[Old]] and pathed [[New]]\n");
   });
 
   test("refuses a destination in another directory - that is a move", async () => {
@@ -241,6 +295,13 @@ describe("rename", () => {
     expect(res.applied).toBe(false);
     expect(res.references?.inboundFiles).toEqual(["Projects/Ref.md"]);
     expect(res.references?.filesRewritten).toBe(0);
+    // The plan is reported in the spellings it would write, minimal
+    // forms included, so a dry run previews exactly the apply.
+    expect(res.references?.rewrittenSpellings).toEqual([
+      { from: "Projects/Old.md", to: "New" },
+      { from: "Projects/Old", to: "New" },
+      { from: "Old", to: "New" },
+    ]);
     expect(existsSync(join(vault, "Projects/Old.md"))).toBe(true);
     expect(read("Projects/Ref.md")).toContain("[[Projects/Old]]");
   });
@@ -274,6 +335,316 @@ describe("the freshness of the evidence a rename acted on", () => {
   });
 });
 
+/** Stamp a vault's index without running a full index pass. */
+async function stampIndex(at: string): Promise<void> {
+  const { resolveSearchConfig } = await import("../../../../src/core/search/index.ts");
+  const { LAST_INDEXED_AT_STATE_KEY, Store } = await import("../../../../src/core/search/store.ts");
+  const store = await Store.open(resolveSearchConfig({ vault }), { mode: "write" });
+  store.setState(LAST_INDEXED_AT_STATE_KEY, at);
+  await store.close();
+}
+
+/** The rename input every refresh test moves the same note with. */
+function renameInput(apply: boolean) {
+  return {
+    action: NOTE_LIFECYCLE_ACTION.rename,
+    path: "Projects/Old.md",
+    to: "Projects/New.md",
+    ...(apply ? { apply: true } : {}),
+  } as const;
+}
+
+/**
+ * The detached refresh an applied write claims (F2).
+ *
+ * The tests run with the suite-wide freshen-off default and turn the
+ * interval on only inside the specific tests that need it, so no real
+ * indexer is ever left behind; the spawn is always intercepted by the
+ * `refreshSpawn` seam. The "force was passed" evidence is indirect but
+ * binding: the index stamp in these fixtures is SECONDS old, so an
+ * unforced call would answer `fresh` and spawn nothing.
+ */
+describe("the detached refresh an applied write claims", () => {
+  const FRESHEN_INTERVAL_ENV = "OPEN_SECOND_BRAIN_SEARCH_FRESHEN_INTERVAL_S";
+  let savedInterval: string | undefined;
+  let intervalWasSaved = false;
+
+  beforeEach(() => {
+    savedInterval = undefined;
+    intervalWasSaved = false;
+  });
+  afterEach(() => {
+    if (!intervalWasSaved) return;
+    // Restore whatever the environment ACTUALLY held, including its
+    // absence. Writing back a hardcoded "60" here once leaked a freshen
+    // interval onto every follower test file sharing the process.
+    if (savedInterval === undefined) delete process.env[FRESHEN_INTERVAL_ENV];
+    else process.env[FRESHEN_INTERVAL_ENV] = savedInterval;
+    intervalWasSaved = false;
+  });
+
+  /** Capture the interval the environment holds right now, once. */
+  function saveInterval(): void {
+    if (intervalWasSaved) return;
+    savedInterval = process.env[FRESHEN_INTERVAL_ENV];
+    intervalWasSaved = true;
+  }
+
+  function withFreshenOn(): void {
+    saveInterval();
+    process.env[FRESHEN_INTERVAL_ENV] = "60";
+  }
+
+  test("an applied rename claims one detached refresh, and the child is the freshen run", async () => {
+    withFreshenOn();
+    // A stamp younger than the interval: only the force path spawns here.
+    await stampIndex(new Date().toISOString());
+    note("Projects/Old.md", "x\n");
+    const spawned: string[][] = [];
+
+    const res = await noteLifecycle(vault, {
+      ...renameInput(true),
+      refreshSpawn: (argv: string[]) => spawned.push(argv),
+    });
+
+    expect(res.references?.refresh).toBe(INDEX_REFRESH.claimed);
+    // A claim that started names no refusal, so the reason is null
+    // rather than a bare absent key a reader would have to guess about.
+    expect(res.references?.refreshReason).toBeNull();
+    expect(spawned).toHaveLength(1);
+    const argv = spawned[0]!.join(" ");
+    expect(argv).toContain("search index");
+    expect(argv).toContain("--freshen");
+    expect(argv).toContain("--freshen-state");
+    // The evidence read stays synchronous: the report still describes
+    // the index as it stood at the end of the call.
+    expect(res.references?.index.state).toBe(INDEX_EVIDENCE.stale);
+  });
+
+  test("the claim resolves through the config file the caller passed, not the environment alone", async () => {
+    // The interval is 0 by CONFIG FILE here - the suite-wide env default
+    // is scrubbed - so the claim reads `off` only if it resolves the
+    // search config through the caller's refreshConfigPath. Resolved
+    // without it, the default interval stands and the rename claims a
+    // run the operator's config refused.
+    await stampIndex(new Date().toISOString());
+    note("Projects/Old.md", "x\n");
+    atomicWriteFileSync(configPath, `vault: ${vault}\nsearch_freshen_interval_s: 0\n`);
+    const key = "OPEN_SECOND_BRAIN_SEARCH_FRESHEN_INTERVAL_S";
+    const saved = process.env[key];
+    delete process.env[key];
+    try {
+      const res = await noteLifecycle(vault, {
+        ...renameInput(true),
+        refreshConfigPath: configPath,
+      });
+      expect(res.references?.refresh).toBe(INDEX_REFRESH.notClaimed);
+      expect(res.references?.refreshReason).toBe("off");
+    } finally {
+      if (saved === undefined) delete process.env[key];
+      else process.env[key] = saved;
+    }
+  });
+
+  test("claim exclusivity prevents doubles: a second applied write spawns nothing", async () => {
+    withFreshenOn();
+    await stampIndex(new Date().toISOString());
+    note("Projects/Old.md", "x\n");
+    const first: string[][] = [];
+    const second: string[][] = [];
+
+    const one = await noteLifecycle(vault, {
+      ...renameInput(true),
+      refreshSpawn: (argv: string[]) => first.push(argv),
+    });
+    const two = await noteLifecycle(vault, {
+      action: NOTE_LIFECYCLE_ACTION.rename,
+      path: "Projects/New.md",
+      to: "Projects/Newer.md",
+      apply: true,
+      refreshSpawn: (argv: string[]) => second.push(argv),
+    });
+
+    expect(one.references?.refresh).toBe(INDEX_REFRESH.claimed);
+    // The intercepted spawn never runs a child, so the first claim is
+    // still held - and the second write must not spawn past it. Its
+    // refusal names the reason instead of leaving `not_claimed` to be
+    // read as a deliberate config-off.
+    expect(two.references?.refresh).toBe(INDEX_REFRESH.notClaimed);
+    expect(two.references?.refreshReason).toBe("claimed");
+    expect(second).toHaveLength(0);
+  });
+
+  test("a freshen interval of 0 disables the post-write spawn - config off means off", async () => {
+    saveInterval();
+    process.env[FRESHEN_INTERVAL_ENV] = "0";
+    await stampIndex(new Date().toISOString());
+    note("Projects/Old.md", "x\n");
+    const spawned: string[][] = [];
+
+    const res = await noteLifecycle(vault, {
+      ...renameInput(true),
+      refreshSpawn: (argv: string[]) => spawned.push(argv),
+    });
+
+    expect(res.references?.refresh).toBe(INDEX_REFRESH.notClaimed);
+    // `not_claimed` alone cannot distinguish a broken freshen path from
+    // a deliberate off; the reason can.
+    expect(res.references?.refreshReason).toBe("off");
+    expect(spawned).toHaveLength(0);
+  });
+
+  test("a plan-only run claims nothing", async () => {
+    withFreshenOn();
+    await stampIndex(new Date().toISOString());
+    note("Projects/Old.md", "x\n");
+    const spawned: string[][] = [];
+
+    const res = await noteLifecycle(vault, {
+      ...renameInput(false),
+      refreshSpawn: (argv: string[]) => spawned.push(argv),
+    });
+
+    expect(res.applied).toBe(false);
+    expect(res.references?.refresh).toBe(INDEX_REFRESH.notClaimed);
+    // No write, no attempt: a plan-only run refused nothing, so there is
+    // no reason to name - null, not a borrowed skip token.
+    expect(res.references?.refreshReason).toBeNull();
+    expect(spawned).toHaveLength(0);
+  });
+
+  test("an unindexed vault claims nothing - there is nothing to refresh", async () => {
+    withFreshenOn();
+    note("Projects/Old.md", "x\n");
+    const spawned: string[][] = [];
+
+    const res = await noteLifecycle(vault, {
+      ...renameInput(true),
+      refreshSpawn: (argv: string[]) => spawned.push(argv),
+    });
+
+    expect(res.references?.index.state).toBe(INDEX_EVIDENCE.absent);
+    expect(res.references?.refresh).toBe(INDEX_REFRESH.notClaimed);
+    // Nothing to refresh is itself a stated reason: the machinery's own
+    // no-index token, not a bare unexplained refusal.
+    expect(res.references?.refreshReason).toBe("no_index");
+    expect(spawned).toHaveLength(0);
+  });
+
+  test("a write landing while a run is in flight is queued: two rapid renames produce a second pass", async () => {
+    withFreshenOn();
+    await stampIndex(new Date().toISOString());
+    note("Projects/Old.md", "x\n");
+    const first: string[][] = [];
+    const second: string[][] = [];
+
+    // The first rename claims the run; the intercepted spawn never runs
+    // a child, so the claim stays held - the shape of a refresh still in
+    // flight.
+    await noteLifecycle(vault, {
+      ...renameInput(true),
+      refreshSpawn: (argv: string[]) => first.push(argv),
+    });
+    // The run's scan has (conceptually) started; the second rename lands
+    // DURING it.
+    const scanStart = Date.now();
+    const two = await noteLifecycle(vault, {
+      action: NOTE_LIFECYCLE_ACTION.rename,
+      path: "Projects/New.md",
+      to: "Projects/Newer.md",
+      apply: true,
+      refreshSpawn: (argv: string[]) => second.push(argv),
+    });
+
+    expect(two.references?.refresh).toBe(INDEX_REFRESH.notClaimed);
+    expect(second).toHaveLength(0);
+    // ...but the write is no longer dropped. A durable marker beside the
+    // freshen state says a write is pending since that instant.
+    const { resolveSearchConfig } = await import("../../../../src/core/search/index.ts");
+    const stateDir = dirname(resolveSearchConfig({ vault }).dbPath);
+    const marker = readFreshenPending(stateDir);
+    expect(marker).not.toBeNull();
+    expect(marker!.since).toBeGreaterThanOrEqual(scanStart);
+    expect(existsSync(join(stateDir, FRESHEN_PENDING_FILE))).toBe(true);
+
+    // The child's settle, before releasing the claim: the marker is
+    // newer than the scan start, so ONE bounded extra pass runs and the
+    // pass that covered it clears the marker. No loop, no leak.
+    let passes = 0;
+    const ran = await settleFreshenPending(stateDir, scanStart, async () => {
+      passes++;
+    });
+    expect(ran).toBe(true);
+    expect(passes).toBe(1);
+    expect(readFreshenPending(stateDir)).toBeNull();
+  });
+
+  test("an interval of 0 never spawns and never marks - config off means off", async () => {
+    saveInterval();
+    process.env[FRESHEN_INTERVAL_ENV] = "0";
+    await stampIndex(new Date().toISOString());
+    note("Projects/Old.md", "x\n");
+    // A held claim, so anything that tried to refresh would answer
+    // `claimed` - only config-off stands between this write and it.
+    const { resolveSearchConfig } = await import("../../../../src/core/search/index.ts");
+    const stateDir = dirname(resolveSearchConfig({ vault }).dbPath);
+    const { claimFreshen } = await import("../../../../src/core/search/freshen.ts");
+    expect(claimFreshen(stateDir, Date.now())).toBeString();
+    const spawned: string[][] = [];
+
+    const res = await noteLifecycle(vault, {
+      ...renameInput(true),
+      refreshSpawn: (argv: string[]) => spawned.push(argv),
+    });
+
+    expect(res.references?.refresh).toBe(INDEX_REFRESH.notClaimed);
+    expect(res.references?.refreshReason).toBe("off");
+    expect(spawned).toHaveLength(0);
+    // Off is off: no run is queued either, because an operator who
+    // disabled freshening asked for exactly that.
+    expect(readFreshenPending(stateDir)).toBeNull();
+    expect(existsSync(join(stateDir, FRESHEN_PENDING_FILE))).toBe(false);
+  });
+
+  test("a spawn failure never fails the write", async () => {
+    withFreshenOn();
+    await stampIndex(new Date().toISOString());
+    note("Projects/Old.md", "body\n");
+    note("Projects/Ref.md", "see [[Projects/Old]]\n");
+
+    const res = await noteLifecycle(vault, {
+      ...renameInput(true),
+      refreshSpawn: () => {
+        throw new Error("no fork");
+      },
+    });
+
+    expect(res.applied).toBe(true);
+    expect(res.references?.refresh).toBe(INDEX_REFRESH.notClaimed);
+    expect(read("Projects/New.md")).toContain("body");
+    expect(read("Projects/Ref.md")).toContain("[[New]]");
+  });
+
+  test("an applied delete claims the same refresh", async () => {
+    withFreshenOn();
+    await stampIndex(new Date().toISOString());
+    note("Projects/Gone.md", "x\n");
+    const spawned: string[][] = [];
+
+    const res = await noteLifecycle(vault, {
+      action: NOTE_LIFECYCLE_ACTION.delete,
+      path: "Projects/Gone.md",
+      apply: true,
+      confirm: true,
+      refreshSpawn: (argv: string[]) => spawned.push(argv),
+    });
+
+    expect(res.applied).toBe(true);
+    expect(res.references?.refresh).toBe(INDEX_REFRESH.claimed);
+    expect(spawned).toHaveLength(1);
+  });
+});
+
 describe("move", () => {
   test("relocates across directories and rewrites the path spelling", async () => {
     note("Inbox/Note.md", "---\ntitle: Note\n---\n\nbody\n");
@@ -289,7 +660,9 @@ describe("move", () => {
     expect(res.applied).toBe(true);
     expect(read("Projects/Note.md")).toContain("body");
     expect(existsSync(join(vault, "Inbox/Note.md"))).toBe(false);
-    expect(read("Inbox/Ref.md")).toContain("[[Projects/Note]]");
+    // The basename stays unique through the move, so the rewritten link
+    // comes out at its minimal spelling.
+    expect(read("Inbox/Ref.md")).toContain("[[Note]]");
     // The basename did not change, so there was no bare spelling to fix.
     expect(res.references?.basename).toBe(BASENAME_REWRITE.notNeeded);
   });

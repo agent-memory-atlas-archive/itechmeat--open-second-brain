@@ -73,6 +73,75 @@ describe("checkEntityContamination (pure)", () => {
     });
     expect(result.clean).toBe(true);
   });
+
+  // Separator-tolerant twins (note-change truth maintenance, F3): the
+  // check shares the anchoring kernels' match-form rule, so its inclusion
+  // test folds separator runs on both sides, matches a slug-prefixed form
+  // at the path-segment boundary, and never sees a mid-word mention.
+
+  test("separator-folded mentions clear the entity across spellings", () => {
+    const result = checkEntityContamination({
+      conclusion: "Ada-Lovelace approved the rollout",
+      sources: ["ada lovelace signed off this morning"],
+      entities: [person("ent-people-ada-lovelace", "Ada-Lovelace")],
+    });
+    expect(result.clean).toBe(true);
+    expect(result.violations).toHaveLength(0);
+  });
+
+  test("a slug-prefixed alias clears the entity through its last path segment", () => {
+    // The slug-prefixed alias is the entity's ONLY matchable form (the
+    // name matches nothing), the conclusion carries the slug form, and the
+    // source mentions only the bare tail - so the tail expansion is the
+    // ONE route that can clear the citation, and this test fails if the
+    // last-segment expansion is ever dropped.
+    const result = checkEntityContamination({
+      conclusion: "see people/ada_lovelace for the rollout decision",
+      sources: ["ada lovelace signed off this morning"],
+      entities: [person("ent-people-ada-lovelace", "***", ["people/ada_lovelace"])],
+    });
+    expect(result.clean).toBe(true);
+    expect(result.violations).toHaveLength(0);
+  });
+
+  test("a mid-word mention is not a mention (canada never anchors ada)", () => {
+    const result = checkEntityContamination({
+      conclusion: "Canada approved the rollout",
+      sources: ["Nothing relevant"],
+      entities: [person("ent-people-ada", "Ada")],
+    });
+    expect(result.clean).toBe(true);
+    expect(result.violations).toHaveLength(0);
+  });
+
+  test("an inflected mention in the conclusion is a violation when no source cites it", () => {
+    // H1 (PR 268 review), missed violation: Russian attaches case
+    // endings with no space, so the two-sided boundary rule silenced the
+    // conclusion's "Иваном" and a conclusion asserting an uncited
+    // entity's presence read as clean. The leading-only rule anchors it.
+    const result = checkEntityContamination({
+      conclusion: "Встреча с Иваном перенесена на четверг",
+      sources: ["Протокол встречи: повестка без участников"],
+      entities: [person("ent-people-ivan", "Иван")],
+    });
+    expect(result.clean).toBe(false);
+    expect(result.violations).toHaveLength(1);
+    expect(result.violations[0]!.entityId).toBe("ent-people-ivan");
+  });
+
+  test("an inflected mention in a source clears the cited entity", () => {
+    // H1 (PR 268 review), false alarm: the conclusion names "Иван" while
+    // the cited source says "Ивану" - the two-sided rule refused the
+    // source hit and flagged a properly cited conclusion. The
+    // leading-only rule restores the citation.
+    const result = checkEntityContamination({
+      conclusion: "Иван утвердил бюджет",
+      sources: ["Ивану показали проект бюджета на утреннем созвоне"],
+      entities: [person("ent-people-ivan", "Иван")],
+    });
+    expect(result.clean).toBe(true);
+    expect(result.violations).toHaveLength(0);
+  });
 });
 
 describe("deepSynthesis wiring", () => {

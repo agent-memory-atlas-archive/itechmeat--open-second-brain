@@ -350,7 +350,7 @@ async function toolBrainSecrets(
  * Advertised bound for `retry_tasks`: the widest list any install can
  * need, the built-ins plus the custom-task cap. The handler refuses
  * against the tasks THIS install registered, which can be fewer; naming
- * more tasks than the lane dispatches is a mistake, not a request.
+ * more tasks than the lane has is a mistake, not a request.
  *
  * The `maxItems` this feeds into the schema is ADVERTISEMENT, not
  * enforcement - nothing in the request path validates a JSON Schema.
@@ -361,6 +361,26 @@ async function toolBrainSecrets(
  * does validate refuses before spending a round trip.
  */
 const MAX_RETRY_TASKS = LANE_TASKS.length + CUSTOM_TASK_MAX;
+
+/**
+ * An optional boolean argument, read through one rule. `true` passes as
+ * itself, and so does the string `"true"` - clients commonly round-trip
+ * booleans as strings, and a literal `=== true` read turned that spelling
+ * into a preview that still reported `verdict: ok`, the caller never the
+ * wiser. `false` and `"false"` answer `false`; absence and `null` answer
+ * `undefined` (the caller's default applies). Every OTHER value - `"yes"`,
+ * `1`, a nested object - is an INVALID_PARAMS refusal naming the argument,
+ * the same shape `coerceBoolOptional` throws for a non-boolean: refused,
+ * never silently demoted to the argument's default.
+ */
+function coerceOptionalBool(args: Record<string, unknown>, key: string): boolean | undefined {
+  const raw = args[key];
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === "boolean") return raw;
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  throw new MCPError(INVALID_PARAMS, `argument '${key}' must be a boolean`);
+}
 
 /** The refusal of a lane run below local reach; it names nothing in the vault. */
 export const MAINTENANCE_RUN_LOCAL_ONLY = "brain_maintenance: run executes at local reach only";
@@ -483,7 +503,12 @@ async function toolBrainMaintenance(
     ...(ctx.configPath ? { configPath: ctx.configPath } : {}),
     searchConfig,
     now,
-    forceCost: args["force_cost"] === true,
+    // One boolean rule per call: force_cost rides the same coercion
+    // relink_apply does, so the string spelling applies and a junk value
+    // is refused by name instead of silently spending the caller's
+    // default.
+    forceCost: coerceOptionalBool(args, "force_cost") === true,
+    relinkApply: coerceOptionalBool(args, "relink_apply") === true,
     safeguardFor: laneSafeguard,
     ...(onProgress ? { onProgress } : {}),
   });
@@ -518,6 +543,10 @@ async function toolBrainMaintenance(
   });
   // The run-level spend block, the CLI JSON payload's shape.
   const spend = lane.reindex.spendBlock(result.tasks);
+  // The relink pass's report: the preview on the default arm, the changes
+  // under relink_apply - the same block the CLI JSON payload carries, so
+  // the two front doors cannot disagree about what the pass would add.
+  const relink = lane.relinkReport();
   return {
     verdict: result.verdict,
     tasks: result.tasks,
@@ -526,6 +555,7 @@ async function toolBrainMaintenance(
     // cannot disagree about what a skip says.
     ...(result.capacity !== undefined ? { capacity: result.capacity } : {}),
     ...(spend !== undefined ? { spend } : {}),
+    ...(relink !== undefined ? { relink } : {}),
     // Named, never dropped: a refused declaration journals nothing, and
     // the valid tasks still ran.
     ...(lane.custom.errors.length > 0 ? { custom_task_errors: lane.custom.errors } : {}),
@@ -610,7 +640,7 @@ export const ADMIN_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   {
     name: "brain_maintenance",
     description:
-      "Quiet-window, lease-guarded maintenance lane: run executes dream, reindex, bridges, clusters and declared custom:<name> tasks behind window, busy, pressure, capacity and streak gates; status renders lease and journal. Reindex embeds only with config maintenance_embeddings.",
+      "Quiet-window, lease-guarded maintenance lane: run executes dream, reindex, bridges, clusters, relink and declared custom:<name> tasks behind window, busy, pressure, capacity and streak gates; status renders lease and journal. Reindex embeds only with config maintenance_embeddings.",
     inputSchema: {
       type: "object",
       properties: {
@@ -634,6 +664,11 @@ export const ADMIN_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           type: "boolean",
           description:
             "Bypass a positive embedding cost gate for this run's reindex (run); recorded on the spend receipt when it overrode a gate that would have refused.",
+        },
+        relink_apply: {
+          type: "boolean",
+          description:
+            "Apply the relink pass (run): rewrite the changed signal pages' entity anchor lines. Default false previews the per-source additions and writes nothing.",
         },
         busy_minutes: {
           type: "integer",

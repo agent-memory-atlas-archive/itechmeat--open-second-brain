@@ -90,6 +90,14 @@ function renderResult(res: NoteLifecycleResult): Record<string, unknown> {
         last_indexed_at: res.references.index.lastIndexedAt,
         next_command: res.references.index.nextCommand,
       },
+      // `claimed` says a detached refresh run is IN FLIGHT, never that it
+      // has landed; every other value names why nothing was started, and
+      // `refresh_reason` spells that reason - the freshen machinery's own
+      // skip token, or the error it raised - so `not_claimed` is never
+      // the whole answer a caller receives. Read from THIS call's own
+      // decision, never from state another vault could have written.
+      refresh: res.references.refresh,
+      refresh_reason: res.references.refreshReason,
     },
     // `null` when no cascade was asked for, which is a different answer
     // from a cascade that found nothing. Rendered on every response so a
@@ -139,6 +147,9 @@ async function toolBrainNoteLifecycle(
       // A note the caller may not read at its reach is refused exactly
       // as a missing one.
       readable: readableAtContextReach(ctx),
+      // The post-write refresh resolves through the server's own config
+      // path, like every other search-resolving call in this file.
+      ...(ctx.configPath !== null ? { refreshConfigPath: ctx.configPath } : {}),
     });
     return renderResult(res);
   } catch (err) {
@@ -370,7 +381,7 @@ export const LIFECYCLE_FILE_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze
   {
     name: TOOL,
     description:
-      "Note-file lifecycle. action: rename renames in place; move changes the directory; archive displaces the note under Archive/; delete removes it, and delete_linked extends that to files whose frontmatter derives them from it alone. Dry-run unless apply; delete needs confirm. Rewrites [[links]].",
+      "Note-file lifecycle: rename, move, archive (displaces the note under Archive/), delete. Dry-run unless apply; delete needs confirm. Rewrites inbound [[wikilinks]] to the minimal spelling that still resolves; applied writes claim a detached index refresh (references.refresh: claimed, not landed).",
     inputSchema: {
       type: "object",
       properties: {

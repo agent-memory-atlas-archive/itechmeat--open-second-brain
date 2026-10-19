@@ -21,7 +21,7 @@ import { join } from "node:path";
 
 import { bootstrapBrain } from "../../src/core/brain/init.ts";
 import { atomicWriteFileSync } from "../../src/core/fs-atomic.ts";
-import { INDEX_EVIDENCE } from "../../src/core/brain/notes/lifecycle.ts";
+import { INDEX_EVIDENCE, INDEX_REFRESH } from "../../src/core/brain/notes/lifecycle.ts";
 import { LIFECYCLE_FILE_TOOLS } from "../../src/mcp/brain/lifecycle-file-tools.ts";
 import { MCPError } from "../../src/mcp/protocol.ts";
 import type { ServerContext } from "../../src/mcp/tool-contract.ts";
@@ -84,10 +84,22 @@ describe("dispatch", () => {
     const references = res["references"] as Record<string, unknown>;
     expect(references["files_rewritten"]).toBe(1);
     expect(references["inbound_files"]).toEqual(["Projects/Ref.md"]);
+    // The spellings the rewrite carried out, minimal forms included.
+    expect(references["rewritten_spellings"]).toEqual([
+      { from: "Projects/Old.md", to: "New" },
+      { from: "Projects/Old", to: "New" },
+      { from: "Old", to: "New" },
+    ]);
+    // Freshening is off suite-wide, so the write claimed nothing - and
+    // the refusal says why on the same response, so a caller reading
+    // `not_claimed` is not left to distinguish a deliberate off from a
+    // broken freshen path.
+    expect(references["refresh"]).toBe(INDEX_REFRESH.notClaimed);
+    expect(references["refresh_reason"]).toBe("no_index");
     const index = references["index"] as Record<string, unknown>;
     expect(index["state"]).toBe(INDEX_EVIDENCE.absent);
     expect(typeof index["next_command"]).toBe("string");
-    expect(readFileSync(join(vault, "Projects/Ref.md"), "utf8")).toContain("[[Projects/New]]");
+    expect(readFileSync(join(vault, "Projects/Ref.md"), "utf8")).toContain("[[New]]");
   });
 
   test("dry run is the default: nothing moves without an explicit apply", async () => {

@@ -37,7 +37,10 @@ import { brainDirsForWrite } from "./paths.ts";
 import type { DedupIndexEntry } from "./dedup-hash.ts";
 import { buildEntityIndex } from "./entities/index-builder.ts";
 import {
+  MIN_ANCHOR_FORM_LENGTH,
   entityMatchForms,
+  matchFormVariants,
+  matchVariantsOccurIn,
   normalizeEntityName,
   sanitizeEntityLabel,
   validateEntityLabel,
@@ -238,6 +241,25 @@ export interface RouteFactsInput {
    * drops it at read; `0` (the default) stamps nothing, byte-identical.
    */
   readonly ambientTtlDays?: number;
+  /**
+   * Link-derived entity ids the CALLER resolved from this capture's
+   * source page, in the page's first-occurrence (body) order
+   * (note-change truth maintenance, F4). The kernel unions them into
+   * every signal this capture writes: link-derived ids first - the
+   * first body-order link leads the persisted `entities:` line, so it
+   * is the primary anchor when both mechanisms match the same fact -
+   * followed by the text-derived ids that are not already present.
+   *
+   * The resolution and its withholding are the CALLER's job, done
+   * server-side before this call: a page-sourced caller maps the page's
+   * outbound wikilinks through the page-link resolver, which drops
+   * withheld entity pages before any id is produced. This kernel takes
+   * the ids as given - it reads no pages, resolves no links and never
+   * widens the list on its own. A session-sourced capture passes
+   * nothing (or an empty list), which is byte-identical to before this
+   * parameter existed; a dry run forecasts unchanged either way.
+   */
+  readonly linkDerivedEntityIds?: ReadonlyArray<string>;
 }
 
 export interface RouteFactsResult {
@@ -269,10 +291,13 @@ export interface RouteFactsResult {
 /** Max length of the redacted fact text carried onto a `durability-skip` log. */
 const DURABILITY_LOG_TEXT_MAX_LEN = 200;
 
-/** Minimum normalised form length that participates in substring matching. */
-const MIN_ANCHOR_FORM_LENGTH = 3;
-
-/** A registry entity reduced to its clean, matchable label forms. */
+/**
+ * A registry entity reduced to its clean, matchable label forms, each
+ * expanded once into its separator-variant match forms (note-change truth
+ * maintenance, F3) and the expansion Set-deduped. Precomputed HERE - once
+ * per capture, not once per fact - so the per-fact kernel never re-derives
+ * a variant.
+ */
 export interface AnchorableEntity {
   readonly id: string;
   readonly forms: ReadonlyArray<string>;
@@ -316,9 +341,18 @@ export function buildAnchorables(
       // Fall through: entityMatchForms drops the junk name form itself, so a
       // valid alias still yields an anchorable form.
     }
-    const forms = entityMatchForms([entity.name, ...entity.aliases], { lexicon }).filter(
-      (f) => f.length >= MIN_ANCHOR_FORM_LENGTH,
-    );
+    // Match-variant expansion (F3) happens ONCE here, per capture: the
+    // gate-filtered normalized forms fold to their canonical-join match
+    // variants (at most the full form plus a folder-prefixed tail).
+    // MIN_ANCHOR_FORM_LENGTH still gates the ORIGINAL forms - an
+    // expansion never rescues a short one.
+    const forms = [
+      ...new Set(
+        entityMatchForms([entity.name, ...entity.aliases], { lexicon })
+          .filter((f) => f.length >= MIN_ANCHOR_FORM_LENGTH)
+          .flatMap((f) => matchFormVariants(f)),
+      ),
+    ];
     if (forms.length === 0) continue;
     out.push({ id: entity.id, forms });
   }
@@ -327,18 +361,47 @@ export function buildAnchorables(
 
 /**
  * Resolve canonical-entity anchors for a fact: every anchorable registry
- * entity whose normalised label form appears in the fact text. The
- * canonicalization kernel is the comparison boundary, so facts and the
- * registry compare like with like.
+ * entity whose match forms occur in the fact text. The canonicalization
+ * kernel is the comparison boundary, so facts and the registry compare
+ * like with like - and since F3 (note-change truth maintenance) both
+ * sides fold: the haystack folds through {@link matchFormVariants} once
+ * per fact, each entity's precomputed variants are compared through the
+ * shared leading-edge rule ({@link matchVariantsOccurIn}), so a spaced
+ * text anchors a hyphenated or folder-prefixed form while the fold never
+ * plants a mid-word hit nothing anchored before.
  */
 function entityAnchors(anchorables: ReadonlyArray<AnchorableEntity>, factText: string): string[] {
   if (anchorables.length === 0) return [];
-  const haystack = normalizeEntityName(factText);
+  const haystackVariants = matchFormVariants(normalizeEntityName(factText));
   const ids: string[] = [];
   for (const entity of anchorables) {
-    if (entity.forms.some((f) => haystack.includes(f))) ids.push(entity.id);
+    if (matchVariantsOccurIn(entity.forms, haystackVariants)) ids.push(entity.id);
   }
   return ids;
+}
+
+/**
+ * The persisted anchor union for one capture: the caller's link-derived
+ * ids first, in the body order they arrived (the first body-order link
+ * is the primary when both mechanisms match the same fact), then the
+ * text-derived anchors the kernel found, deduped across the two
+ * mechanisms. Absent or empty link ids answer the text anchors verbatim,
+ * so a session-sourced capture is byte-identical to before the parameter
+ * existed.
+ */
+function unionAnchors(
+  linkDerived: ReadonlyArray<string> | undefined,
+  textAnchors: ReadonlyArray<string>,
+): ReadonlyArray<string> {
+  if (linkDerived === undefined || linkDerived.length === 0) return textAnchors;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const id of [...linkDerived, ...textAnchors]) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
 }
 
 /**
@@ -489,7 +552,7 @@ export function routeExtractedFacts(vault: string, input: RouteFactsInput): Rout
       withheld++;
       continue;
     }
-    const anchors = entityAnchors(anchorables, fact.text);
+    const anchors = unionAnchors(input.linkDerivedEntityIds, entityAnchors(anchorables, fact.text));
     const topic = `fact-${fact.family}`;
     try {
       const result = writeSignal(

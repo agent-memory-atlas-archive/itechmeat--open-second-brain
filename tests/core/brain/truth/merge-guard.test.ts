@@ -114,6 +114,106 @@ describe("guardEntityMerge (pure)", () => {
     expect(verdict.allowed).toBe(true);
   });
 
+  // Separator-tolerant twins (note-change truth maintenance, F3): the
+  // guard shares the anchoring kernels' match-form rule, so its inclusion
+  // test folds separator runs on both sides, matches a slug-prefixed form
+  // at the path-segment boundary, and never anchors a mid-word mention.
+
+  test("separator-folded mentions anchor across hyphen and underscore spellings", () => {
+    const ada = person("ent-people-ada-lovelace", "Ada-Lovelace", ["ada_lovelace"]);
+    const verdict = guardEntityMerge({
+      keepText: "Ada Lovelace decided to ship on Friday",
+      dropText: "Bob Hale decided to ship on Friday",
+      entities: [ada, bob],
+    });
+    expect(verdict.allowed).toBe(false);
+    expect(verdict.keepAnchors).toEqual(["ent-people-ada-lovelace"]);
+    expect(verdict.dropAnchors).toEqual(["ent-people-bob-hale"]);
+  });
+
+  test("a slug-prefixed alias matches through its last path segment", () => {
+    // The "***" name matches nothing, so only the slug-prefixed alias -
+    // via its "ada lovelace" tail - can anchor the first entity.
+    const weird = person("ent-people-ada-lovelace", "***", ["people/ada_lovelace"]);
+    const verdict = guardEntityMerge({
+      keepText: "Ada Lovelace decided to ship on Friday",
+      dropText: "Bob Hale decided to ship on Friday",
+      entities: [weird, bob],
+    });
+    expect(verdict.allowed).toBe(false);
+    expect(verdict.keepAnchors).toEqual(["ent-people-ada-lovelace"]);
+  });
+
+  test("a mid-word mention never anchors (canada never anchors ada)", () => {
+    const ada = person("ent-people-ada", "Ada");
+    const verdict = guardEntityMerge({
+      keepText: "Canada approved the rollout",
+      dropText: "Bob Hale approved the rollout",
+      entities: [ada, bob],
+    });
+    expect(verdict.keepAnchors).toEqual([]);
+    expect(verdict.allowed).toBe(true);
+  });
+
+  test("CJK names fire the protected-name path (no-space scripts anchor)", () => {
+    // Kana particles touch the names directly - a script written without
+    // word spaces suspends the boundary rule, so both sides anchor and a
+    // disjoint CJK pair blocks the merge exactly like a Latin one.
+    const tanaka = person("ent-people-tanaka-taro", "田中太郎");
+    const suzuki = person("ent-people-suzuki-hanako", "鈴木花子");
+    const verdict = guardEntityMerge({
+      keepText: "田中太郎は出張を決めた",
+      dropText: "鈴木花子は出張を決めた",
+      entities: [tanaka, suzuki],
+    });
+    expect(verdict.keepAnchors).toEqual(["ent-people-tanaka-taro"]);
+    expect(verdict.dropAnchors).toEqual(["ent-people-suzuki-hanako"]);
+    expect(verdict.allowed).toBe(false);
+  });
+
+  test("inflected Russian names fire the protected-name path (leading-only boundary)", () => {
+    // H1 (PR 268 review): Russian attaches case endings to names with no
+    // space - "Ивана", "Петра" - and the two-sided boundary rule silenced
+    // both sides, letting claims about different people collapse. The
+    // leading-only rule keeps the veto: each side anchors its own person
+    // through the inflected spelling and the sets are disjoint.
+    const ivan = person("ent-people-ivan", "Иван");
+    const petr = person("ent-people-petr", "Петр");
+    const verdict = guardEntityMerge({
+      keepText: "Ивана повысили до директора",
+      dropText: "Петра повысили до директора",
+      entities: [ivan, petr],
+    });
+    expect(verdict.keepAnchors).toEqual(["ent-people-ivan"]);
+    expect(verdict.dropAnchors).toEqual(["ent-people-petr"]);
+    expect(verdict.allowed).toBe(false);
+  });
+
+  test("a slash-bearing company name no longer anchors through its bare tail", () => {
+    // M1 (PR 268 review): the slug tail fired on ANY slash-containing
+    // name, so keep "Bob Chappell left the firm" also anchored the
+    // Warner/Chappell organization through the tail "chappell", the
+    // anchor sets overlapped, and the merge was allowed. The tail is
+    // minted only from a registry entity-type folder prefix, so the
+    // person and the organization stay disjoint and the veto holds.
+    const bob = person("ent-people-bob-chappell", "Bob Chappell");
+    const warner: GuardEntityLike = {
+      id: "ent-company-warner-chappell",
+      category: "company",
+      name: "Warner/Chappell",
+      aliases: [],
+      status: "active",
+    };
+    const verdict = guardEntityMerge({
+      keepText: "Bob Chappell left the firm",
+      dropText: "Warner/Chappell left the firm",
+      entities: [bob, warner],
+    });
+    expect(verdict.keepAnchors).toEqual(["ent-people-bob-chappell"]);
+    expect(verdict.dropAnchors).toEqual(["ent-company-warner-chappell"]);
+    expect(verdict.allowed).toBe(false);
+  });
+
   test("default guarded categories cover people and orgs", () => {
     expect(GUARDED_ENTITY_CATEGORIES).toContain("people");
     expect(GUARDED_ENTITY_CATEGORIES).toContain("org");
