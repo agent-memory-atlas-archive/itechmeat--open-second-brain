@@ -23,6 +23,7 @@ import {
   BRAIN_RETIRED_REASON,
   type BrainConfidence,
   type BrainConfig,
+  type BrainPreference,
 } from "./types.ts";
 
 export interface RefreshUpdate {
@@ -51,6 +52,30 @@ export interface RefreshUpdate {
    * legacy vaults keep their no-op dream guarantees.
    */
   readonly freshness_trend?: string;
+  /**
+   * Derived-fact fields (finding 77), carried for the same reason the
+   * pre-flight carries them: the renderer emits a non-default
+   * `provenance` and a non-empty `related` only when the write input
+   * supplies them, so an update loop that omitted them would strip both
+   * from a promoted rule on its first counter change - and, because the
+   * no-op pre-flight renders from the input too, leave the file looking
+   * "needs rewrite" on every pass after that. Absent stays absent: a
+   * pref without these fields is written exactly as before.
+   */
+  readonly provenance?: BrainPreference["provenance"];
+  readonly related?: ReadonlyArray<string>;
+  /**
+   * The record's `visibility:` tokens, carried for the same reason the
+   * derived-fact fields are (finding 77; review round 2): the renderer
+   * emits a `visibility:` line only when the write input supplies it,
+   * and `wouldRewritePreference` builds its output from the input alone
+   * - it does not run the tiered merge that keeps the file's existing
+   * line - so an update that omitted the tokens would leave every pref
+   * carrying `visibility:` on disk looking "needs rewrite" on every
+   * pass, each rewrite a real `_revision` bump. Absent stays absent: a
+   * pref without the field is written exactly as before.
+   */
+  readonly visibility?: ReadonlyArray<string>;
 }
 
 /**
@@ -373,6 +398,29 @@ export function planRefresh(
       confidence_value: confidence.value,
       pinned: rec.pref.pinned,
       ...(trendLabel !== undefined ? { freshness_trend: trendLabel } : {}),
+      // Carrying the derived-fact fields through the no-op pre-flight.
+      // The renderer emits a non-default `provenance` and a non-empty
+      // `related`, so a render that omitted them could never match a
+      // preference that carries them (`deriveFact` output, the dream
+      // pass's own cross-topic promotions): every pass would see the
+      // file as "needs rewrite", and the txn's `_revision` auto-stamp
+      // would then make each rewrite real, flipping every rerun into a
+      // changed run forever. Absent stays absent, so prefs without
+      // these fields render exactly the bytes they always did.
+      ...(rec.pref.provenance !== undefined && rec.pref.provenance !== "stated"
+        ? { provenance: rec.pref.provenance }
+        : {}),
+      ...(rec.pref.related !== undefined && rec.pref.related.length > 0
+        ? { related: rec.pref.related }
+        : {}),
+      // The record's `visibility:` tokens ride along like provenance and
+      // related above: the scan reads them off the raw frontmatter (the
+      // typed parser drops the field), and only a render that includes
+      // them can match a file that carries the line. Empty is default
+      // visibility and stays absent, exactly like the writer's own rule.
+      ...(rec.visibility !== undefined && rec.visibility.length > 0
+        ? { visibility: rec.visibility }
+        : {}),
     };
 
     if (!countersChanged) {

@@ -1059,11 +1059,16 @@ export const VERB_HELP: Record<string, string> = {
     "threshold (default 200000; override via --warn-threshold or the\n" +
     "BRAIN_TOKEN_WARN_THRESHOLD env var).\n",
   "context-pack":
-    "usage: o2b brain context-pack --max-tokens <n> [--query <q>] [--lanes] [--cache-stable] [--dedup-repeated]\n" +
+    "usage: o2b brain context-pack [--max-tokens <n>] [--model <name>] [--query <q>] [--lanes] [--cache-stable] [--dedup-repeated]\n" +
     "                              [--receipt] [--receipt-host <name>] [--telemetry] [--telemetry-host <name>]\n" +
     "                              [--session-id <id>] [--turn-id <id>] [--vault <path>] [--json]\n" +
     "Return the highest-tier, most recent vault slice that fits under\n" +
-    "<n> tokens. Items ordered core → supporting → peripheral, then\n" +
+    "<n> tokens. --max-tokens is optional: when omitted, the budget derives\n" +
+    "from the model context window (the vault's context: block, the\n" +
+    "environment override, or --model; the matching preset's budget), and\n" +
+    "--json names the deciding channel in max_tokens_source. With nothing\n" +
+    "resolvable the verb refuses - it never picks a budget silently. Items\n" +
+    "ordered core → supporting → peripheral, then\n" +
     "newest first. Stops adding pages when the next page would exceed\n" +
     "the budget. --query <q> filters by NFKC+casefold substring match\n" +
     "on topic + principle. --lanes also returns directives, constraints,\n" +
@@ -1084,7 +1089,10 @@ export const VERB_HELP: Record<string, string> = {
     "usage: o2b brain context-presets show [preset-id] [--json]\n" +
     "       o2b brain context-presets suggest [--model <name>] [--context-window <tokens>] [--json]\n" +
     "       o2b brain context-presets diff <preset-id> [current-value flags] [--override <path>...] [--json]\n" +
-    "Dry-run model-aware context budget preset diagnostics. Never writes config.\n",
+    "Dry-run model-aware context budget preset diagnostics. Never writes config.\n" +
+    "With --model alone (no --context-window), the window resolves from the model id\n" +
+    "first (declared table, then a trailing 1m suffix); a preset hint answers only\n" +
+    "when nothing places the id, and the reason names what decided.\n",
   "pre-compact-extract":
     "usage: o2b brain pre-compact-extract --vault <path> --session-id <id> --turn-start <id> --turn-end <id> --text <text> [--host <name>] [--max-chars <n>] [--dry-run] [--json]\n" +
     "Extract Decision/Commitment/Outcome/Rule/Open question lines into idempotent continuity records.\n" +

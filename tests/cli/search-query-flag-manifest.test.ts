@@ -25,6 +25,7 @@ import { join } from "node:path";
 
 import { nestedCommand } from "../../src/cli/command-manifest.ts";
 import { VAULT_FLAGS } from "../../src/cli/search/helpers.ts";
+import { SEARCH_QUERY_FLAGS } from "../../src/cli/search/verbs/query.ts";
 import { parsedFlagSchema } from "../helpers/parsed-flag-schema.ts";
 
 const VERBS_DIR = join(import.meta.dir, "..", "..", "src", "cli", "search", "verbs");
@@ -106,8 +107,20 @@ const COVERED: ReadonlyArray<CoveredVerb> = Object.freeze([
  */
 const INHERITED_FLAG_NAME = "json";
 
-/** The `parseFlags(argv, { ... })` schema the verb declares, as `name -> type`. */
+/**
+ * The `parseFlags(argv, { ... })` schema the verb declares, as `name -> type`.
+ *
+ * The query verb's schema is no longer an inline literal: it is the
+ * descriptor-derived {@link SEARCH_QUERY_FLAGS} export (t_50c81d5c E3),
+ * read directly - same object the verb passes to its parser, so the
+ * ratchet's direction is unchanged (what the verb parses must be
+ * modelled) and the static source read stays only for the verbs whose
+ * schemas are still literals.
+ */
 function verbFlagSchema(entry: CoveredVerb): ReadonlyMap<string, string> {
+  if (entry.source === "query.ts") {
+    return new Map(Object.entries(SEARCH_QUERY_FLAGS).map(([name, spec]) => [name, spec.type]));
+  }
   return parsedFlagSchema({
     file: join(VERBS_DIR, entry.source),
     marker: entry.marker,
@@ -210,5 +223,43 @@ describe("the search verbs declare the flags they parse", () => {
       "query --limit is modelled as string but parsed as boolean",
       "query --undeclared-flag is parsed but not modelled",
     ]);
+  });
+});
+
+describe("the schema verb declares the flags its two subcommands parse", () => {
+  // `o2b search schema` sits outside the COVERED table above for one
+  // pinned reason: that table's non-vacuity floor asserts every covered
+  // verb parses `--vault`, and this verb addresses the repo's committed
+  // artifact, not a vault. The same standard still applies, so it is held
+  // here: both subcommand parse schemas are read from the verb and the
+  // manifest row must account for every flag, never the reverse.
+  const MARKER = "export async function cmdSearchSchema";
+  const SOURCE = join(VERBS_DIR, "schema-export.ts");
+
+  function schemaFor(callOpen: string): ReadonlyMap<string, string> {
+    return parsedFlagSchema({ file: SOURCE, marker: MARKER, callOpen });
+  }
+
+  test("every parsed flag is modelled, with the same type", () => {
+    const exportSchema = schemaFor("parseFlags(argv.slice(1), {");
+    const checkSchema = schemaFor("parseFlags(argv.slice(1), { json:");
+    // Pin both reads so a regex that stopped matching cannot pass: export
+    // parses stdout + json, check parses json only.
+    expect(Object.fromEntries(exportSchema)).toEqual({ stdout: "boolean", json: "boolean" });
+    expect(Object.fromEntries(checkSchema)).toEqual({ json: "boolean" });
+    const manifest = comparable(manifestFlagSchema("schema"));
+    expect(mismatches(comparable(exportSchema), manifest, "schema").toSorted()).toEqual([]);
+    expect(mismatches(comparable(checkSchema), manifest, "schema").toSorted()).toEqual([]);
+  });
+
+  test("no modelled flag outlives the parse that would accept it", () => {
+    const parsed = schemaFor("parseFlags(argv.slice(1), {");
+    for (const name of comparable(manifestFlagSchema("schema")).keys()) {
+      expect(`${name} parsed: ${parsed.has(name)}`).toBe(`${name} parsed: true`);
+    }
+  });
+
+  test("the witness flag is reachable from help", () => {
+    expect(manifestFlagSchema("schema").has("stdout")).toBe(true);
   });
 });

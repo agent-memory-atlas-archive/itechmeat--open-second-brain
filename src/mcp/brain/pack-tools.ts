@@ -12,6 +12,7 @@ import { isAbsolute, relative } from "node:path";
 
 import {
   resolveDensityRankingContextPack,
+  resolveModelContextWindowEnvTokens,
   resolveRecallAdequacyThresholds,
   resolveRecallGateTelemetry,
   resolveSearchFocusContextPack,
@@ -67,9 +68,17 @@ import {
   diffContextPreset,
   getContextPreset,
   listContextPresets,
+  presetForResolvedWindow,
   suggestContextPreset,
+  unrecognisedModelBudgetRefusal,
   type ContextPresetCurrentConfig,
 } from "../../core/brain/context-presets.ts";
+import {
+  resolveModelContextWindowTokens,
+  MODEL_CONTEXT_WINDOW_ENV_KEY,
+  type ModelWindowSource,
+  type ResolvedModelWindow,
+} from "../../core/brain/model-window.ts";
 import { extractPreCompactRecords } from "../../core/brain/pre-compact-extract.ts";
 import { EventTraceSelectorError, resolveLogEventTraces } from "../../core/brain/event-trace.ts";
 import { gatedOwnerScopeView, ownerScopeView } from "../../core/brain/owner-scope-view.ts";
@@ -147,6 +156,69 @@ async function withSearchErrorsOnWire<T>(
 }
 
 /**
+ * The vault's declared `context.window_tokens`; `undefined` when the block
+ * is absent or the file cannot be read. Fail-soft on purpose: a broken
+ * `_brain.yaml` raises later, where the pack builds, exactly as it always
+ * has - the derivation channel must not answer for the operator's config
+ * before the real reader does.
+ */
+function contextWindowConfigValue(vault: string): number | undefined {
+  try {
+    return loadBrainConfig(vault).context?.window_tokens;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolve the model context window for one tool call (t_a567cc12) from
+ * the three channels this server owns - the vault's `context:` block, the
+ * environment override, and the caller's model hint - in the resolver's
+ * precedence (config > env > declared table > `1m` suffix > default).
+ *
+ * `null` means NOTHING is resolvable: no model hint, no operator block,
+ * no env value. Callers refuse on it - the pinned decision is never a
+ * silent default budget. A malformed env value raises (an operator typo
+ * must not shrink every budget to the default unnoticed); wrap the call
+ * where the tool wants that on the wire as INVALID_PARAMS.
+ *
+ * Only invoked on the derivation path: a call that carries its explicit
+ * budget never reads the vault or the environment, so the explicit path
+ * behaves byte-identically to before the resolver existed.
+ */
+function resolveSurfaceModelWindow(
+  vault: string,
+  model: string | undefined,
+): ResolvedModelWindow | null {
+  const operatorWindow = contextWindowConfigValue(vault);
+  const envWindow = resolveModelContextWindowEnvTokens();
+  if (model === undefined && operatorWindow === undefined && envWindow === undefined) return null;
+  return resolveModelContextWindowTokens({
+    ...(model !== undefined ? { model } : {}),
+    ...(operatorWindow !== undefined ? { operatorWindowTokens: operatorWindow } : {}),
+    ...(envWindow !== undefined ? { envWindowTokens: envWindow } : {}),
+  });
+}
+
+/**
+ * The caller's optional `model` id. A whitespace-only or empty value is
+ * ABSENT - a blank name is no name - so the derivation answers
+ * nothing-resolvable and refuses with the budget message, exactly as a
+ * call without `model` does, instead of a model-argument complaint and
+ * never a derived default budget. A non-string value stays a caller
+ * error.
+ */
+function optionalModelArg(tool: string, args: Record<string, unknown>): string | undefined {
+  const raw = args["model"];
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "string") {
+    throw new MCPError(INVALID_PARAMS, `${tool}: model must be a non-empty string`);
+  }
+  const trimmed = raw.trim();
+  return trimmed === "" ? undefined : trimmed;
+}
+
+/**
  * A pack refusal raised after the query embed still names that spend. The
  * loader's pre-embed check reads every belief in view, while the pack keeps
  * fewer (no tombstones, chain tips only, and a dimension the query vector
@@ -184,9 +256,68 @@ async function toolBrainContextPack(
   ctx: ServerContext,
   args: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  const maxTokens = coercePositiveInteger("brain_context_pack", "max_tokens", args["max_tokens"]);
-  if (maxTokens === undefined) {
-    throw new MCPError(INVALID_PARAMS, "brain_context_pack: max_tokens must be a positive integer");
+  const model = optionalModelArg("brain_context_pack", args);
+  const maxTokensArg = coercePositiveInteger(
+    "brain_context_pack",
+    "max_tokens",
+    args["max_tokens"],
+  );
+  // The adequacy pairing is an input-SHAPE contract, declared in the
+  // schema's `dependentRequired`, so it refuses an incomplete pair by
+  // name before any semantic refusal can preempt it: `max_tokens` is now
+  // optional behind the derivation below (t_a567cc12), and a payload
+  // carrying one half of the pair must learn about the pairing, not about
+  // a budget it never sent.
+  const recallAttempt = coerceRecallAdequacyInput(
+    "brain_context_pack",
+    args,
+    RECALL_SCORES_ARG_NAME,
+  );
+  const answerableArg = coerceDecisionAnswerable(
+    "brain_context_pack",
+    args,
+    RECALL_SCORES_ARG_NAME,
+    recallAttempt !== undefined,
+  );
+  // Derived budget (t_a567cc12): an explicit `max_tokens` is first-class
+  // and untouched. When it is omitted, the budget derives from the model
+  // context window the resolver resolves, through the matching preset's
+  // `context_pack.max_tokens` - the curated mapping. A `default`-sourced
+  // window defers to the model's hint preset, the same mapping
+  // `brain_context_presets` suggest answers, so one model gets one budget
+  // and one suggestion on every surface - and an id NOTHING places (no
+  // table row, no suffix, no hint) refuses: the conservative posture this
+  // tool held before derivation existed, never the default window's
+  // long-context budget an 8k local model cannot hold. With nothing
+  // resolvable the call refuses exactly as before: the pinned decision is
+  // never a silent default budget.
+  let maxTokens: number;
+  let maxTokensSource: ModelWindowSource | undefined;
+  if (maxTokensArg !== undefined) {
+    maxTokens = maxTokensArg;
+  } else {
+    let resolved: ResolvedModelWindow | null;
+    try {
+      resolved = resolveSurfaceModelWindow(ctx.vault, model ?? undefined);
+    } catch (e) {
+      throw new MCPError(INVALID_PARAMS, `brain_context_pack: ${(e as Error).message}`);
+    }
+    if (resolved === null) {
+      throw new MCPError(
+        INVALID_PARAMS,
+        "brain_context_pack: max_tokens must be a positive integer",
+      );
+    }
+    const refusal = unrecognisedModelBudgetRefusal(model, resolved);
+    if (refusal !== null) {
+      throw new MCPError(INVALID_PARAMS, `brain_context_pack: ${refusal}`);
+    }
+    // The hint fallback rides along exactly when the resolver's answer is
+    // the default-sourced assumption, so a hint-only model budgets the
+    // preset `brain_context_presets` suggest names for it; the source
+    // disclosed on the wire stays the window's.
+    maxTokens = presetForResolvedWindow(model, resolved).context_pack.max_tokens;
+    maxTokensSource = resolved.source;
   }
   const query = typeof args["query"] === "string" ? (args["query"] as string) : undefined;
   // Ranked query mode (v1.53.0). Enforced beside the `dependentRequired`
@@ -256,20 +387,9 @@ async function toolBrainContextPack(
   );
   const receipt = receiptOptionsFromArgs("brain_context_pack", args, "context_pack", "mcp");
   const telemetry = telemetryOptionsFromArgs("brain_context_pack", args, "mcp");
-  // Adequacy verdict (t_b8f66fec): when the caller passes the recall
-  // scores that produced this material, classify grounding fitness and
-  // name the action; also persist it in the receipt for the audit trail.
-  const recallAttempt = coerceRecallAdequacyInput(
-    "brain_context_pack",
-    args,
-    RECALL_SCORES_ARG_NAME,
-  );
-  const answerableArg = coerceDecisionAnswerable(
-    "brain_context_pack",
-    args,
-    RECALL_SCORES_ARG_NAME,
-    recallAttempt !== undefined,
-  );
+  // The pairing coercions themselves ran above the budget derivation, so
+  // an incomplete pair is refused by name; only the ASSESSMENT waits for
+  // this point, beside the receipt and telemetry options it rides with.
   const adequacy =
     recallAttempt !== undefined
       ? assessRecallAdequacy(
@@ -429,6 +549,10 @@ async function toolBrainContextPack(
   return {
     vault_path: vaultPathField(ctx),
     max_tokens: report.maxTokens,
+    // Present only when the budget was derived (t_a567cc12): the channel
+    // that decided, so a caller can see a resolution was assumed rather
+    // than paid for. An explicit `max_tokens` answers without it.
+    ...(maxTokensSource !== undefined ? { max_tokens_source: maxTokensSource } : {}),
     tokens_used: report.tokensUsed,
     items: report.items.map((i) => ({
       id: i.id,
@@ -938,6 +1062,7 @@ async function toolBrainPreCompressPack(
   ctx: ServerContext,
   args: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
+  const model = optionalModelArg("brain_pre_compress_pack", args);
   const topK = coercePositiveInteger("brain_pre_compress_pack", "top_k", args["top_k"]) ?? 10;
   const maxCharsPerMemory = coercePositiveInteger(
     "brain_pre_compress_pack",
@@ -949,6 +1074,40 @@ async function toolBrainPreCompressPack(
     "max_total_chars",
     args["max_total_chars"],
   );
+  // Derived caps (t_a567cc12): an absent cap used to mean unbounded - the
+  // one injection surface with no ceiling at all. When a cap is absent
+  // and a window resolves, the matching preset's `pre_compress` block
+  // fills it; explicit caps stay first-class; with nothing resolvable the
+  // historical unbounded addendum stands, byte-identical. `top_k` keeps
+  // its own 10 default - the presets' top-k values are suggestion
+  // diagnostics, not this tool's default.
+  let resolvedCaps: ResolvedModelWindow | null = null;
+  // A malformed OPEN_SECOND_BRAIN_MODEL_CONTEXT_WINDOW used to rethrow
+  // here as INVALID_PARAMS - blaming the caller's parameters and losing
+  // the addendum over an operator typo the caller cannot see and this
+  // result never disclosed. On THIS path an unparseable env value means
+  // nothing resolvable: the historical unbounded caps stand and a named
+  // warning says which channel misread, never echoing the value itself.
+  let windowWarning: string | undefined;
+  if (maxCharsPerMemory === undefined || maxTotalChars === undefined) {
+    try {
+      resolvedCaps = resolveSurfaceModelWindow(ctx.vault, model ?? undefined);
+    } catch {
+      resolvedCaps = null;
+      windowWarning =
+        `${MODEL_CONTEXT_WINDOW_ENV_KEY} is not a well-formed positive integer; ` +
+        "pre-compress caps stay unbounded and nothing was derived from it";
+    }
+  }
+  // The hint fallback rides along here exactly as it does in the
+  // context-pack budget above: when the resolver's answer is the
+  // default-sourced assumption, a hint-only model's caps come from its
+  // hint preset, the same mapping the pack and `brain_context_presets`
+  // suggest name - one model, one mapping on every surface.
+  const derivedCaps =
+    resolvedCaps !== null ? presetForResolvedWindow(model, resolvedCaps).pre_compress : null;
+  const effMaxCharsPerMemory = maxCharsPerMemory ?? derivedCaps?.max_chars_per_memory;
+  const effMaxTotalChars = maxTotalChars ?? derivedCaps?.max_total_chars;
   const receipt = receiptOptionsFromArgs("brain_pre_compress_pack", args, "pre_compress", "mcp");
   const telemetry = telemetryOptionsFromArgs("brain_pre_compress_pack", args, "mcp");
   const agentScope = coerceAgentScope(ctx, args, true);
@@ -961,8 +1120,8 @@ async function toolBrainPreCompressPack(
     ...(readable !== undefined ? { readable } : {}),
     restricted: contextReach(ctx) !== TRANSPORT_REACH.local,
     ...(agentScope !== undefined ? { agentScope } : {}),
-    ...(maxCharsPerMemory !== undefined ? { maxCharsPerMemory } : {}),
-    ...(maxTotalChars !== undefined ? { maxTotalChars } : {}),
+    ...(effMaxCharsPerMemory !== undefined ? { maxCharsPerMemory: effMaxCharsPerMemory } : {}),
+    ...(effMaxTotalChars !== undefined ? { maxTotalChars: effMaxTotalChars } : {}),
     ...(configuredDegradation(ctx.vault) !== undefined
       ? { degradation: configuredDegradation(ctx.vault)! }
       : {}),
@@ -979,6 +1138,10 @@ async function toolBrainPreCompressPack(
     // builder has, so a warning dropped here is a broken `_brain.yaml`
     // nothing tells the caller about.
     ...(pack.warnings ? { warnings: pack.warnings } : {}),
+    // The window channel's own warning: present only when the derivation
+    // was skipped over an unparseable operator env value (M4), so a
+    // normal answer stays byte-identical.
+    ...(windowWarning !== undefined ? { window_warning: windowWarning } : {}),
     ...(pack.receiptId ? { receipt_id: pack.receiptId } : {}),
     ...(pack.telemetryId ? { telemetry_id: pack.telemetryId } : {}),
     items: pack.items.map((i) => ({
@@ -1114,14 +1277,20 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
     name: "brain_context_pack",
     previewBudget: MCP_PREVIEW_BUDGET,
     description:
-      "Return the highest-tier, most recent vault slice that fits under `max_tokens`. Ordered core → supporting → peripheral, newest first; stops adding pages when the next page would exceed the budget. Read-only.",
+      "Return the highest-tier, most recent vault slice under `max_tokens` - derived from the model context window when omitted, refused when nothing resolves. Ordered core → supporting → peripheral, newest first; stops when the next page would exceed the budget. Read-only.",
     inputSchema: {
       type: "object",
       properties: {
         max_tokens: {
           type: "integer",
           minimum: 1,
-          description: "Strict upper bound on the returned slice's token count.",
+          description:
+            "Token cap for the slice. Omitted: derives from the resolved window (channel in `max_tokens_source`; `default` defers to the preset hint). Nothing resolvable is refused.",
+        },
+        model: {
+          type: "string",
+          description:
+            "Model id. `max_tokens` omitted: the context window resolves (config, env, table, `1m` suffix); an unplaced id is refused (pass max_tokens or set context.window_tokens).",
         },
         query: {
           type: "string",
@@ -1211,10 +1380,14 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
         },
         agent_scope: AGENT_SCOPE_SCHEMA,
       },
-      required: ["max_tokens"],
-      // Both or neither, stated declaratively so a schema-driven client can
-      // discover the pairing instead of learning it from an INVALID_PARAMS
-      // at call time. Built beside the enforcement; see
+      // `max_tokens` used to be the one required argument; the resolver
+      // (t_a567cc12) made it optional behind a derivation contract
+      // instead, so `required` is gone - the nothing-resolvable refusal
+      // is enforced beside the handler, not expressible as `required`.
+      //
+      // Pairings, stated declaratively so a schema-driven client can
+      // discover them instead of learning them from an INVALID_PARAMS at
+      // call time. Built beside the enforcement; see
       // `recallAdequacyPairing`. `query_mode` joins it one-directionally:
       // a mode needs a query, a query needs no mode. `packing_policy`
       // joins the same way: a policy with nothing to order is inert, so
@@ -1348,12 +1521,14 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
         },
         model: {
           type: "string",
-          description: "Optional model name hint for suggest.",
+          description:
+            "Optional model for suggest. With `context_window_tokens` absent the window resolves first (table, `1m` suffix); a hint answers only when nothing places the id.",
         },
         context_window_tokens: {
           type: "integer",
           minimum: 1,
-          description: "Optional context-window size hint for suggest.",
+          description:
+            "Optional context-window size hint for suggest. Wins over model-derived resolution.",
         },
         current: {
           type: "object",
@@ -1368,10 +1543,11 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
   },
   {
     // No preview budget: the addendum is meant to be injected whole and
-    // is already bounded by its own per-entry / total character caps.
+    // is bounded by its own per-entry / total character caps - now also
+    // derived from the resolved context window when absent (t_a567cc12).
     name: "brain_pre_compress_pack",
     description:
-      "Return a compact system-prompt addendum (top-K confirmed preferences plus the head of active.md) for a host to inject right before context compression. Char-budgeted. Read-only.",
+      "Return a compact system-prompt addendum (top-K confirmed preferences plus the head of active.md) for a host to inject right before context compression. Char-budgeted: absent caps derive from the resolved model context window, so the addendum is bounded whenever a window resolves. Read-only.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1381,17 +1557,22 @@ export const PACK_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
           description:
             "Maximum number of preferences to include, highest-confidence first (default 10).",
         },
+        model: {
+          type: "string",
+          description:
+            "Model id. When a char cap is absent the context window resolves from this id (table, `1m` suffix, or default); a preset hint sizes caps only when nothing places it.",
+        },
         max_chars_per_memory: {
           type: "integer",
           minimum: 1,
           description:
-            "Optional per-entry character cap (code points); trimmed entries carry `trimmed: true`.",
+            "Optional per-entry character cap; trimmed entries carry `trimmed: true`. Absent: the preset cap applies when a window resolves; nothing resolvable stays unbounded.",
         },
         max_total_chars: {
           type: "integer",
           minimum: 1,
           description:
-            "Optional total character cap (code points) across the addendum; lowest-priority overflow is dropped.",
+            "Optional total character cap; lowest-priority overflow drops first. Absent: the preset cap applies when a window resolves; nothing resolvable stays unbounded.",
         },
         receipt: {
           type: "boolean",

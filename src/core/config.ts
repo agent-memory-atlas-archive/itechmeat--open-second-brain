@@ -1121,6 +1121,36 @@ function resolveAdequacyMinResults(env: string | undefined, fileValue: string | 
 }
 
 /**
+ * Operator-declared model context window, environment channel
+ * (t_a567cc12). The vault-side channel is the `context:` block of
+ * `Brain/_brain.yaml`, and the BLOCK wins over a value here: the
+ * resolver's deliberate precedence (plan B1) is operator config >
+ * operator env > declared table > `1m` suffix > default, and an
+ * explicit per-call argument wins over both operator channels. The
+ * precedence lives with the resolver that consumes the parsed values,
+ * exactly as the recall-adequacy floors above hand theirs to their
+ * consumer.
+ *
+ * A well-formed positive integer is returned as-is: like every
+ * first-hand declaration it passes through the resolver unclamped - the
+ * declaration exists to state the true window. Any other value fails
+ * fast, mirroring the trio above - a window that silently ignored its
+ * operator would mis-size every pack.
+ */
+export const MODEL_CONTEXT_WINDOW_ENV_KEY = "OPEN_SECOND_BRAIN_MODEL_CONTEXT_WINDOW";
+
+/** Parse {@link MODEL_CONTEXT_WINDOW_ENV_KEY}; `undefined` when unset or blank. */
+export function resolveModelContextWindowEnvTokens(): number | undefined {
+  const raw = process.env[MODEL_CONTEXT_WINDOW_ENV_KEY]?.trim() ?? "";
+  if (raw === "") return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${MODEL_CONTEXT_WINDOW_ENV_KEY} must be a positive integer; got '${raw}'`);
+  }
+  return value;
+}
+
+/**
  * Generation-report tracing gate (Hindsight brain-loop ops, t_281c3edc).
  * Default OFF: the inbound `generation_report` continuity path stays
  * dormant unless `generation_trace_enabled: "true"`, when an agent's

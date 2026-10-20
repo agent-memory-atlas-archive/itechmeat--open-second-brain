@@ -21,13 +21,15 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 
 import type { Store } from "../../search/store.ts";
 import { linkConstraintAllows } from "../../search/link-constraints.ts";
 import { normalizeRelationTarget } from "../../graph/frontmatter-relations.ts";
 import { atomicWriteFileSync } from "../../fs-atomic.ts";
+import { toPosix } from "../../path-safety.ts";
 import { isoSecond } from "../time.ts";
+import { matchScope, resolveVaultScope } from "../../vault-scope/index.ts";
 import {
   formatFrontmatter,
   listVaultPages,
@@ -326,7 +328,7 @@ export function acceptBridge(
   const [meta, body] = parseFrontmatter(sourceAbs);
   const targetBase = noteId(target);
   const targetFull = target.replace(/\.md$/u, "");
-  const ambiguous = countBasenameMatches(vault, targetBase) > 1;
+  const ambiguous = countBasenameMatches(vault, targetBase, target) > 1;
   const link = `[[${ambiguous ? targetFull : targetBase}]]`;
 
   const current = meta["related"];
@@ -369,15 +371,53 @@ export function acceptBridge(
 /**
  * Number of vault pages sharing one basename (without `.md`).
  *
- * The walk has no skip list, so it reaches `Brain/entities/` like any other
- * subtree. A quarantined entity page must not make an operator's link
- * target read as ambiguous, so it is not counted.
+ * The page at `target` - the one the caller explicitly named and
+ * `acceptBridge` has already validated to exist - is always counted.
+ * The two rules below filter only the OTHER namesakes:
+ *
+ *   - Entity status: a quarantined entity page is not counted (the walk
+ *     has no skip list, so it reaches `Brain/entities/` like any other
+ *     subtree).
+ *   - Vault scope (t_fd842db0): a page outside the operator's scope -
+ *     an `ignore_paths` entry, outside the `include_paths` allowlist, or
+ *     under a frozen default ignore - is not part of the vault by
+ *     definition (`vault-scope`'s own reading), so it can no more anchor
+ *     a wikilink than a missing file would. This is the same rule set
+ *     the scope-aware lint and resolution surfaces resolve by
+ *     (`page-dedup`'s basename census, the note-title resolver); the
+ *     narrow walk below stays untouched because its population feeds a
+ *     dozen unrelated products.
+ *
+ * Skipping the target itself would let an in-scope twin answer the
+ * census alone: an out-of-scope target with a twin would then be
+ * spelled `[[basename]]`, and the wikilink would resolve to the twin.
+ *
+ * The census decides the SPELLING only: `acceptBridge` validates
+ * existence, not scope, so a caller who explicitly names an
+ * out-of-scope target still gets it accepted - that edge predates the
+ * scope filter and is unchanged by it.
  */
-function countBasenameMatches(vault: string, base: string): number {
+function countBasenameMatches(vault: string, base: string, target: string): number {
+  // Resolved once, above the loop: one existsSync + YAML load per
+  // accept, which is per operator action.
+  const rules = resolveVaultScope(vault).rules;
+  const targetRel = toPosix(target);
   let count = 0;
   for (const page of listVaultPages(vault, { reach: MAINTENANCE_LANE_REACH })) {
+    if (basename(page.path, ".md") !== base) continue;
+    // The scope predicate needs the vault-relative POSIX path: a raw
+    // host path would silently never match a path rule.
+    const pageRel = toPosix(relative(vault, page.path));
+    // The named target counts itself, before any scope skip: its
+    // existence is already validated, and only the OTHER candidates
+    // are subject to the filters below.
+    if (pageRel === targetRel) {
+      count++;
+      continue;
+    }
     if (!vaultPageInStatusScope(page.metadata, ENTITY_STATUS_SCOPE.readable)) continue;
-    if (basename(page.path, ".md") === base) count++;
+    if (!matchScope(pageRel, rules).inScope) continue;
+    count++;
   }
   return count;
 }

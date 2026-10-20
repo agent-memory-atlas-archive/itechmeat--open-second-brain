@@ -199,6 +199,45 @@ function writePreferences(input: DreamApplyInput, agent: string): void {
     );
   }
 
+  // Cross-topic rule promotion (t_642bc2b8): the planned rule is an
+  // ordinary unconfirmed preference through the same txn chokepoint -
+  // `inferred` provenance plus the evidence wikilinks and `related`
+  // lineage are what make it a promotion rather than a new claim.
+  // `overwrite: false` like the topic plan: the planner's content-slug
+  // dedup already decided the file is new, and a surprise collision
+  // must fail loudly rather than clobber.
+  for (const ct of plan.crossTopicRules) {
+    writePreferenceTxn(
+      vault,
+      {
+        slug: ct.slug,
+        topic: ct.topic,
+        principle: ct.principle,
+        created_at: isoSecond(now),
+        unconfirmed_until: isoSecond(addDays(now, cfg.dream.unconfirmed_window_days)),
+        status: BRAIN_PREFERENCE_STATUS.unconfirmed,
+        evidenced_by: ct.evidencedBy,
+        // No evidence yet, matching the topic plan's pre-seeding.
+        confidence_value: 0,
+        recentApplied: [],
+        recentViolated: [],
+        provenance: "inferred",
+        related: ct.related,
+        // The strictest visibility of the sources (review finding 63):
+        // the rule restates a source's principle verbatim, so it may
+        // never land at default visibility behind a restricted source.
+        // Written only when non-empty, like the topic plan's stamp.
+        ...(ct.visibility.length > 0 ? { visibility: ct.visibility } : {}),
+        // The sources' shared owner token, so owner-scoped recall keeps
+        // the rule as private as its sources; ownerless rules omit it.
+        ...(ct.owner ? { owner: ct.owner } : {}),
+      },
+      [],
+      { overwrite: false },
+      historyOpts,
+    );
+  }
+
   for (const update of refresh.updated.values()) {
     // Rebuild the evidence slice from the log on every pass so the
     // pref body stays in sync with the counters even when the
@@ -230,6 +269,22 @@ function writePreferences(input: DreamApplyInput, agent: string): void {
         recentViolated: ev.violated,
         ...(update.freshness_trend !== undefined
           ? { freshness_trend: update.freshness_trend }
+          : {}),
+        // Derived-fact fields (finding 77): the update carries a promoted
+        // rule's provenance and lineage through its counter changes, in
+        // the same render position the writer uses, so the bytes match
+        // the no-op pre-flight and the fields survive every rewrite.
+        ...(update.provenance !== undefined ? { provenance: update.provenance } : {}),
+        ...(update.related !== undefined && update.related.length > 0
+          ? { related: update.related }
+          : {}),
+        // The record's `visibility:` tokens (review round 2), threaded like
+        // provenance and related: the update write is the only thing that
+        // keeps the line on a restricted rule through its counter changes,
+        // and the no-op pre-flight needs the input to carry it to match the
+        // bytes on disk. Written only when non-empty, like every stamp.
+        ...(update.visibility !== undefined && update.visibility.length > 0
+          ? { visibility: update.visibility }
           : {}),
         ...(update.scope ? { scope: update.scope } : {}),
         lenientScopeTags: true,

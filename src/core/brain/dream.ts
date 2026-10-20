@@ -66,6 +66,11 @@ import { resolveNearDuplicateRetireSiblingsEnabled } from "../config.ts";
 import { planAutoRetires } from "./dream-plan-retires.ts";
 import { planTopics, topicKeyContentionWarnings } from "./dream-plan-topics.ts";
 import type { PlanState, ScanResult } from "./dream-plan.ts";
+import {
+  planCrossTopicRules,
+  readCrossTopicLedger,
+  resolveCrossTopicConfig,
+} from "./dream-plan-cross-topic.ts";
 import { planRefresh, scanApplyEvidence, type RefreshResult } from "./dream-refresh.ts";
 import { writeDreamLog } from "./dream-report.ts";
 import { scanBrain } from "./dream-scan.ts";
@@ -191,6 +196,7 @@ function scanAsAdmitted(
     preferences: scan.preferences.filter((r) => keep(r.path)),
     retired: scan.retired.filter((r) => keep(r.path)),
     corrupted: scan.corrupted.filter((r) => keep(r.path)),
+    tombstonedPreferences: scan.tombstonedPreferences?.filter((r) => keep(r.path)),
   };
 }
 
@@ -305,6 +311,30 @@ function dreamRun(
   //    preferences get a `retain-pinned` log event instead of a real
   //    retire.
   planAutoRetires(scan, cfg, now, plan, refresh);
+
+  // 4b. Cross-topic rule promotion (t_642bc2b8). Planned after the
+  //     refresh pass - the source pool reads post-refresh confirmation
+  //     state - and after the retire plan, so a preference this pass is
+  //     about to retire is never cited as evidence. Before the `changed`
+  //     gate, so a fired promotion counts as a state change and a
+  //     below-threshold or budgeted-out pass stays byte-identical; the
+  //     rollup ladder is the structural precedent (plan before the
+  //     gate, persist the ledger only when fired). The ledger read is
+  //     skipped entirely when the feature is off: an un-opted-in vault
+  //     pays no I/O here. The disclosure sink is the run's warning list:
+  //     a declared knob the resolver floored (finding 62) is named on
+  //     the summary, never applied silently.
+  const crossTopicConfig = resolveCrossTopicConfig(cfg, (code, message) =>
+    warnings.push({ code, message }),
+  );
+  const crossTopic = planCrossTopicRules({
+    scan,
+    refresh,
+    config: crossTopicConfig,
+    ledger: crossTopicConfig ? readCrossTopicLedger(vault) : null,
+    now,
+    plan,
+  });
 
   // 5. §7.3 step "move consumed signals out of inbox/" needs no pass of
   //    its own: both routes that consume a signal - the topic loop and
@@ -476,6 +506,7 @@ function dreamRun(
       refresh,
       reconcile,
       rollupPlan,
+      crossTopicLedger: crossTopic.ledger,
       moved: exec.moved,
       archived: exec.archived,
       gatedSlugs,
@@ -624,6 +655,7 @@ function collectWarnings(
  *   - a corrupted frontmatter (we want the skip event recorded)
  *   - any pinned-rebut-attempt warning
  *   - a fired rollup-ladder rung (S3)
+ *   - a cross-topic rule promotion (t_642bc2b8)
  */
 function hasStateChange(
   plan: PlanState,
@@ -645,6 +677,7 @@ function hasStateChange(
     // so a run that produces only quarantine entries is still a
     // meaningful run from the operator's perspective.
     plan.quarantined.length > 0 ||
+    plan.crossTopicRules.length > 0 ||
     rollupPlan.fired ||
     corruptedCount > 0
   );

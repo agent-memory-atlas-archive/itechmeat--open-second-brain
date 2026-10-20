@@ -165,6 +165,16 @@ export interface ScanResult {
   readonly retired: RetiredRecord[];
   readonly corrupted: CorruptedEntry[];
   /**
+   * Preferences the scan skipped because a tombstone marks them
+   * (`_status: tombstoned`, Belief lifecycle suite t_7d5a3589). The pass
+   * never plans over them, but the path-only entries still matter to the
+   * cross-topic slug check (finding 64): a tombstoned `pref-cross-*` file
+   * holds the exact path a re-promotion would write, and `overwrite:
+   * false` must never find that path occupied by surprise. Absent on a
+   * scan built by hand.
+   */
+  readonly tombstonedPreferences?: ReadonlyArray<CorruptedEntry>;
+  /**
    * Every entry name in `inbox/archived/`, parseable or not. The archive
    * step checks a move's destination name against this listing rather than
    * against the parsed records, so a tombstoned or corrupt file there still
@@ -239,6 +249,14 @@ export interface PlanState {
    * overlaps {@link signalsToMove}.
    */
   readonly signalsToArchive: Map<string, SignalArchivePlan>;
+  /**
+   * Cross-topic rule promotions (t_642bc2b8): one new unconfirmed
+   * preference per elected cross-bucket cluster, at most one per owner
+   * token per calendar day. Planned by `dream-plan-cross-topic.ts`
+   * after the refresh pass (it needs post-refresh confirmation state);
+   * every write happens in the apply stage like every other entry.
+   */
+  readonly crossTopicRules: CrossTopicRulePlan[];
 }
 
 export interface SignalArchivePlan {
@@ -253,6 +271,56 @@ export interface SignalSuppressedPlan {
   readonly retired: string;
   readonly reason: string;
   readonly topic: string;
+}
+
+/**
+ * One planned cross-topic rule promotion (t_642bc2b8).
+ *
+ * The promoted artifact is an ordinary unconfirmed preference whose
+ * evidence is the set of per-topic rules it generalises, so nothing in
+ * the persistence format is new. What the planner decides:
+ *
+ *   - `slug` is content-derived (`cross-<sha256-12>` over the sorted
+ *     source ids), so the same source set always maps to one file and a
+ *     rerun dedups itself below the changed gate.
+ *   - `topic` is the deterministic join of the sorted raw topic
+ *     displays - a key no signal will ever carry, which is exactly why
+ *     the rule cannot re-enter the per-topic "one preference per topic"
+ *     world. Topic-keyed recall will not surface it; the `related`
+ *     lineage and `evidenced_by` wikilinks are the way back.
+ *   - `principle` is one source's principle verbatim (the
+ *     lexicographically smallest source's) - the kernel stays LLM-free
+ *     and the rule says exactly what its sources say. The cross-topic
+ *     fact lives in the evidence, not in invented prose.
+ *   - `owner` carries the sources' shared owner token when they have
+ *     one, so owner-scoped recall keeps the rule as private as its
+ *     sources; ownerless sources produce an ownerless rule.
+ *   - `visibility` is the strictest of the sources' `visibility:` token
+ *     sets (`strictestVisibilityOf`, the topic plan's own rule): the
+ *     rule restates a source's principle verbatim, so it may never be
+ *     more public than the most restricted member. An intersection that
+ *     misses falls closed on the reserved token. Empty means default
+ *     visibility, and the writer omits the field then.
+ */
+export interface CrossTopicRulePlan {
+  /** `cross-<sha256-12>`; the file basename without the `pref-` prefix. */
+  readonly slug: string;
+  /** Deterministic join of the sorted source topic displays. */
+  readonly topic: string;
+  /** One source's principle, verbatim. */
+  readonly principle: string;
+  /** `[[pref-<slug>]]` wikilinks to every source, in code-unit order. */
+  readonly evidencedBy: ReadonlyArray<string>;
+  /** The source preference ids (`pref-<slug>`), in code-unit order. */
+  readonly related: ReadonlyArray<string>;
+  /**
+   * The strictest `visibility:` tokens of the cluster members. Written
+   * to the promoted rule's frontmatter when non-empty; empty is default
+   * visibility.
+   */
+  readonly visibility: ReadonlyArray<string>;
+  /** The sources' shared owner token; absent for ownerless sources. */
+  readonly owner?: string;
 }
 
 export interface NewUnconfirmedPlan {
@@ -335,6 +403,7 @@ export function emptyPlan(): PlanState {
     quarantined: [],
     topicKeyContentions: [],
     signalsToArchive: new Map(),
+    crossTopicRules: [],
   };
 }
 

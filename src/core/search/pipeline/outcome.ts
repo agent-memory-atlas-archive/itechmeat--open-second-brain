@@ -26,6 +26,7 @@ import {
   RETRIEVAL_DEGRADATION,
   RETRIEVAL_RELATIONAL_PATH_CODE,
   type RelationalPathTrailEntry,
+  type RetrievalDegradationDetail,
 } from "../retrieval-trail.ts";
 import { buildEvidenceVerification, coverageOverResults } from "../evidence-verification.ts";
 import { fnv1aHex } from "../feedback.ts";
@@ -320,12 +321,30 @@ export function buildSearchOutcome(input: OutcomeInput): SearchOutcome {
  * hit or miss, gains it here from the index age it is served at. The
  * result is the trail the pipeline would have built with the code in its
  * sink: the code leads, and a corpus statement gives way to it.
+ *
+ * `behindCount` is the measured index-behind census the caller computed
+ * under the same gate (t_e4438152). Measured - including a measured
+ * zero - it rides the detail beside the age; `null` or absent means not
+ * measured, and the detail then names the age alone. A count is a plain
+ * integer, so the open degradation-detail object needs no schema change
+ * and no new code appears.
  */
-export function withIndexStale(outcome: SearchOutcome, ageSeconds: number | null): SearchOutcome {
+export function withIndexStale(
+  outcome: SearchOutcome,
+  ageSeconds: number | null,
+  behindCount?: number | null,
+): SearchOutcome {
   if (ageSeconds === null || ageSeconds <= INDEX_STALE_SECONDS) return outcome;
+  // Spread, not a ternary of literals: a ternary union synthesizes a
+  // `behindCount?: undefined` arm, and undefined is not a detail value.
+  // Absent stays absent, exactly like the null-measured case.
+  const detail: RetrievalDegradationDetail = Object.freeze({
+    ageSeconds,
+    ...(behindCount === null || behindCount === undefined ? {} : { behindCount }),
+  });
   const stale = Object.freeze({
     code: RETRIEVAL_DEGRADATION.indexStale,
-    detail: Object.freeze({ ageSeconds }),
+    detail,
   });
   const trail = outcome.retrievalTrail;
   const retrievalTrail = Object.freeze({

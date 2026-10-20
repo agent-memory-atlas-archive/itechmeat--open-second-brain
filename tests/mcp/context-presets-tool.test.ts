@@ -72,4 +72,50 @@ describe("brain_context_presets tool", () => {
       preserved_overrides: [{ path: "context_pack.max_tokens", current: 9000, preset: 4000 }],
     });
   });
+
+  test("a model-only suggest resolves the window and discloses the source", async () => {
+    await expect(callPresets({ operation: "suggest", model: "gpt-4o" })).resolves.toMatchObject({
+      preset_id: "long-context",
+      confidence: "high",
+      reason: "context window 128000 tokens resolved from declared matched long-context",
+    });
+    // Unknown model, no hint: nothing published places the id, so the
+    // conservative fallback answers - the same tight-context/low answer a
+    // model-free call gets. The pack budget surfaces refuse the same id
+    // instead of budgeting the default window's long-context.
+    await expect(callPresets({ operation: "suggest", model: "kimi-k2" })).resolves.toMatchObject({
+      preset_id: "tight-context",
+      confidence: "low",
+      reason: "no model or context-window hint matched; using conservative default",
+    });
+    // The disagreeing-model case: "gpt-4.1-mini" matches the "mini" hint
+    // AND the declared table. The suggestion must name the long-context
+    // mapping the pack budget derives from, not the hint's tight-context.
+    await expect(
+      callPresets({ operation: "suggest", model: "gpt-4.1-mini" }),
+    ).resolves.toMatchObject({
+      preset_id: "long-context",
+      confidence: "high",
+      reason: "context window 1000000 tokens resolved from declared matched long-context",
+    });
+    // No model and no window keeps the conservative fallback.
+    await expect(callPresets({ operation: "suggest" })).resolves.toMatchObject({
+      preset_id: "tight-context",
+      confidence: "low",
+    });
+  });
+
+  test("a hint-only model answers its hint, the mapping the pack budget derives", async () => {
+    // "gemini-2.5-flash" is unknown to the declared table: the resolver
+    // answers the default window, but the hint decides on BOTH surfaces -
+    // this suggest answer and the pack budget derivation that applies the
+    // same fallback when the resolver's source is "default".
+    await expect(
+      callPresets({ operation: "suggest", model: "gemini-2.5-flash" }),
+    ).resolves.toMatchObject({
+      preset_id: "tight-context",
+      confidence: "high",
+      reason: "model hint matched tight-context",
+    });
+  });
 });
