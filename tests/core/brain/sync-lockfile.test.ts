@@ -283,6 +283,8 @@ describe("every module that takes a lock is under a scanned root", () => {
     ["core/brain/link-graph/hallways.ts", "Brain"],
     ["core/brain/link-graph/orphan-repair.ts", "Brain"],
     ["core/brain/payload-registry.ts", "Brain"],
+    ["core/brain/pledge-intake.ts", "Brain"],
+    ["core/brain/pledges.ts", "Brain"],
     ["core/brain/preference-txn.ts", "Brain"],
     ["core/brain/query-demand.ts", "Brain"],
     ["core/brain/receipts/compact.ts", "Brain"],
