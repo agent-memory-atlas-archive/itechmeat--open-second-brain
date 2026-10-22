@@ -75,6 +75,15 @@ const EXCLUSIONS: ReadonlyArray<DoctorExitExclusion> = [
       "author's head - the two produce different graphs",
   },
   {
+    code: "chunk-holds-active",
+    reason:
+      "the hold is a consequence of the embedding configuration, not a defect in the page or " +
+      "the index: the configured model provably cannot take the chunk inside its declared " +
+      "input window, and the two ways to change that - chunking the source more finely, or " +
+      "leaving the page unembedded - are per-page editorial decisions, which the finding " +
+      "names together so the operator can make them",
+  },
+  {
     code: "concept-gap",
     reason:
       "the repair is to write a preference that does not exist yet, which is authoring content " +
@@ -136,6 +145,19 @@ const EXCLUSIONS: ReadonlyArray<DoctorExitExclusion> = [
       "their content, not a repair of a record this store owns",
   },
   {
+    // The informal privacy marker (write-honesty, F1). The marker is a
+    // claim about audience, and the vocabulary is the author's: `access:`
+    // can mean a narrower group than one token states. The restamp is
+    // preview-first for exactly that reason.
+    code: "privacy-marker-unstamped",
+    reason:
+      "the informal marker is a claim about audience written in the author's own vocabulary, " +
+      "which can mean a narrower group than any single token states, and the additive restamp " +
+      "is preview-first by contract: it writes only after an operator has read each would-be " +
+      "visibility line, so no one command resolves the class without deciding for pages nobody " +
+      "reviewed",
+  },
+  {
     code: "stale-lock",
     reason:
       "the lock primitive is a single-attempt exclusive create, so no timeout distinguishes a " +
@@ -194,6 +216,14 @@ const EXCLUSIONS: ReadonlyArray<DoctorExitExclusion> = [
       "a regular expression in the capture configuration failed to compile. What it was meant " +
       "to match is not recoverable from a pattern that does not parse, so the repair is an edit " +
       "by whoever wrote it",
+  },
+  {
+    code: "person-nicknames-unreadable",
+    reason:
+      "the operator's person nickname map exists but cannot be used - it does not parse or " +
+      "violates its shape. The repair is an edit to that file by whoever wrote it: the map it " +
+      "was meant to hold is not derivable from the error, and minting nickname data would put " +
+      "words in the operator's mouth about who knows whom",
   },
   {
     code: "iso-invalid",

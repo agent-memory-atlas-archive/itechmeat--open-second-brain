@@ -20,9 +20,16 @@ import {
   resolveEmbeddingPrice,
   type PriceQuote,
 } from "./embeddings/pricing.ts";
-import { estimateCostUsd, estimateTokens, LOCAL_EMBEDDING_MODEL } from "./embeddings/signature.ts";
+import { effectiveInputWindowTokens, passagePrefixSentByProvider } from "./embeddings/presets.ts";
+import {
+  embeddingSignature,
+  estimateCostUsd,
+  estimateTokens,
+  LOCAL_EMBEDDING_MODEL,
+} from "./embeddings/signature.ts";
+import { sha256Hex } from "../integrity/digest.ts";
 import type { Store } from "./store.ts";
-import type { PendingVectorScope } from "./store/chunks.ts";
+import type { ChunkHoldExclusion, PendingVectorScope } from "./store/chunks.ts";
 import type { ResolvedSearchConfig } from "./types.ts";
 
 /** Why a gate refused. The value leaves TypeScript in previews and JSON. */
@@ -139,16 +146,70 @@ export interface EmbeddingSpendPlanOptions {
 }
 
 /**
+ * The pending-census exclusion key for this config's chunk holds
+ * (chunk skip-and-hold, F2): the (model, window, signature) triple under
+ * which the embedding phase records a hold, and under which the pending
+ * anti-join hides held chunks from every spend surface.
+ *
+ * Null when no chunk can be proved over anything - no model, or no
+ * declared window - and a null key excludes nothing: an old hold row
+ * whose key no longer matches the config is inert, which is exactly the
+ * release path. The phase persists under the same rendering so the writer
+ * and the readers cannot drift on what "the same hold" means.
+ */
+export function chunkHoldExclusion(config: ResolvedSearchConfig): ChunkHoldExclusion | null {
+  const model = activeEmbeddingModel(config);
+  if (model === null) return null;
+  const windowTokens = effectiveInputWindowTokens(config.semantic, model);
+  if (windowTokens === null) return null;
+  return Object.freeze({
+    model,
+    windowTokens,
+    embeddingSignature: holdKeySignature(config, model),
+  });
+}
+
+/**
+ * The hold table's signature: the embedding identity PLUS the passage
+ * prefix the backend would actually send. The hold's proof is measured
+ * over `prefix + content` against the window, so the key the proof is
+ * recorded under has to answer for the prefix too - a shortened or
+ * removed prefix changes what fits, and a key blind to it would keep
+ * excluding a chunk that now fits, with nothing to release it. The prefix
+ * rides as a LEADING field, so the trailing provider:model:dimension
+ * triple every signature reader parses from the end stays intact; an
+ * empty sent prefix (every backend but `openai-compat`, or the prefix
+ * disabled) contributes no field and renders the identity alone.
+ */
+function holdKeySignature(config: ResolvedSearchConfig, model: string): string {
+  const identity = embeddingSignature({
+    provider: config.semantic.provider,
+    model,
+    dimension: config.semantic.dimension,
+  });
+  const sent = passagePrefixSentByProvider(config.semantic.provider, config.semantic.passagePrefix);
+  if (sent === "") return identity;
+  const digest = sha256Hex(sent);
+  return `pp-${digest.slice(0, 16)}:${identity}`;
+}
+
+/**
  * Plan the spend of embedding every pending chunk in scope. Reads only:
  * the phase in `indexer.ts` remains the only spender and throws on a
- * blocked verdict.
+ * blocked verdict. Chunks held under the config's own key are not
+ * pending: they leave the census before they can be priced.
  */
 export function planEmbeddingSpend(
   store: Store,
   config: ResolvedSearchConfig,
   opts: EmbeddingSpendPlanOptions = {},
 ): EmbeddingSpendPlan {
-  return priceSpendPlan(store.findChunksWithoutEmbeddings(opts.scope), config, opts.forced);
+  const hold = chunkHoldExclusion(config);
+  return priceSpendPlan(
+    store.findChunksWithoutEmbeddings(opts.scope, hold ?? undefined),
+    config,
+    opts.forced,
+  );
 }
 
 /**

@@ -22,7 +22,18 @@ import {
   ENTITY_CONFLICT_KIND,
   type EntityIndex,
 } from "../entities/index-builder.ts";
+import {
+  PersonNicknameConfigError,
+  resolvePersonNicknameMap,
+} from "../entities/person-nicknames.ts";
+import {
+  derivePersonNameVariants,
+  EMPTY_PERSON_NICKNAME_MAP,
+  isPersonCategory,
+  type PersonNicknameMap,
+} from "../entities/person-variants.ts";
 import { findMalformedEntityLabels } from "../entities/label-hygiene.ts";
+import { ENTITY_STATUS_SCOPE, entityStatusInScope } from "../entities/status-scope.ts";
 import type { BrainEntity, EntityConflict } from "../entities/types.ts";
 import type { DoctorCheck } from "./check.ts";
 
@@ -49,8 +60,30 @@ function claimedForms(index: EntityIndex, conflict: EntityConflict): string[] {
   );
 }
 
+/** Doctor code of an unusable operator nickname map. */
+export const PERSON_NICKNAMES_UNREADABLE_CODE = "person-nicknames-unreadable";
+
 /** Doctor code of a proposal-only alias-merge candidate. */
 export const ENTITY_ALIAS_CANDIDATE_CODE = "entity-alias-candidate";
+
+/**
+ * The one alias-merge sentence both candidate kinds are written with.
+ * Kept in a single home so the doctor's findings and the decision-model
+ * annotator's message-matching can never drift apart.
+ */
+function aliasMergeCandidateMessage(
+  nameA: string,
+  idA: string,
+  nameB: string,
+  idB: string,
+  method: string,
+  similarity: number | string,
+): string {
+  return (
+    `possible alias-merge: '${nameA}' (${idA}) ~ '${nameB}' (${idB}) ` +
+    `[${method} ${similarity}]. Review and add an alias to merge — never auto-merged.`
+  );
+}
 
 /**
  * The doctor message of one alias-merge candidate. Shared with the
@@ -58,10 +91,77 @@ export const ENTITY_ALIAS_CANDIDATE_CODE = "entity-alias-candidate";
  * the doctor's issues back to their candidates by this exact text.
  */
 export function entityAliasCandidateMessage(c: EntityAliasCandidate): string {
-  return (
-    `possible alias-merge: '${c.name_a}' (${c.a}) ~ '${c.name_b}' (${c.b}) ` +
-    `[${c.method} ${c.similarity}]. Review and add an alias to merge — never auto-merged.`
+  return aliasMergeCandidateMessage(c.name_a, c.a, c.name_b, c.b, c.method, c.similarity);
+}
+
+/**
+ * The doctor message of one DERIVED-VARIANT collision
+ * (write-honesty-egress-consent, F3/C5): the same alias-merge shape,
+ * with a `person-variant` method label. The similarity is 1 because the
+ * collision is exact - the derived form equals the other record's
+ * declared form byte-for-byte after normalization. The method label
+ * differs from every lexical/embedding candidate's, so the annotator's
+ * by-message match simply never pairs this finding with one.
+ */
+export function personVariantCollisionMessage(a: BrainEntity, b: BrainEntity): string {
+  const [first, second] = a.id.localeCompare(b.id) <= 0 ? [a, b] : [b, a];
+  return aliasMergeCandidateMessage(
+    first.name,
+    first.id,
+    second.name,
+    second.id,
+    "person-variant",
+    1,
   );
+}
+
+/**
+ * Every pair of canonical PERSON records where a derived variant of one
+ * equals a DECLARED form (name or alias) of the other
+ * (write-honesty-egress-consent, F3/C5). Lookups stay exact-declared-
+ * first, so nothing mis-resolves today - but the registry holds two
+ * records answering to one form, and that is the same latent alias-merge
+ * the candidates above nominate, so it is reported through the same
+ * warning. Exactly one finding per unordered pair, however many variants
+ * collide and whichever side derives.
+ *
+ * A form shared only as a DERIVED form on both sides is not a collision:
+ * neither record declared it, so the collision scan has nothing to offer
+ * the merge that the ambiguity error at lookup time does not already
+ * say better.
+ */
+function derivedVariantCollisionMessages(
+  index: EntityIndex,
+  nicknames: PersonNicknameMap,
+): string[] {
+  const persons = index.entities.filter(
+    (e) =>
+      entityStatusInScope(e.status, ENTITY_STATUS_SCOPE.canonical) && isPersonCategory(e.category),
+  );
+  const declared = new Map<string, ReadonlySet<string>>(
+    persons.map((p) => [p.id, new Set([p.name, ...p.aliases].map((f) => normalizeEntityName(f)))]),
+  );
+  const seenPairs = new Set<string>();
+  const messages: string[] = [];
+  for (const deriver of persons) {
+    const variants = new Set<string>();
+    for (const form of [deriver.name, ...deriver.aliases]) {
+      for (const v of derivePersonNameVariants(normalizeEntityName(form), nicknames)) {
+        variants.add(v);
+      }
+    }
+    if (variants.size === 0) continue;
+    for (const claimant of persons) {
+      if (claimant.id === deriver.id) continue;
+      const pairKey = [deriver.id, claimant.id].toSorted().join("\u0000");
+      if (seenPairs.has(pairKey)) continue;
+      const claimantForms = declared.get(claimant.id)!;
+      if (![...variants].some((v) => claimantForms.has(v))) continue;
+      seenPairs.add(pairKey);
+      messages.push(personVariantCollisionMessage(deriver, claimant));
+    }
+  }
+  return messages;
 }
 
 /** `ent-a (path-a), ent-b (path-b)` - the records, not just their files. */
@@ -147,6 +247,44 @@ export const entityRegistryCheck: DoctorCheck = {
           `${malformed.id} has a malformed label ${JSON.stringify(malformed.name)} ` +
           `(${malformed.reason}). Review with 'o2b brain entity prune' and re-run with ` +
           "--confirm to remove the node and its edges behind a snapshot.",
+      });
+    }
+
+    // write-honesty-egress-consent (F3/C5): a derived person variant of
+    // one person that equals another person's declared form. Same
+    // warning as the candidates below - it nominates the same remedy -
+    // but deterministic and always on, like the lints above. Unlike the
+    // conflict findings above, which deliberately read what is STORED
+    // (scoping them would stop the doctor reporting on exactly the
+    // records a read path hides), this scan and the malformed-label scan
+    // resolve through the shared canonical predicate: a quarantined
+    // person's variants nominate no merges.
+    // An unusable nickname file degrades this scan to no derived
+    // collisions rather than discarding the check - the read lanes keep
+    // their documented degradations too - but the doctor is the
+    // surfacing point: a present-yet-unusable operator file is one
+    // warning, naming the path, with the error's own short
+    // (position-only) detail.
+    let nicknames = EMPTY_PERSON_NICKNAME_MAP;
+    try {
+      nicknames = resolvePersonNicknameMap(vault);
+    } catch (err) {
+      if (!(err instanceof PersonNicknameConfigError)) throw err;
+      nicknames = EMPTY_PERSON_NICKNAME_MAP;
+      issues.push({
+        severity: "warning",
+        code: PERSON_NICKNAMES_UNREADABLE_CODE,
+        path: err.path,
+        message:
+          `the person nickname map at ${err.path} is unusable and nickname-derived ` +
+          `lookups run without it: ${err.detail}`,
+      });
+    }
+    for (const message of derivedVariantCollisionMessages(index, nicknames)) {
+      issues.push({
+        severity: "warning",
+        code: ENTITY_ALIAS_CANDIDATE_CODE,
+        message,
       });
     }
 

@@ -37,10 +37,11 @@ function hasColumn(db: Database, table: string, name: string): boolean {
     .some((c) => c.name === name);
 }
 
-// v14 (recall-quality): the virtual chunks.chunk_kind column, the taxonomy
-// indexes and the document_attributes side table joined the latest version.
-test("latest schema version is 14", () => {
-  expect(LATEST_SCHEMA_VERSION).toBe(14);
+// v15 (write-honesty): the chunk_embedding_holds table joined the latest
+// version (v14 (recall-quality) had added the virtual chunks.chunk_kind
+// column, the taxonomy indexes and the document_attributes side table).
+test("latest schema version is 15", () => {
+  expect(LATEST_SCHEMA_VERSION).toBe(15);
 });
 
 test("fresh migration reaches latest with the authored_at column", () => {

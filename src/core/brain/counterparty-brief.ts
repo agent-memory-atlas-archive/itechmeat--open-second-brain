@@ -76,11 +76,8 @@ import {
   type PledgeListItem,
 } from "./pledges.ts";
 import { neutralizeSingleLine, untrustedFramingHeader } from "./untrusted-source.ts";
-import {
-  REMOTE_DENY_VISIBILITY_TOKEN,
-  pageVisibility,
-  strictestVisibilityOf,
-} from "../graph/visibility.ts";
+import { REMOTE_DENY_VISIBILITY_TOKEN, strictestVisibilityOf } from "../graph/visibility.ts";
+import { remoteDenyVisibilityTokens } from "../graph/privacy-markers.ts";
 import {
   DEGRADATION_CODE,
   emitDegradationNotice,
@@ -324,7 +321,12 @@ function entityCarriesReservedToken(entity: BrainEntity): boolean {
   }
   const [meta, , notices] = parseFrontmatterTextWithNotices(text);
   if (notices.length > 0) return true;
-  return pageVisibility(meta).includes(REMOTE_DENY_VISIBILITY_TOKEN);
+  // The full union (declared tokens plus any informal marker's
+  // reservation), so a page stating `access: private` under the informal
+  // key is reserved exactly as a formally declared one would be - the
+  // marker is the same claim in an older spelling, and the brief leaves
+  // the machine either way.
+  return remoteDenyVisibilityTokens(meta).includes(REMOTE_DENY_VISIBILITY_TOKEN);
 }
 
 /**
@@ -437,7 +439,12 @@ function pledgeItem(
   // be shareable, so the item is withheld - the same discipline the
   // cited-source gate applies.
   if (pledgeNotices.length > 0) return null;
-  const tagLists: ReadonlyArray<string>[] = [[...pageVisibility(meta)]];
+  // Each tag list is the page's declared tokens plus any informal marker's
+  // reservation (`remoteDenyVisibilityTokens`), so a page saying
+  // `access: private` under the informal key folds exactly as a formally
+  // reserved one would - the brief leaves the machine, and the marker is
+  // the same claim in an older spelling.
+  const tagLists: ReadonlyArray<string>[] = [[...remoteDenyVisibilityTokens(meta)]];
   let sourceRel = pledgeRel(pledge.slug);
   if (pledge.source.length > 0) {
     const source = pledgeSourceWithinVault(pledge.source);
@@ -451,7 +458,7 @@ function pledgeItem(
     if (!isRegularFile(sourceAbs)) return null;
     const [sourceMeta, , sourceNotices] = parseFrontmatterWithNotices(sourceAbs);
     if (sourceNotices.length > 0) return null;
-    tagLists.push([...pageVisibility(sourceMeta)]);
+    tagLists.push([...remoteDenyVisibilityTokens(sourceMeta)]);
     sourceRel = source;
   }
   const folded = strictestVisibilityOf(tagLists);
@@ -538,7 +545,10 @@ function preferenceItems(
     }
     const [meta, body, pageNotices] = parseFrontmatterTextWithNotices(text);
     if (pageNotices.length > 0) continue;
-    if (pageVisibility(meta).includes(REMOTE_DENY_VISIBILITY_TOKEN)) continue;
+    // The full union, so a preference page reserving itself under an
+    // informal key (`confidentiality: secret`) is withheld exactly as a
+    // formally declared one would be.
+    if (remoteDenyVisibilityTokens(meta).includes(REMOTE_DENY_VISIBILITY_TOKEN)) continue;
     const lifecycle = readLifecycleState(meta);
     if (lifecycle.tombstoned || lifecycle.supersededBy !== null) continue;
     if (anchorEntityForms(body, forms, anchorOpts).length === 0) continue;

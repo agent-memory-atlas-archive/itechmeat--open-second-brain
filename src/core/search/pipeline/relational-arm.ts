@@ -239,9 +239,11 @@ function isCallerReadable(
   reach: TransportReach,
   agentScope: string | null,
   cache: FrontmatterCache,
+  store: Pick<Store, "indexedVisibilityByPaths">,
 ): boolean {
+  const indexedTags = store.indexedVisibilityByPaths([path]).get(path);
   return (
-    isPathReadableAtReach(vault, path, reach, cache) &&
+    isPathReadableAtReach(vault, path, reach, cache, indexedTags) &&
     (agentScope === null || isPathOwnerVisible(vault, path, agentScope, cache))
   );
 }
@@ -377,11 +379,18 @@ export function runRelationalArm(
         // documents or not. The enforcement verdict below stays the FULL
         // classification: the exclusion (enforce) or the kept
         // contribution (shadow) does not depend on what was recordable.
-        const recordable = isCallerReadable(vault, rep.path, reach, agentScope, frontmatterCache)
+        const recordable = isCallerReadable(
+          vault,
+          rep.path,
+          reach,
+          agentScope,
+          frontmatterCache,
+          store,
+        )
           ? [
               ...eligibility.node,
               ...(sourcePath === null ||
-              isCallerReadable(vault, sourcePath, reach, agentScope, frontmatterCache)
+              isCallerReadable(vault, sourcePath, reach, agentScope, frontmatterCache, store)
                 ? eligibility.source
                 : []),
             ]
@@ -402,7 +411,16 @@ export function runRelationalArm(
         if (trustGateMode === SEARCH_TRUST_GATE_MODE.enforce) continue;
       }
     }
-    const gated = gatePath(vault, node.path, titles, reach, agentScope, frontmatterCache, nowMs);
+    const gated = gatePath(
+      vault,
+      node.path,
+      titles,
+      reach,
+      agentScope,
+      frontmatterCache,
+      nowMs,
+      store,
+    );
     outcome.rankedChunkIds.push(rep.chunkId);
     outcome.reachByChunk.set(rep.chunkId, {
       via: node.viaLinkTypes,
@@ -593,6 +611,7 @@ function gatePath(
   agentScope: string | null,
   cache: FrontmatterCache,
   nowMs: number,
+  store: Store,
 ): {
   readonly path: ReadonlyArray<RelationalPathStep>;
   readonly supersededBy?: string;
@@ -602,7 +621,7 @@ function gatePath(
   for (const step of steps) {
     const meta = titles.get(step.documentId);
     const unreadable =
-      meta === undefined || !isCallerReadable(vault, meta.path, reach, agentScope, cache);
+      meta === undefined || !isCallerReadable(vault, meta.path, reach, agentScope, cache, store);
     if (unreadable) continue;
     gated.push(step);
     if (supersededBy === undefined) {

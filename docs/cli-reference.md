@@ -2457,6 +2457,13 @@ model. The
 offline `local` embedder has no input window, so the key is refused with
 `INVALID_INPUT` when `embedding_provider` is `local`.
 
+`o2b search status --json` carries `held_chunks` - `{ total, items }`, each
+item `{ path, chunk_index, estimated_tokens, window_tokens, reason }`, the
+list position-ordered and capped at 20 with `total` naming the whole - only
+while the index holds chunks under the ACTIVE embedding configuration; it is
+absent when nothing is held, and records whose (model, window, signature)
+key a config change released are not reported.
+
 `embedding_extra_body` (`OPEN_SECOND_BRAIN_EMBEDDING_EXTRA_BODY`, since
 v1.73.0) sends operator-declared fields with every embedding request to an
 OpenAI-compatible endpoint, for a serving stack that needs a field the
@@ -2817,6 +2824,17 @@ o2b search check                           reports how many indexed documents re
                                            the field, and how many documents hold no frontmatter the index measured
 ```
 
+```text
+o2b brain privacy-marker-restamp  [--apply] [--json] - stamp the reserved visibility token onto pages that declare their audience only through an informal privacy marker (access / confidentiality / sensitivity); dry-run default, additive, idempotent, never removes a token, never re-embeds
+```
+
+With `--apply`, a candidate whose frontmatter cannot be rewritten losslessly
+is REFUSED, not stamped: a page whose frontmatter carries a line the
+scanner drops, a comment line, an indented nested mapping, or a file that
+cannot be re-read is reported in the verb's `skipped` list (JSON) and on
+stderr with the reason, and its bytes stay untouched - `updated N of M`
+never silently absorbs a refused page.
+
 A vault page's `visibility:` frontmatter carries opaque, language-neutral
 tokens, and ONE of them is reserved: a page declaring it is not readable
 at `remote` reach. Reach is a transport fact rather than a caller
@@ -2866,6 +2884,55 @@ distinct: the page's tokens, an empty list for a page that declares none,
 and unmeasured for a document the index holds no frontmatter chunk for.
 `o2b search check` reports the unmeasured population rather than counting
 it as declaring nothing.
+
+### The content class (since v1.92.0)
+
+```text
+o2b brain bank-export --out <file>   [--include-prompt-derived]
+o2b brain graph-export --out <file>  [--include-prompt-derived]
+o2b brain okf-export --out <dir>     [--include-prompt-derived]
+o2b brain export --format transcripts-jsonl --transcripts <file|dir>
+                   --out <file>      [--include-prompt-derived]
+```
+
+Pages carry a `content_class:` frontmatter key that the server writes, the
+same way the channel a record arrived on is written by the process that
+received it and never named by the caller. The vocabulary is closed and
+holds one member today: `prompt-derived`, stamped at creation on the write
+paths that are definitionally material an agent produced from a prompt -
+note writes that arrive over the MCP transport, the session import, and the
+in-process report writers. A caller that sends the key has it dropped; an
+operator-authored CLI write is never stamped.
+
+Every shared export leaves class-marked pages out by default. The three
+page-export verbs above split them out of the payload BEFORE it is
+composed, so a marked page is absent from the export rather than redacted
+inside it, and each omission is named on stderr with the page's path and
+its class, so a smaller export is never a silent one. Passing
+`--include-prompt-derived` carries the pages back in; the run says so on
+stderr, because an operator who opted in deserves to see the opt-in
+acknowledged where the copy is made. `o2b brain export` is the transcript
+export, not a page export: it never drops vault pages, and its
+`--include-prompt-derived` governs TRANSCRIPT CONVERSATIONS - a record
+that carries the class is omitted and named by its `session_id`, the same
+way the page verbs name paths (and only the `transcripts-jsonl` format
+reads the flag; the other formats ignore it). The knowledge pack goes one
+step earlier: a marked page is blocked by the selection step beside the
+`visibility` and `owner` blocks and named in the pack's `blocked` list,
+since a pack is a curated subset by design and offers no override.
+The transcript format has a contract to export session material, so it
+never applies the default quietly: a record that carries the class is
+omitted and named, and a corpus the policy would empty is a refusal, never
+an empty file.
+
+Pages written before this shipped carry no `content_class` key, and
+nothing rewrites them to add one - a stamp applied by a later pass would
+describe the pass, not the writer. Absence of the mark is the documented
+pre-stamp era: such a page is unmarked and keeps exporting exactly as it
+did before this release. The vocabulary is closed on the write side and
+forgiving on the read side: a hand-edited value this build does not know
+reads as unmarked, because inventing an exclusion for it would let one
+typo silently hide pages from every shared export.
 
 ## What leaves the machine unscanned (network egress)
 

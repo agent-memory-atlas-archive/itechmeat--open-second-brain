@@ -68,6 +68,7 @@ import { censusSessionSignals, type ImportCensus } from "../import-census.ts";
 import { appendContinuityRecord } from "../continuity/store.ts";
 import { discoverMarkersDetailed, isFeedbackMarker } from "../inline.ts";
 import { writeSignal } from "../signal.ts";
+import { stampPromptDerivedLine } from "../provenance/content-class.ts";
 import { importSessionRecall } from "../session-recall.ts";
 import { isoDate, isoSecond } from "../time.ts";
 import { BRAIN_SIGNAL_SOURCE_TYPE } from "../types.ts";
@@ -484,6 +485,30 @@ export async function importSession(
           : {}),
         ...(opts.rawCodec === true ? { rawCodec: true } : {}),
       });
+      // A session-replayed signal is prompt-derived material by
+      // definition - it is a turn of an agent conversation - so the
+      // content-class stamp rides the same run that wrote it (F5). The
+      // signal writer composes its own frontmatter and exposes no
+      // extension point, so the stamp lands as a line insert on the
+      // bytes this call just wrote; a deduped write (empty path) has
+      // nothing new to stamp. The stamp failing never loses the signal:
+      // the error surfaces by name in this import's errors, separate
+      // from the writeSignal arm so neither stage can be mistaken for
+      // the other.
+      if (res.path !== "") {
+        try {
+          stampPromptDerivedLine(res.path);
+        } catch (err) {
+          // The row names `res.path` - the signal page the failure is
+          // about - never `absPath`, which is the transcript this import
+          // only read. An operator following the row must land on the
+          // page that went unstamped.
+          errors.push({
+            path: res.path,
+            message: `content-class stamp failed: ${(err as Error).message ?? String(err)}`,
+          });
+        }
+      }
       dedup.set(input.dedupHash, { id: res.id, path: res.path });
       createdHashes.push(input.dedupHash);
       signalsCreated++;
