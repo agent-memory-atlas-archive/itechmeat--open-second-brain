@@ -701,6 +701,8 @@ o2b brain doctor              gains the `symlink-escape` error (vault-internal s
 
 Extracted facts pass a deterministic durability gate before persisting: structural signals only (temp paths, progress counters, run-id and timestamp shapes, measurement-token dominance, exit-status shapes), extendable with `durability.denylist` regexes; rejections log `durability-skip` events and are surfaced by count in the route result. Entity labels are sanitized (`**Foo**` becomes `Foo`) and structurally validated at every intake boundary, with `entities.label_denylist` as the only vocabulary source. Since v1.80.0 the structural gate also learns from the store: entity creation consults the derived lexicon (`Brain/entities/lexicon.json`, dataset-hashed over the vault's own pages - no word list ships with the binary) and two more verdicts feed the existing heal triangle (`entity-label-malformed` findings plus `o2b brain entity prune`): a multi-token all-caps label with no prior stored occurrence (`shouted-heading`) and a caseful label whose every token is a learned common word (`function-word-run`) are refused at creation, while code-shaped labels (containing `_`, `.`, `/`, a digit, or internal uppercase) bypass both case rules, and labels in caseless scripts admit on the structural gate alone. The verdicts are advisory after admission: existing records are heal candidates, never auto-removed. Rebuild the lexicon with `o2b brain entity lexicon rebuild` after corpus edits; a stale, torn or expired artifact reads as absent, so admission degrades to today's structural behavior and never mis-rejects. Feedback writes that closely resemble a confirmed same-scope preference return a conflict advisory (and log `write-conflict-advisory`) while the write proceeds. Embedding-side: `embedding_prefix_query`/`embedding_prefix_passage` (env twins, e5 preset defaults) control instruction prefixes, invalid vectors are rejected with `EMBEDDING_INVALID_VECTOR`, and quota exhaustion surfaces as non-retriable `EMBEDDING_QUOTA_EXHAUSTED` with Retry-After-aware backoff for plain rate limits.
 
+Beside the denylist, person lookups and query expansion read one more operator-supplied vocabulary, `Brain/entities/person-nicknames.json`: a JSON object mapping each nickname to the array of full person names it stands for (for example `{"bob": ["Robert Smith"]}`), with keys and values compared after the same normalization as entity names - case, whitespace and quote folding. Like the denylist it is operator data only: nothing is derived into it and no vocabulary ships with the binary. A missing file means no nickname data; a person also answers to the derived structural forms of its declared names (first-initial-plus-surname and reversed word order, plus the dotted-initial and `Last, First` spellings). A present but malformed file is reported by `o2b brain doctor` as `person-nicknames-unreadable` and nickname lookups degrade to the declared and structural forms; an entry the parser folds away - a nickname that normalizes to nothing, a value list with no usable name, a nickname equal to a name it stands for - surfaces as a `person-nicknames-entry-skipped` warning naming the entry's position.
+
 ### Belief lifecycle and decision memory (since v1.33.0)
 
 ```text
@@ -2288,6 +2290,7 @@ so there is no separate lane field that could drift from it:
 | `semantic-embedding-abi-drift`       | the index carries embeddings written by another build; `detail.fields` counts the contradicted ABI fields                                                                                                                                                                                                                                                                                                                        |
 | `hybrid-degraded`                    | hybrid recall was asked for and the semantic lane did not run, so this answer is keyword-only                                                                                                                                                                                                                                                                                                                                    |
 | `hybrid-deadline-exceeded`           | the composite hybrid path (embed, semantic top-k, rerank, second pass) outlived `search_hybrid_deadline_ms`, so the phases past the budget were cut; `detail.budgetMs` is the deadline, `detail.elapsedMs` the moment it fired                                                                                                                                                                                                   |
+| `person-derived-ambiguity`           | a person form in the query reached several people only through derivation (an initial, a word order or an operator nickname), so nothing was expanded for it rather than guess one person; `detail` maps that form to the competing person ids, dot-joined                                                                                                                                                                      |
 | `rank-cap-truncated-pool`            | the rank cap truncated the candidate pool; `detail.cap` is the cap that bit                                                                                                                                                                                                                                                                                                                                                      |
 | `rerank-provider-unavailable`        | the configured cross-encoder reranker (remote endpoint or local model) could not answer, so the answer keeps the heuristic order; `detail.category` is one of `auth`, `quota`, `gone`, `rejected`, `transient`, `timeout`, `network`, `malformed`, `unclassified`                                                                                                                                                                |
 | `rerank-model-sunset`                | the configured rerank model's announced decommission date has passed, so no rerank request was sent and the answer keeps the heuristic order                                                                                                                                                                                                                                                                                     |
@@ -3020,24 +3023,44 @@ names it (`docs/decision-models/providers.md`).
 ## Decision model (optional)
 
 ```text
-o2b decision-model check      Config state: enabled, provider, base URL, pinned model, the key
-                              variable's NAME and whether it is set (never the value), per-use
-                              modes, vault opt-out, cost gate and today's spend, processor terms,
-                              adapter and calibration, threshold profile (with one warning for
-                              uses whose enforce runs as shadow), choice option limit, licence
+o2b decision-model check      Config state: enabled, the provider chain in order
+                              (decision_model_providers), each entry's base URL, pinned model,
+                              the key variable's NAME and whether it is set (never the value),
+                              per-use modes, vault opt-out, cost gate and today's spend,
+                              processor terms, adapter and calibration, threshold tuning state
+                              (with one warning per use whose enforce runs as shadow, naming
+                              the model and the tuning command), choice option limit, licence
                               note for open weights with a commercial-use restriction.
-                              --ping sends one request over a synthetic state (no vault content)
-                              and records it (use ping, counted toward the cost gate).
-                              Exit 1 only for an invalid config or a failed ping of an active
-                              provider; a missing key is exit 0 with a hint. --vault --config --json
+                              --ping sends one request per configured provider over a
+                              synthetic state (no vault content) and records each (use ping,
+                              counted toward the cost gate). Exit 1 only for an invalid config
+                              or when no configured provider answers the ping; a missing key
+                              is exit 0 with a hint. --vault --config --json
 o2b decision-model report     decision_model_call records per use: calls, outcome mix, p50/p95
                               latency, input tokens, cost, rerank shadow agreement (top-1, top-5
-                              overlap, ordinary shadow records only). --since DATE --use USE
-                              --vault --config --json
+                              overlap, ordinary shadow records only), and a shadow section
+                              naming the uses that run as shadow for want of stored thresholds.
+                              --since DATE --use USE --vault --config --json
+o2b decision-model eval       run --use USE grades the preregistered per-use eval over the
+                              configured adapter (real spend; a promote writes the machine-side
+                              tuning mark); list prints cached decision_model_eval_grade
+                              records, oldest first. --use --since --vault --config --json
+o2b decision-model thresholds fit --use USE derives the use's threshold from its labelled
+                              report data against a false-action target (--target, default
+                              0.05) and writes it for the answering model in
+                              decision-thresholds.json next to config.yaml; writes nothing
+                              when the data cannot decide. list prints the store by model and
+                              use with per-vault overrides and kept history. set --model ID
+                              --use USE --value N [--name NAME] [--vault PATH] writes one by
+                              hand; nothing is ever deleted. --config --json
 ```
 
-Off by default; active only when `decision_model_enabled: "true"` AND the
-environment variable named by `decision_model_env_key` is set. Config keys,
+Off by default; a provider entry is active only when `decision_model_enabled:
+"true"` AND the environment variable its key setting names is set. The
+entries answer in the configured order (`decision_model_providers`, with
+`decision_model_provider` as the one-entry form): a connection error or
+timeout falls through to the next entry within the same budget, and every
+record names the provider and model that actually answered. Config keys,
 presets, privacy and the vault opt-out: [`docs/decision-models.md`](decision-models.md).
 
 ## Helpers
