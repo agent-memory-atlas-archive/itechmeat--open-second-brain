@@ -17,12 +17,25 @@
  * export verb redacted them. Write-time coverage also says nothing about
  * a record already on disk or appended by another writer: the read model
  * never re-scans. Scanning what this verb actually READ answers both.
+ *
+ * The third subcommand, `promote` (issue #277), is the one that writes:
+ * it re-renders `host_memory_write` records as unconfirmed preference
+ * pages through the read-model, dry-run by default, sealed with an
+ * approval digest an apply must carry back.
  */
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
+import type { PlannedFile } from "../../../core/brain/claude-memory-plan.ts";
 import { loadNormalizedContinuityRecords } from "../../../core/brain/continuity/read-model.ts";
+import { promoteHostMemory } from "../../../core/brain/continuity/promote-host-memory.ts";
+import {
+  PromoteConflictsError,
+  PromoteManifestCorruptError,
+  type PromoteConflictsPartialProgress,
+  type PromoteHostMemoryResult,
+} from "../../../core/brain/continuity/promote-host-memory.ts";
 import {
   deriveUsageSignals,
   rankByUsageDecay,
@@ -44,12 +57,14 @@ const CLI_VERSION: string = OPEN_SECOND_BRAIN_VERSION;
 
 const USAGE =
   "usage: o2b brain continuity export --format atof|atif [--session <id>] [--month YYYY-MM] [--out <dir>] [--json]\n" +
-  "       o2b brain continuity rank [--kind <kind>] [--limit N] [--json]";
+  "       o2b brain continuity rank [--kind <kind>] [--limit N] [--json]\n" +
+  "       o2b brain continuity promote [--month YYYY-MM] [--apply] [--approval-digest <hex>] [--json]";
 
 export async function cmdBrainContinuity(argv: string[]): Promise<number> {
   const subcommand = argv[0];
   if (subcommand === "export") return exportContinuity(argv.slice(1));
   if (subcommand === "rank") return rankContinuity(argv.slice(1));
+  if (subcommand === "promote") return promoteContinuity(argv.slice(1));
   return fail(USAGE);
 }
 
@@ -209,4 +224,245 @@ function previewText(payload: Readonly<Record<string, unknown>>): string {
 
 function safeName(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
+}
+
+/**
+ * `o2b brain continuity promote`: re-render `host_memory_write` records
+ * as unconfirmed preference pages (issue #277). Dry-run by default - it
+ * plans, seals the plan and prints the digest, and writes nothing.
+ * `--apply` lands the plan; non-interactively it must carry the dry
+ * run's digest via `--approval-digest`, exactly as import-claude-memory
+ * does, so what lands is what was reviewed.
+ */
+function promoteContinuity(argv: string[]): number {
+  const { flags } = parse(argv, {
+    vault: { type: "string" },
+    month: { type: "string" },
+    apply: { type: "boolean" },
+    "approval-digest": { type: "string" },
+    json: { type: "boolean" },
+  });
+  const month = typeof flags["month"] === "string" ? flags["month"].trim() : undefined;
+  if (month !== undefined && !/^\d{4}-\d{2}$/.test(month)) {
+    return usageError("brain continuity promote: --month must look like YYYY-MM");
+  }
+  const mode = flags["apply"] === true ? "apply" : "dry-run";
+  const approvalDigest =
+    typeof flags["approval-digest"] === "string" ? flags["approval-digest"].trim() : undefined;
+  // A dry run COMPUTES a digest; it cannot consume one. Refuse the
+  // pairing by name instead of silently dropping the value.
+  if (mode !== "apply" && approvalDigest !== undefined) {
+    return usageError(
+      "brain continuity promote: --approval-digest applies to --apply; " +
+        "a dry run computes a digest, it does not consume one",
+    );
+  }
+  if (mode === "apply" && approvalDigest === undefined && !process.stdin.isTTY) {
+    return usageError(
+      "brain continuity promote: --apply requires --approval-digest in non-interactive " +
+        "mode (run the default dry run first, then apply with the digest it prints)",
+    );
+  }
+
+  const vault = brainVerbContext(flags).vault;
+  const asJson = flags["json"] === true;
+  try {
+    const res = promoteHostMemory({
+      vault,
+      mode,
+      ...(month !== undefined ? { month } : {}),
+      ...(approvalDigest !== undefined ? { approvalDigest } : {}),
+    });
+    if (asJson) process.stdout.write(`${renderPromoteJson(month, res)}\n`);
+    else if (mode === "dry-run") printPromotePlan(res);
+    else {
+      printPromoteApply(
+        res.applied,
+        res.skipped,
+        res.skippedUnchanged,
+        res.snapshotRunId,
+        res.redactedCount,
+        res.privateCount,
+        res.total,
+        res.conflicts,
+      );
+    }
+    if (res.manifestCorrupt) printManifestCorruptWarning();
+    return 0;
+  } catch (err) {
+    if (err instanceof PromoteConflictsError) {
+      // The safe writes already landed; report the applied progress, then
+      // the conflicts, and exit 2.
+      const partial = err.partial;
+      if (asJson && partial !== null) {
+        process.stdout.write(`${renderPromotePartialJson(month, partial, err.conflicts)}\n`);
+      } else {
+        if (partial !== null) {
+          printPromoteApply(
+            partial.applied,
+            partial.skipped,
+            partial.skippedUnchanged,
+            partial.snapshotRunId,
+            partial.redactedCount,
+            partial.privateCount,
+            partial.total,
+            err.conflicts,
+          );
+        }
+        process.stderr.write("conflicts:\n");
+        for (const c of err.conflicts) {
+          process.stderr.write(
+            `  ${c.prefId} already exists in Brain but is not in ` +
+              `Brain/.imports/host-memory-promotions.json (${c.basename})\n`,
+          );
+        }
+      }
+      return 2;
+    }
+    if (err instanceof PromoteManifestCorruptError) {
+      return fail(`brain continuity promote: ${(err as Error).message}`);
+    }
+    return fail(`brain continuity promote: ${(err as Error).message}`);
+  }
+}
+
+function renderPromoteJson(month: string | undefined, res: PromoteHostMemoryResult): string {
+  return renderPromoteEnvelope({
+    mode: res.mode,
+    month,
+    total: res.total,
+    plans: res.plans,
+    applied: res.applied,
+    skipped: res.skipped,
+    skippedUnchanged: res.skippedUnchanged,
+    conflicts: res.conflicts,
+    redactedCount: res.redactedCount,
+    privateCount: res.privateCount,
+    manifestCorrupt: res.manifestCorrupt,
+    digest: res.digest,
+    snapshotRunId: res.snapshotRunId,
+  });
+}
+
+/**
+ * The one JSON envelope every promote exit spells: the same key set on
+ * the dry run, the clean apply and the conflict path, with `conflicts`
+ * always present (empty when none) and `plans` carrying the full plan
+ * even when the run stopped at exit 2 - a consumer keying on `plans`
+ * must not read zero rows off a partial run, and one keying on
+ * `conflicts` must not meet the key only on that path.
+ */
+function renderPromoteEnvelope(parts: {
+  mode: string;
+  month: string | undefined;
+  total: number;
+  plans: ReadonlyArray<PlannedFile>;
+  applied: ReadonlyArray<PlannedFile>;
+  skipped: ReadonlyArray<{ id: string; reason: string }>;
+  skippedUnchanged: ReadonlyArray<PlannedFile>;
+  conflicts: ReadonlyArray<PlannedFile>;
+  redactedCount: number;
+  privateCount: number;
+  manifestCorrupt: boolean;
+  digest: string;
+  snapshotRunId: string | null;
+}): string {
+  return JSON.stringify(
+    {
+      mode: parts.mode,
+      month: parts.month ?? null,
+      total: parts.total,
+      counts: {
+        plans: parts.plans.length,
+        applied: parts.applied.length,
+        skipped: parts.skipped.length,
+        skipped_unchanged: parts.skippedUnchanged.length,
+        conflicts: parts.conflicts.length,
+        private_dropped: parts.privateCount,
+        redacted: parts.redactedCount,
+      },
+      manifest_corrupt: parts.manifestCorrupt,
+      digest: parts.digest,
+      snapshot: parts.snapshotRunId,
+      plans: parts.plans.map((p) => ({ id: p.basename, pref_id: p.prefId, action: p.action })),
+      skipped: parts.skipped.map((s) => ({ id: s.id, reason: s.reason })),
+      applied: parts.applied.map((p) => ({ id: p.basename, pref_id: p.prefId, action: p.action })),
+      conflicts: parts.conflicts.map((p) => ({
+        id: p.basename,
+        pref_id: p.prefId,
+        action: p.action,
+      })),
+    },
+    null,
+    2,
+  );
+}
+
+function renderPromotePartialJson(
+  month: string | undefined,
+  partial: PromoteConflictsPartialProgress,
+  conflicts: PromoteConflictsError["conflicts"],
+): string {
+  return renderPromoteEnvelope({
+    mode: "apply",
+    month,
+    total: partial.total,
+    plans: partial.plans,
+    applied: partial.applied,
+    skipped: partial.skipped,
+    skippedUnchanged: partial.skippedUnchanged,
+    conflicts,
+    redactedCount: partial.redactedCount,
+    privateCount: partial.privateCount,
+    manifestCorrupt: partial.manifestCorrupt,
+    digest: partial.digest,
+    snapshotRunId: partial.snapshotRunId,
+  });
+}
+
+function printManifestCorruptWarning(): void {
+  process.stderr.write(
+    "warning: Brain/.imports/host-memory-promotions.json could not be read as the " +
+      "manifest shape - this plan was computed against an empty history and --apply " +
+      "refuses until the file is reconciled\n",
+  );
+}
+
+function printPromotePlan(res: PromoteHostMemoryResult): void {
+  process.stdout.write(
+    `promote plan: ${res.plans.length} actionable, ${res.skipped.length} skipped\n`,
+  );
+  if (res.privateCount > 0 || res.redactedCount > 0) {
+    process.stdout.write(
+      `  saw ${res.total} record(s): ${res.privateCount} private dropped, ` +
+        `${res.redactedCount} redacted (masked text promoted)\n`,
+    );
+  }
+  process.stdout.write(`approval-digest: ${res.digest}\n`);
+  for (const p of res.plans) process.stdout.write(`  ${p.action} ${p.prefId} (${p.basename})\n`);
+  for (const s of res.skipped) process.stdout.write(`  SKIP  ${s.id}: ${s.reason}\n`);
+}
+
+function printPromoteApply(
+  applied: ReadonlyArray<{ prefId: string }>,
+  skipped: ReadonlyArray<{ id: string; reason: string }>,
+  skippedUnchanged: ReadonlyArray<unknown>,
+  snapshotRunId: string | null,
+  redactedCount: number,
+  privateCount: number,
+  total: number,
+  conflicts: ReadonlyArray<unknown>,
+): void {
+  process.stdout.write(
+    `applied: ${applied.length}; unchanged: ${skippedUnchanged.length}; skipped: ${skipped.length}\n`,
+  );
+  if (privateCount > 0 || redactedCount > 0) {
+    process.stdout.write(
+      `  saw ${total} record(s): ${privateCount} private dropped, ` +
+        `${redactedCount} redacted (masked text promoted)\n`,
+    );
+  }
+  if (snapshotRunId) process.stdout.write(`snapshot: ${snapshotRunId}\n`);
+  for (const s of skipped) process.stdout.write(`  SKIP  ${s.id}: ${s.reason}\n`);
+  if (conflicts.length > 0) process.stdout.write(`conflicts: ${conflicts.length}\n`);
 }
