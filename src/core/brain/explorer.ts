@@ -21,6 +21,12 @@
  * ({@link ExplorerParseFailure}), never dropped. This surface both
  * displays the graph and exports it, and a graph silently missing a rule
  * is indistinguishable from a vault that never had one.
+ *
+ * The privacy deny markers reserve a node without refusing it: the
+ * collector keeps every parsed node and
+ * {@link collectExplorerDenials} reports which ones a SHARED output
+ * must withhold - the live view is the operator's own, the export is
+ * not, so the narrowing lives with the caller that writes bytes outward.
  */
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
@@ -28,8 +34,10 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildBacklinkIndex, type BacklinkIndex } from "./backlinks.ts";
+import { deniedReservationKey, PREFERENCE_DENY_REASON, type PreferenceDenial } from "./export.ts";
 import { brainDirs } from "./paths.ts";
 import { parsePreference, parseRetired } from "./preference.ts";
+import { parseFrontmatter } from "../vault.ts";
 import {
   BRAIN_PREFERENCE_STATUS,
   type BrainConfidence,
@@ -38,6 +46,8 @@ import {
 } from "./types.ts";
 import { collectExplorerConsole } from "./explorer-console.ts";
 import { buildOperatorSnapshot } from "./operator-snapshot.ts";
+import { redactRawOutput } from "../redactor.ts";
+import { sortedDistinctLiterals } from "../secret-ref.ts";
 
 export const EXPLORER_SCHEMA_VERSION = 1 as const;
 
@@ -103,6 +113,55 @@ export interface ExplorerGraph {
 export interface CollectExplorerDataOptions {
   /** Wall clock for `generated_at`. Defaults to `new Date()`. */
   readonly now?: Date;
+}
+
+/**
+ * The nodes the privacy deny markers reserve, as the shared lanes'
+ * denial report: one list over BOTH node kinds, preference and retired,
+ * each named with its id and the frontmatter key that denied it.
+ *
+ * The same judgment the preference exporters make, read from the
+ * frontmatter of every `pref-*.md` under `Brain/preferences/` and every
+ * `ret-*.md` under `Brain/retired/`. It is a report beside the
+ * collector, not a filter inside it: {@link collectExplorerData} keeps
+ * every parsed node, because the live server is the operator's own view
+ * and a silently smaller graph there is the exact lie the parse-failure
+ * refusal exists to prevent. A caller that writes bytes for another
+ * reader narrows at its own seam and names what it left out.
+ *
+ * A file the parsers would refuse appears in
+ * {@link ExplorerGraph.parse_failures}, and every export caller refuses
+ * on that before reading this list - so a file with no readable
+ * frontmatter id can never match a node and is skipped here rather than
+ * guessed at.
+ */
+export function collectExplorerDenials(vault: string): ReadonlyArray<PreferenceDenial> {
+  const dirs = brainDirs(vault);
+  const denied: PreferenceDenial[] = [];
+  const scan = (dir: string, prefix: string): void => {
+    if (!existsSync(dir)) return;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+      if (!entry.name.startsWith(prefix)) continue;
+      const path = join(dir, entry.name);
+      // `parseFrontmatter` cannot throw; a file it cannot read yields an
+      // empty map, which denies nothing - and the parse-failure refusal
+      // has already stopped the export before this list is read.
+      const [meta] = parseFrontmatter(path);
+      const key = deniedReservationKey(meta);
+      if (key === null) continue;
+      const id = meta["id"];
+      if (typeof id !== "string") continue;
+      denied.push({ id, reason: PREFERENCE_DENY_REASON, denied_by: key });
+    }
+  };
+  scan(dirs.preferences, "pref-");
+  scan(dirs.retired, "ret-");
+  // Sorted like the shared collectors' denial lists: the report rides
+  // byte-deterministic surfaces (the stderr notice), and the explorer's
+  // own output ordering is stable by id.
+  denied.sort((a, b) => a.id.localeCompare(b.id));
+  return denied;
 }
 
 export function collectExplorerData(
@@ -476,7 +535,25 @@ export function buildLiveServer(
       if (url.pathname === "/status.json") {
         try {
           const snapshot = await buildOperatorSnapshot(vault, snapshotOptions);
-          return jsonResponse(JSON.stringify(snapshot));
+          // The explorer serves browsers, so the store group answers the
+          // way the MCP surface answers below local reach: the writer
+          // lock PATH is withheld - it is a resolved host path the index
+          // may keep outside the vault - while every state field stays,
+          // and `state_files.search_index` still answers presence.
+          const store = { ...snapshot.store, writerLockPath: null };
+          // The probe's failure reason can embed the same resolved host
+          // path this field withholds (proper-lockfile's fs errors carry
+          // it verbatim), so the path - in both its spellings - is
+          // scrubbed from the reason too: the browser surface answers
+          // below local reach for the whole store group, not for one
+          // field of it.
+          if (store.writerLockReason !== null && snapshot.store.writerLockPath !== null) {
+            const index = snapshot.store.writerLockPath;
+            store.writerLockReason = redactRawOutput(store.writerLockReason, {
+              literals: sortedDistinctLiterals([index, `${index}.lock`]),
+            });
+          }
+          return jsonResponse(JSON.stringify({ ...snapshot, store }));
         } catch (err) {
           return errorResponse("/status.json", err);
         }

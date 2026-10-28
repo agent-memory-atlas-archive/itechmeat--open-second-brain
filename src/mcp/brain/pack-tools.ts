@@ -17,6 +17,7 @@ import {
   resolveRecallAdequacyThresholds,
   resolveRecallGateTelemetry,
   resolveSearchFocusContextPack,
+  resolveTailTrimContextPack,
 } from "../../core/config.ts";
 import { resolveSearchConfig } from "../../core/search/index.ts";
 import { SearchError } from "../../core/search/search-error.ts";
@@ -55,6 +56,7 @@ import {
   getContextReceipt,
   isContextReceiptTrigger,
   listContextReceipts,
+  lookupReceiptReplyPresence,
   RECEIPT_ITEM_ACTIVE_BODY,
   RECEIPT_ITEM_LESSONS_BODY,
   RECEIPT_ITEM_SCOPED_RULES,
@@ -453,6 +455,10 @@ async function toolBrainContextPack(
   // entity_facts_context_pack config key (default off) so the default
   // tool output carries no entity_facts key.
   const entityFacts = resolveEntityFactsContextPack(ctx.configPath ?? undefined);
+  // Tail-trim wiring (t_cb6a5558): gated on the tail_trim_context_pack
+  // config key (default off) so the default tool output carries no
+  // tail_trim key and no trim ever runs.
+  const tailTrim = resolveTailTrimContextPack(ctx.configPath ?? undefined);
   const agentScope = coerceAgentScope(ctx, args, true);
   // Root closure (t_sec_pack_reach): the pack reads page bodies by path,
   // outside the three read roots, so the reserved-token rule is asked per
@@ -501,6 +507,7 @@ async function toolBrainContextPack(
           ...(agentScope !== undefined ? { agentScope } : {}),
           ...(densityRanking ? { densityRanking: true } : {}),
           ...(entityFacts ? { entityFacts: true } : {}),
+          ...(tailTrim ? { tailTrim: true } : {}),
           ...(sessionFocus !== null ? { sessionFocus } : {}),
           ...(query ? { query } : {}),
           ...(queryMode !== null ? { queryMode } : {}),
@@ -611,6 +618,19 @@ async function toolBrainContextPack(
           },
         }
       : {}),
+    // The trim block appears only when the config key resolved on AND
+    // the pack actually trimmed - the same conditional shape as
+    // `entity_facts` above. Fields project to the tool's wire casing.
+    ...(report.tailTrim
+      ? {
+          tail_trim: {
+            dropped: report.tailTrim.dropped,
+            kept_by_query_terms: report.tailTrim.keptByQueryTerms,
+            rescued: report.tailTrim.rescued,
+            tokens_saved: report.tailTrim.tokensSaved,
+          },
+        }
+      : {}),
     ...(adequacy !== undefined
       ? {
           adequacy: {
@@ -664,9 +684,13 @@ async function toolBrainContextReceipts(
       ...(sessionId !== undefined ? { sessionId } : {}),
       ...(local ? {} : { exclude: isRuleOnlyInjection }),
     });
+    // The join is show-only: summarizeContextReceipt's second parameter
+    // is the presence join, so the summaries are mapped through an arrow
+    // - a point-free `.map(summarizeContextReceipt)` would hand every
+    // row's ARRAY INDEX to that parameter.
     const summaries = receipts
       .map((receipt) => receiptAtReach(receipt, local))
-      .map(summarizeContextReceipt);
+      .map((receipt) => summarizeContextReceipt(receipt));
     const page = pageSlice(summaries, offset, limit ?? Math.max(summaries.length, 1));
     return {
       vault_path: vaultPathField(ctx),
@@ -697,6 +721,21 @@ async function toolBrainContextReceipts(
       payload: receipt.payload,
       private: receipt.private,
       redacted: receipt.redacted,
+      // The receipt's session reply-presence join (t_f8510c55): the
+      // per-note verdicts of the session's latest reply_presence record,
+      // or the named unjoined outcome - a receipt whose session checked
+      // no turn, or that names no session at all, says so instead of
+      // reading as silently absent. The lookup runs on the reach-adjusted
+      // record, so a payload redacted below local reach joins only on
+      // what it still carries - and through the caller's reach view, so
+      // a note row naming a page reserved below local reach drops from
+      // `per_note` (counted in `withheld`) instead of disclosing its
+      // path, range and verdict to a caller the page withheld itself from.
+      reply_presence: lookupReceiptReplyPresence(
+        ctx.vault,
+        receipt,
+        reachView(ctx.vault, contextReach(ctx)),
+      ),
     };
   }
 

@@ -7,11 +7,21 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { writePreference } from "../../src/core/brain/preference.ts";
+import { collectExplorerData, renderExportedHtml } from "../../src/core/brain/explorer.ts";
+import { moveToRetired, writePreference } from "../../src/core/brain/preference.ts";
+import { BRAIN_RETIRED_REASON } from "../../src/core/brain/types.ts";
 import { REDACTION_PLACEHOLDER } from "../../src/core/redactor.ts";
 import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
 import { runCli } from "../helpers/run-cli.ts";
@@ -220,6 +230,181 @@ describe("o2b brain explorer --export", () => {
   });
 });
 
+describe("o2b brain explorer --export privacy denials", () => {
+  /**
+   * Hand-add an informal privacy marker the same way an operator does:
+   * a user-tier frontmatter line on the node's file.
+   */
+  function stampMarker(relPath: string, line: string): void {
+    const abs = join(vault, relPath);
+    writeFileSync(abs, readFileSync(abs, "utf8").replace(/^---\n/, `---\n${line}\n`));
+  }
+
+  function seedReservedPref(): void {
+    writePreference(vault, {
+      slug: "reserved",
+      topic: "reserved",
+      principle: "Reserved principle",
+      created_at: "2026-05-01T00:00:00Z",
+      unconfirmed_until: "2026-05-08T00:00:00Z",
+      status: "confirmed",
+      evidenced_by: ["[[sig-2026-05-01-reserved]]"],
+      confirmed_at: "2026-05-02T00:00:00Z",
+      applied_count: 1,
+      violated_count: 0,
+      last_evidence_at: "2026-05-02T00:00:00Z",
+      confidence: "high",
+      confidence_value: 0.8,
+      pinned: false,
+    });
+    stampMarker("Brain/preferences/pref-reserved.md", "access: private");
+  }
+
+  test("a reserved preference is absent from the HTML and named on stderr", async () => {
+    await bootstrap();
+    seedOnePref();
+    seedReservedPref();
+    const out = join(tmp, "brain.html");
+    const r = await runCli(["brain", "explorer", "--vault", vault, "--export", out], {
+      env: { OPEN_SECOND_BRAIN_CONFIG: config },
+    });
+    expect(r.returncode).toBe(0);
+    const body = readFileSync(out, "utf8");
+    expect(body).not.toContain("pref-reserved");
+    expect(body).not.toContain("Reserved principle");
+    // The unmarked rule still ships.
+    expect(body).toContain("pref-explorer-seed");
+    // The omission is disclosed on stderr, with the key that denied it.
+    expect(r.stderr).toContain("pref-reserved");
+    expect(r.stderr).toContain("(access)");
+    expect(r.stderr).toContain("left out");
+    // stderr only: the HTML names the omission as absence, not prose.
+    expect(r.stdout).not.toContain("left out");
+    // The count answers for what was written: one node exported, one
+    // named as withheld on stderr.
+    expect(r.stdout).toContain("exported 1 ");
+  });
+
+  test("a reserved retired entry is absent too", async () => {
+    await bootstrap();
+    seedOnePref();
+    writePreference(vault, {
+      slug: "old-reserved",
+      topic: "old-reserved",
+      principle: "Old reserved principle",
+      created_at: "2026-05-01T00:00:00Z",
+      unconfirmed_until: "2026-05-08T00:00:00Z",
+      status: "confirmed",
+      evidenced_by: ["[[sig-2026-05-01-old-reserved]]"],
+      confirmed_at: "2026-05-02T00:00:00Z",
+      applied_count: 1,
+      violated_count: 0,
+      last_evidence_at: "2026-05-02T00:00:00Z",
+      confidence: "high",
+      confidence_value: 0.8,
+      pinned: false,
+    });
+    const deadPath = join(vault, "Brain", "preferences", "pref-old-reserved.md");
+    moveToRetired(vault, deadPath, BRAIN_RETIRED_REASON.staleNoEvidence, {
+      now: new Date("2026-05-10T00:00:00Z"),
+      retired_by: "[[Brain/log/2026-05-10]]",
+    });
+    stampMarker("Brain/retired/ret-old-reserved.md", "sensitivity: confidential");
+
+    const out = join(tmp, "brain.html");
+    const r = await runCli(["brain", "explorer", "--vault", vault, "--export", out], {
+      env: { OPEN_SECOND_BRAIN_CONFIG: config },
+    });
+    expect(r.returncode).toBe(0);
+    const body = readFileSync(out, "utf8");
+    expect(body).not.toContain("ret-old-reserved");
+    expect(body).not.toContain("Old reserved principle");
+    expect(r.stderr).toContain("ret-old-reserved");
+    expect(r.stderr).toContain("(sensitivity)");
+  });
+
+  test("an unmarked vault exports byte-identically to the shared collector's rendering", async () => {
+    await bootstrap();
+    seedOnePref();
+    const out = join(tmp, "brain.html");
+    const r = await runCli(["brain", "explorer", "--vault", vault, "--export", out], {
+      env: { OPEN_SECOND_BRAIN_CONFIG: config },
+    });
+    expect(r.returncode).toBe(0);
+    // No reservation held anything back, so the file is exactly what the
+    // pre-denial pipeline rendered - the denial pass changed no bytes.
+    const stripTimestamp = (s: string): string =>
+      s.replace(/"generated_at":"[^"]*"/, '"generated_at":"X"');
+    expect(stripTimestamp(readFileSync(out, "utf8"))).toBe(
+      stripTimestamp(renderExportedHtml(collectExplorerData(vault))),
+    );
+    expect(r.stderr).not.toContain("left out");
+  });
+});
+
+describe("o2b brain explorer (live) store group", () => {
+  test("a failed lock probe keeps the errno and drops the host path from the reason", async () => {
+    await bootstrap();
+    seedOnePref();
+    // A lock path that cannot even be stat'd: a symlink loop where the
+    // lock directory would sit - the throw shape whose fs message
+    // embeds the full resolved host path.
+    const { resolveSearchConfig } = await import("../../src/core/search/index.ts");
+    const lockPath = `${resolveSearchConfig({ vault, configPath: config }).dbPath}.lock`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    symlinkSync(lockPath, lockPath);
+
+    const port = pickPort();
+    const proc = Bun.spawn(
+      [
+        "bun",
+        "run",
+        "src/cli/main.ts",
+        "brain",
+        "explorer",
+        "--vault",
+        vault,
+        "--port",
+        String(port),
+      ],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, OPEN_SECOND_BRAIN_CONFIG: config },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    try {
+      const banner = await readUntil(proc.stdout, "Live explorer at ");
+      if (!banner.found) {
+        const stderr = await new Response(proc.stderr).text();
+        throw new Error(`explorer exited before listening:\n${banner.text}${stderr}`);
+      }
+      const res = await fetch(`http://127.0.0.1:${port}/status.json`);
+      expect(res.ok).toBe(true);
+      const status = JSON.parse(await res.text()) as {
+        store: {
+          writerLock: string;
+          writerLockPath: string | null;
+          writerLockReason: string | null;
+        };
+      };
+      // The path is withheld from the field AND from the reason: the
+      // browser surface answers below local reach for the whole store
+      // group, not for one field of it. The errno stays - "could not
+      // find out, and here is why".
+      expect(status.store.writerLock).toBe("unknown");
+      expect(status.store.writerLockPath).toBeNull();
+      expect(status.store.writerLockReason).toContain("ELOOP");
+      expect(status.store.writerLockReason).not.toContain(lockPath);
+      expect(status.store.writerLockReason).not.toContain(tmpdir());
+    } finally {
+      proc.kill("SIGINT");
+      await proc.exited;
+    }
+  }, 20000);
+});
+
 describe("o2b brain explorer (live)", () => {
   test(
     "binds to 127.0.0.1, serves all four routes, shuts down on SIGINT",
@@ -299,9 +484,23 @@ describe("o2b brain explorer (live)", () => {
           healthy: boolean;
           counts: { preferences: number };
           activeProfile: string | null;
+          store: {
+            writerLock: string;
+            writerLockPath: string | null;
+            writerLockOwner: string | null;
+            thisCaller: string;
+          };
         };
         expect(typeof status.healthy).toBe("boolean");
         expect(status.counts.preferences).toBe(1);
+        // The explorer serves browsers, not the operator's own reach, so
+        // the lock PATH is withheld the way the MCP surface withholds it
+        // below local reach (a resolved host path is not a browser
+        // client's fact) - while the rest of the store group stays. The
+        // local CLI status keeps the path; that is pinned in status.test.
+        expect(status.store.writerLockPath).toBeNull();
+        expect(typeof status.store.writerLock).toBe("string");
+        expect(status.store.thisCaller).toBe("read-only");
         // The verb threads its resolved config path into the server, so
         // the operator snapshot sees this run's profile registry.
         writeFileSync(

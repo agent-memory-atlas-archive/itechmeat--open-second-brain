@@ -282,10 +282,66 @@ export interface ContextPackEntityFactsReport {
  */
 export const CONTEXT_PACK_ENTITY_FACTS_MAX_ENTITIES = 3;
 
+/**
+ * Score-aware tail trim (t_cb6a5558): how many of the pack's delivered
+ * items are immune to the trim. The head of the delivery is what the
+ * tier gate already vouched for; only the tail past these items competes
+ * on query-term overlap. A named constant, not a knob.
+ */
+export const CONTEXT_PACK_TAIL_TRIM_KEEP = 3;
+
+/**
+ * Score-aware tail trim (t_cb6a5558): a tail item whose query-term
+ * coverage - the fraction of the query's tokens it carries - is at
+ * least this fraction of the top delivered item's coverage restates
+ * the question's terms nearly as fully as the top hit and stays
+ * deliverable. A named constant, not a knob.
+ */
+export const TAIL_TRIM_KEEP_FRACTION = 0.8;
+
+/** The skip reason a whole dropped tail item carries ({@link ContextPackSkipped.reason}). */
+const TAIL_TRIM_SKIP_REASON = "tail-trim";
+
+/**
+ * One candidate the unified walker budgeted but could not fit, kept
+ * (only under the tail-trim flag) so the rescue can offer it the freed
+ * budget in priority order. `body`/`trimmed`/`tokens` are the
+ * post-char-budget values the walker would have emitted.
+ */
+interface TailTrimRescueCandidate {
+  readonly candidate: Candidate;
+  readonly body: string;
+  readonly trimmed: boolean;
+  readonly tokens: number;
+}
+
+/**
+ * What the score-aware tail trim (t_cb6a5558) did to the delivered
+ * tail, counted whole items and tokens. Present ONLY when the caller
+ * opted in via {@link ContextPackOptions.tailTrim} AND a query was
+ * present to score against - the same conditional shape as `semantic`,
+ * `packing` and `entityFacts`.
+ */
+export interface ContextPackTailTrimReport {
+  /** Tail items dropped whole; each also carries a `"tail-trim"` skip entry. */
+  readonly dropped: number;
+  /** Tail items kept because their query-term coverage nearly matched the top hit's. */
+  readonly keptByQueryTerms: number;
+  /** Former `over-budget` candidates re-admitted under the freed budget. */
+  readonly rescued: number;
+  /** Tokens the trim freed, net of the budget the rescue re-spent. */
+  readonly tokensSaved: number;
+}
+
 export interface ContextPackSkipped {
   readonly id: string;
   readonly tokens: number;
-  readonly reason: "over-budget" | "filter-miss" | "guard-blocked" | "over-char-budget";
+  readonly reason:
+    | "over-budget"
+    | "filter-miss"
+    | "guard-blocked"
+    | "over-char-budget"
+    | "tail-trim";
 }
 
 /**
@@ -364,6 +420,12 @@ export interface ContextPackReport {
    * {@link ContextPackEntityFactsReport}.
    */
   readonly entityFacts?: ContextPackEntityFactsReport;
+  /**
+   * Present only when the caller opted in via
+   * {@link ContextPackOptions.tailTrim} and a query scored the tail;
+   * see {@link ContextPackTailTrimReport}.
+   */
+  readonly tailTrim?: ContextPackTailTrimReport;
 }
 
 /**
@@ -529,6 +591,22 @@ export interface ContextPackOptions {
    * `entity_facts_context_pack` config key.
    */
   readonly entityFacts?: boolean;
+  /**
+   * Score-aware tail trim for delivered evidence (t_cb6a5558). When
+   * true AND a query is present, the pack scores every delivered item's
+   * query-term coverage - the fraction of the query's tokens the item
+   * carries, in every query mode - keeps its top
+   * {@link CONTEXT_PACK_TAIL_TRIM_KEEP} delivered items, keeps any tail
+   * item whose coverage is at least
+   * {@link TAIL_TRIM_KEEP_FRACTION} of the top delivered item's (it
+   * restates the question's terms), drops the rest whole with
+   * `"tail-trim"` skip entries, and offers the freed budget back to
+   * `over-budget` candidates in priority order. The report gains a
+   * conditional `tailTrim` member. Omitted/false keeps the pack
+   * byte-identical - the trim never runs without the flag. Callers
+   * gate this on the `tail_trim_context_pack` config key.
+   */
+  readonly tailTrim?: boolean;
   /**
    * Which candidate pages the caller may see, asked with each page's
    * ABSOLUTE path. Applied to the collected candidates before ranking,
@@ -952,7 +1030,10 @@ export function packContext(vault: string, opts: ContextPackOptions): ContextPac
   // (the facts lane, the distilled layer) and retired pages (the pages
   // lane) - and let the caller name the claim order. The whole branch
   // runs ONLY when the policy is named; an omitted option never reaches
-  // it, which is what keeps the unified pack byte-identical.
+  // it, which is what keeps the unified pack byte-identical. Scope note
+  // (t_cb6a5558): the score-aware tail trim applies to the unified path
+  // only in v1 - the policy's lane allocations are untouched and its
+  // reports never carry the `tailTrim` member.
   if (opts.packingPolicy !== undefined) {
     const policy = opts.packingPolicy;
     const factsCandidates = candidates.filter((c) => c.source === "preferences");
@@ -1190,6 +1271,32 @@ export function packContext(vault: string, opts: ContextPackOptions): ContextPac
     );
   }
 
+  // Score-aware tail trim (t_cb6a5558): active only when the caller
+  // opted in AND the query carries at least one token to score against.
+  // A tokenless query scores every candidate 0 and the trim could not
+  // discriminate, so it does not run and no report member appears.
+  const trimQueryTokens =
+    opts.tailTrim === true && opts.query !== undefined ? tokenise(opts.query) : null;
+  const tailTrimActive = trimQueryTokens !== null && trimQueryTokens.size > 0;
+  // Per-candidate restatement scores for the trim: query-term coverage
+  // in EVERY mode. The ranked comparator's jaccard kernel is not
+  // reusable here - its union grows with the page's own vocabulary, so
+  // a long body that carries every query term scores a fraction of the
+  // page that is only the query, and the trim would keep the short
+  // ones rather than the restating ones. Coverage's denominator is the
+  // query alone, which is the keep rule's own measure; the scores are
+  // computed here, under the flag only, so the off-path work does not
+  // change.
+  const tailTrimScoreById = new Map<string, number>();
+  if (tailTrimActive) {
+    for (const c of candidates) {
+      tailTrimScoreById.set(
+        c.id,
+        queryTermCoverage(trimQueryTokens, tokenise(`${c.topic} ${c.principle} ${c.body}`)),
+      );
+    }
+  }
+
   // Per-memory character cap (v0.20.0): trim oversized bodies in priority
   // order via the shared budget primitive before the token budget runs,
   // so one huge page cannot starve the rest. A trimmed body is re-tokenised
@@ -1202,8 +1309,11 @@ export function packContext(vault: string, opts: ContextPackOptions): ContextPac
     },
   );
 
-  const items: ContextPackItem[] = [];
-  const skipped: ContextPackSkipped[] = [];
+  // Reassigned only by the tail trim (t_cb6a5558); the flag-off path
+  // never touches them again after the walk.
+  let items: ContextPackItem[] = [];
+  let skipped: ContextPackSkipped[] = [];
+  const tailTrimRescue: TailTrimRescueCandidate[] = [];
   let used = 0;
   for (const { item: c, text: body, trimmed } of budgeted.kept) {
     if (query !== null) {
@@ -1216,6 +1326,9 @@ export function packContext(vault: string, opts: ContextPackOptions): ContextPac
     const tokens = trimmed ? estimateTokens(body) : c.tokens;
     if (used + tokens > opts.maxTokens) {
       skipped.push({ id: c.id, tokens, reason: "over-budget" });
+      if (tailTrimActive) {
+        tailTrimRescue.push({ candidate: c, body, trimmed, tokens });
+      }
       continue;
     }
     items.push(toContextPackItem(c, body, trimmed, tokens, densityRanking, densityScoreById));
@@ -1265,6 +1378,27 @@ export function packContext(vault: string, opts: ContextPackOptions): ContextPac
     }
   }
 
+  // Score-aware tail trim (t_cb6a5558): runs once the delivered set is
+  // complete (attention item included, at the head), before the total
+  // char ceiling so that ceiling stays the final word on the emitted set.
+  let tailTrim: TailTrimCounters | null = null;
+  if (tailTrimActive) {
+    const trimmed = applyTailTrim(
+      items,
+      used,
+      skipped,
+      tailTrimRescue,
+      tailTrimScoreById,
+      opts.maxTokens,
+      densityRanking,
+      densityScoreById,
+    );
+    items = [...trimmed.items];
+    used = trimmed.used;
+    skipped = [...trimmed.skipped];
+    tailTrim = trimmed.counters;
+  }
+
   // Total recall character cap (v0.20.0): a second ceiling over the
   // token-budgeted set. Applied via the shared primitive on the emitted
   // items only (so query-missed pages never count), dropping the
@@ -1305,6 +1439,7 @@ export function packContext(vault: string, opts: ContextPackOptions): ContextPac
         startedAtMs,
         ownerScopeWarnings,
         withheldIds,
+        tailTrim === null ? null : tailTrimReportOf(tailTrim, new Set(keptItems.map((i) => i.id))),
       );
     }
   }
@@ -1325,6 +1460,7 @@ export function packContext(vault: string, opts: ContextPackOptions): ContextPac
     startedAtMs,
     ownerScopeWarnings,
     withheldIds,
+    tailTrim === null ? null : tailTrimReportOf(tailTrim, new Set(finalItems.map((i) => i.id))),
   );
 }
 
@@ -1360,6 +1496,167 @@ function semanticRelevanceFor(opts: ContextPackOptions): ReadonlyMap<string, num
   if (opts.queryMode !== "semantic") return null;
   if (opts.semanticRelevance === undefined) throw new ContextPackSemanticRelevanceMissingError();
   return opts.semanticRelevance;
+}
+
+/**
+ * Query-term coverage: the fraction of the query's tokens the document
+ * carries - |q ∩ d| / |q| - the measure the trim's keep rule and its
+ * `kept_by_query_terms` counter name ("restates the question's terms
+ * nearly as fully"). The denominator is the query alone, so a long
+ * body that carries every query term scores 1 where the ranked
+ * comparator's jaccard kernel (|q ∩ d| / |q ∪ d|) scores it a fraction
+ * of the page that is only the query. A tokenless query covers
+ * nothing.
+ */
+function queryTermCoverage(
+  queryTokens: ReadonlySet<string>,
+  docTokens: ReadonlySet<string>,
+): number {
+  if (queryTokens.size === 0) return 0;
+  let hits = 0;
+  for (const token of queryTokens) if (docTokens.has(token)) hits += 1;
+  return hits / queryTokens.size;
+}
+
+/**
+ * The score-aware tail trim (t_cb6a5558), applied once to the unified
+ * walk's delivered set. The first {@link CONTEXT_PACK_TAIL_TRIM_KEEP}
+ * items are immune - position, not score, shields the head, so the
+ * synthesized attention item (always unshifted first) is never scored,
+ * dropped or reordered. Every later item whose query-term coverage is
+ * at least {@link TAIL_TRIM_KEEP_FRACTION} of the top delivered item's
+ * is kept; the rest drop WHOLE - never partially re-cut - each becoming
+ * a {@link TAIL_TRIM_SKIP_REASON} skip. The freed budget is then
+ * offered to `over-budget` candidates in walk (priority) order: one
+ * that clears the same bar is re-admitted as a normal item - its
+ * `over-budget` skip is retracted, since it was delivered - and one
+ * that does not clear the bar, or that does not fit inside the budget
+ * the trim freed, keeps its skip - the rescue re-spends what the trim
+ * freed, never the slack the walk happened to leave under `maxTokens`.
+ * Returns the trimmed item list in delivery order (head, kept tail,
+ * rescued), the tokens now spent (`used`), and the raw counters the
+ * report is computed from - so a later ceiling that cuts the trim's
+ * own output can recount it against what actually shipped.
+ */
+function applyTailTrim(
+  items: ReadonlyArray<ContextPackItem>,
+  used: number,
+  skipped: ReadonlyArray<ContextPackSkipped>,
+  rescueCandidates: ReadonlyArray<TailTrimRescueCandidate>,
+  scoreById: ReadonlyMap<string, number>,
+  maxTokens: number,
+  densityRanking: boolean,
+  densityScoreById: ReadonlyMap<string, number>,
+): {
+  readonly items: ReadonlyArray<ContextPackItem>;
+  readonly used: number;
+  readonly skipped: ReadonlyArray<ContextPackSkipped>;
+  readonly counters: TailTrimCounters;
+} {
+  const keepCount = Math.min(CONTEXT_PACK_TAIL_TRIM_KEEP, items.length);
+  const head = items.slice(0, keepCount);
+  const tail = items.slice(keepCount);
+  let topScore = 0;
+  for (const item of items) topScore = Math.max(topScore, scoreById.get(item.id) ?? 0);
+  const keepBar = topScore * TAIL_TRIM_KEEP_FRACTION;
+  const keptTail: ContextPackItem[] = [];
+  const dropped: ContextPackItem[] = [];
+  for (const item of tail) {
+    if ((scoreById.get(item.id) ?? 0) >= keepBar) keptTail.push(item);
+    else dropped.push(item);
+  }
+  let keptUsed = 0;
+  for (const item of head) keptUsed += item.tokens;
+  for (const item of keptTail) keptUsed += item.tokens;
+  const freedTokens = used - keptUsed;
+  const rescuedItems: ContextPackItem[] = [];
+  const rescuedIds = new Set<string>();
+  let rescuedTokens = 0;
+  for (const entry of rescueCandidates) {
+    if ((scoreById.get(entry.candidate.id) ?? 0) < keepBar) continue;
+    // The freed budget is the rescue's whole allowance: the trim dropped
+    // these tokens, and re-admission may spend them and no more. (This
+    // also keeps the maxTokens bound, which every kept item already fits
+    // and the freed tokens never exceed.)
+    if (rescuedTokens + entry.tokens > freedTokens) continue;
+    rescuedItems.push(
+      toContextPackItem(
+        entry.candidate,
+        entry.body,
+        entry.trimmed,
+        entry.tokens,
+        densityRanking,
+        densityScoreById,
+      ),
+    );
+    rescuedIds.add(entry.candidate.id);
+    rescuedTokens += entry.tokens;
+  }
+  return {
+    items: [...head, ...keptTail, ...rescuedItems],
+    used: keptUsed + rescuedTokens,
+    skipped: [
+      ...skipped.filter((s) => !rescuedIds.has(s.id)),
+      ...dropped.map((d): ContextPackSkipped => ({
+        id: d.id,
+        tokens: d.tokens,
+        reason: TAIL_TRIM_SKIP_REASON,
+      })),
+    ],
+    counters: Object.freeze({
+      dropped: dropped.length,
+      freedTokens,
+      keptTailTokens: new Map(keptTail.map((item) => [item.id, item.tokens])),
+      rescuedTokens: new Map(rescuedItems.map((item) => [item.id, item.tokens])),
+    }),
+  };
+}
+
+/**
+ * What one lane's trim delivered, in ids and tokens rather than finished
+ * counts: a ceiling that runs after the trim can cut the trim's own
+ * rescued or kept-tail items, and the report must then describe what
+ * actually shipped, not what the trim alone decided.
+ */
+interface TailTrimCounters {
+  /** Tail items the trim dropped whole; never reduced by a later ceiling. */
+  readonly dropped: number;
+  /** Tokens the trim freed. */
+  readonly freedTokens: number;
+  /** Kept-tail items by id, with their token cost. */
+  readonly keptTailTokens: ReadonlyMap<string, number>;
+  /** Rescued items by id, with the tokens re-admitting each cost. */
+  readonly rescuedTokens: ReadonlyMap<string, number>;
+}
+
+/**
+ * The trim report over the set that actually ships: kept-tail and
+ * rescued counters count only ids still present in `keptIds`, and
+ * `tokensSaved` nets the re-spend of the rescued survivors against the
+ * freed tokens - never negative, since the rescue's whole allowance is
+ * the freed budget.
+ */
+function tailTrimReportOf(
+  trim: TailTrimCounters,
+  keptIds: ReadonlySet<string>,
+): ContextPackTailTrimReport {
+  let keptByQueryTerms = 0;
+  for (const id of trim.keptTailTokens.keys()) {
+    if (keptIds.has(id)) keptByQueryTerms += 1;
+  }
+  let rescued = 0;
+  let reSpent = 0;
+  for (const [id, tokens] of trim.rescuedTokens) {
+    if (!keptIds.has(id)) continue;
+    rescued += 1;
+    reSpent += tokens;
+  }
+  return Object.freeze({
+    dropped: trim.dropped,
+    keptByQueryTerms,
+    rescued,
+    tokensSaved: trim.freedTokens - reSpent,
+  });
 }
 
 /**
@@ -1427,8 +1724,23 @@ function finalizeContextPackReport(
    * reported, but without the tension id, which embeds both subject ids.
    */
   withheldIds: ReadonlySet<string> = new Set(),
+  /**
+   * The score-aware tail trim's counters (t_cb6a5558) when the trim ran
+   * in the passing path. Attached before the receipt and telemetry are
+   * emitted so the counters ride both; null on every path that did not
+   * trim (the packing-policy branch, the zero-budget short-circuit, an
+   * absent option or a tokenless query), keeping those reports
+   * byte-identical.
+   */
+  tailTrim: ContextPackTailTrimReport | null = null,
 ): ContextPackReport {
   let enriched = report;
+  // Conditional tail-trim counters (t_cb6a5558). Attached first so the
+  // receipt budget and the telemetry metadata below read them off the
+  // enriched report; absent on every path that did not trim.
+  if (tailTrim !== null) {
+    enriched = { ...enriched, tailTrim: Object.freeze(tailTrim) };
+  }
   // Conditional entity-facts rollup (dated commitments, t_43b0a379).
   // Attached in the one funnel every return path passes through, so the
   // zero-budget pack, the char-budget-degraded packs and the
@@ -1489,7 +1801,7 @@ function finalizeContextPackReport(
         evidenceRefs: item.evidenceRefs,
       })),
       finalText: report.items.map((item) => item.body).join("\n\n"),
-      budget: contextPackBudgetMetadata(opts, report),
+      budget: contextPackBudgetMetadata(opts, enriched),
       ...(opts.recallAdequacy ? { adequacy: opts.recallAdequacy } : {}),
       ...(opts.recallAdequacy && opts.decisionAnswerable
         ? { decisionAnswerable: opts.decisionAnswerable }
@@ -1512,7 +1824,7 @@ function finalizeContextPackReport(
       gaps: contextPackGaps(report),
       metadata: {
         ...(telemetryOptions.metadata ?? {}),
-        ...contextPackBudgetMetadata(opts, report),
+        ...contextPackBudgetMetadata(opts, enriched),
         skipped_count: report.skipped.length,
         lanes: opts.includeLanes === true,
         ...(enriched.receiptId ? { receipt_id: enriched.receiptId } : {}),
@@ -1580,6 +1892,17 @@ function contextPackBudgetMetadata(
     // PACKING_POLICIES vocabulary - which names nothing sensitive - and
     // an unnamed caller's records never grow the key.
     ...(opts.packingPolicy !== undefined ? { packing_policy: opts.packingPolicy } : {}),
+    // The trim counters ride along only when the trim ran (t_cb6a5558):
+    // a pack that never trimmed keeps its receipt and telemetry metadata
+    // byte-identical.
+    ...(report.tailTrim !== undefined
+      ? {
+          tail_trim_dropped: report.tailTrim.dropped,
+          tail_trim_kept_by_query_terms: report.tailTrim.keptByQueryTerms,
+          tail_trim_rescued: report.tailTrim.rescued,
+          tail_trim_tokens_saved: report.tailTrim.tokensSaved,
+        }
+      : {}),
   };
 }
 

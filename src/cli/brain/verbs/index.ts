@@ -102,6 +102,7 @@ export { cmdBrainTrigger } from "./trigger.ts";
 export { cmdBrainDeepSynthesis } from "./deep-synthesis.ts";
 export { cmdBrainDiarize } from "./diarize.ts";
 export { cmdBrainExtractSignals } from "./extract-signals.ts";
+export { cmdBrainDeadLetters } from "./dead-letters.ts";
 export { cmdBrainDesignNote } from "./design-note.ts";
 export { cmdBrainIdeas } from "./ideas.ts";
 export { cmdBrainEntity } from "./entity.ts";
@@ -141,6 +142,7 @@ export {
   cmdBrainSessionGrep,
 } from "./session-recall.ts";
 export { cmdBrainLint } from "./lint.ts";
+export { cmdBrainValidate } from "./validate.ts";
 export { cmdBrainActions } from "./actions.ts";
 export { cmdBrainSummary } from "./summary.ts";
 export { cmdBrainUnlinked } from "./unlinked.ts";

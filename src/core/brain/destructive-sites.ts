@@ -115,6 +115,15 @@ const UNARCHIVED_EXCLUDED: RecoverabilityFacts = Object.freeze({
 });
 
 /**
+ * No archive behind it, and no bytes reachable at all: the call removes
+ * a directory entry that is empty by construction the moment it runs.
+ */
+const EMPTY_SHELL_ONLY: RecoverabilityFacts = Object.freeze({
+  recoveryPoint: false,
+  blastRadius: Object.freeze({}),
+});
+
+/**
  * Every destructive site under `src/core/brain/` that is not routed
  * through the destructive gate, with the argument for why the removal
  * is accounted for anyway.
@@ -492,6 +501,20 @@ export const DESTRUCTIVE_SITES: Readonly<Record<string, DestructiveSiteDeclarati
         "it and why the DELETE arm of the same module is behind the gate instead - including " +
         "the `--delete-linked` cascade, whose extra unlinks all sit inside that one gate call " +
         "and whose Brain-resident half the archive therefore does hold.",
+    },
+
+    "src/core/brain/notes/folder-lifecycle.ts": {
+      calls: ["rmdirSync", "unlinkSync"],
+      recovery: EMPTY_SHELL_ONLY,
+      reason:
+        "prunes the moved folder's own emptied directories after every file of the move set " +
+        "has relocated: `rmdirSync` refuses a non-empty directory, so a folder whose " +
+        "subtree still holds a failed file - or any file this surface does not address - " +
+        "keeps it, which is exactly where the report says the bytes are. The one " +
+        "`unlinkSync` drops a destination name a mid-set fault linked after the source " +
+        "name's own drop had already failed: the source name still holds that inode, so " +
+        "the bytes outlive the removal and the failure report's kept-path claim stays " +
+        "true. No file bytes are ever reached: both removals take names, never bytes.",
     },
 
     // --- Outside the vault entirely --------------------------------------

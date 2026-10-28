@@ -64,6 +64,12 @@
  * reported with the `o2b install <target> --apply` recovery line, never
  * rewritten.
  *
+ * The `client_versions` probe (t_8e49ec96) slots beside it and reads the
+ * SAME manifest: one fail-soft, read-only, async version ask per recorded
+ * client, graded pass/unknown/skipped and never `fail`, because a version
+ * row never proves a surface broken. Its rows travel on the verdict's
+ * optional `rows` member, which no other probe sets.
+ *
  * The `writeback_contract` probe (t_7c01bb39) is check-only in the same
  * way: it audits whether the workspace agent-instruction file(s) carry
  * the same-turn atomic-fact memory write gate. The contract itself - the
@@ -132,6 +138,7 @@ export const READINESS_PROBE = {
   runtimeAdapterWiring: "runtime_adapter_wiring",
   installedRuntimes: "installed_runtimes",
   registeredCommands: "registered_commands",
+  clientVersions: "client_versions",
   writebackContract: "writeback_contract",
   decisionModel: "decision_model",
 } as const;
@@ -303,6 +310,27 @@ export function isReadinessStatus(value: unknown): value is ReadinessStatus {
 export interface ReadinessVerdict {
   readonly status: ReadinessStatus;
   readonly detail: string;
+  /**
+   * Per-target machine rows, set ONLY by the `client_versions` probe
+   * (t_8e49ec96). Absent on every other probe. Additive and safe: the
+   * readiness JSON exists only under `--readiness`, so no byte-identical
+   * output contract is stressed, and `readiness_summary` is untouched -
+   * a fully-unknown version probe keeps the exit at
+   * `DOCTOR_EXIT.probeIncomplete`, never a `fail`.
+   */
+  readonly rows?: ReadonlyArray<ReadinessVersionRow>;
+}
+
+/** One client's answer inside a `client_versions` verdict. */
+export interface ReadinessVersionRow {
+  /** The install-manifest target the row was asked about. */
+  readonly target: string;
+  /** pass (answered), unknown (no usable answer), skipped (nothing to ask). */
+  readonly status: ReadinessStatus;
+  /** The client's own first stdout line when it answered; `null` otherwise. */
+  readonly version: string | null;
+  /** Why the row graded as it did, never empty. */
+  readonly detail: string;
 }
 
 /** A completed probe: its verdict plus the name and wall-clock duration. */
@@ -335,6 +363,16 @@ export interface ReadinessOptions {
   readonly env?: Readonly<Record<string, string | undefined>>;
   /** Per-check timeout budget; defaults to {@link DEFAULT_READINESS_TIMEOUT_MS}. */
   readonly perCheckTimeoutMs?: number;
+  /**
+   * Ask one client binary its version. Injected only by tests, which
+   * cannot install clients; the product spawns `argv` asynchronously
+   * (see {@link probeClientVersions} for why async). A throw reads
+   * `unknown`, never `fail` - the same contract
+   * {@link isWriterLockHeld}-style probes observe.
+   */
+  readonly clientVersionRunner?: (
+    argv: ReadonlyArray<string>,
+  ) => Promise<{ readonly exitCode: number; readonly stdout: string }>;
 }
 
 // ----- Timeout wrapper ------------------------------------------------------
@@ -1086,6 +1124,381 @@ function probeRegisteredEntries(
   return { target, status: worst, detail: summaries.join("; ") };
 }
 
+// ----- client_versions (t_8e49ec96) -----------------------------------------
+
+/**
+ * The version command asked of each install target's client, and the one
+ * target with no client binary of its own.
+ *
+ * A client INSTALLED but never registered through Open Second Brain is out
+ * of scope by construction: detection comes from the install manifest,
+ * exactly like `registered_commands`, so the probe asks only the clients
+ * this tool recorded.
+ *
+ * Binary names are pinned to each adapter's own spawn precedent
+ * (`copilot-cli.ts` spawns `copilot --version`; `codex.ts` resolves `codex`
+ * via `Bun.which`; `gemini-cli.ts`'s notes name `gemini`) and to each
+ * client's documented CLI. `generic` writes a user-named config and has no
+ * client binary of its own, so it is skipped by name rather than probed.
+ * A correction to a row is a one-line follow-up in this table's own module.
+ */
+const CLIENT_VERSION_COMMANDS: Readonly<Record<string, ReadonlyArray<string> | null>> =
+  Object.freeze({
+    aider: ["aider", "--version"],
+    codex: ["codex", "--version"],
+    "copilot-cli": ["copilot", "--version"],
+    cursor: ["cursor", "--version"],
+    "gemini-cli": ["gemini", "--version"],
+    grok: ["grok", "--version"],
+    kiro: ["kiro", "--version"],
+    opencode: ["opencode", "--version"],
+    pi: ["pi", "--version"],
+    generic: null,
+  });
+
+/**
+ * Clients format their version freely ("codex-cli 0.9.0", "GitHub Copilot
+ * CLI 1.0.5"), so the raw line is the value and nothing is parsed - but a
+ * runaway first line must not carry a readiness payload, so it is capped.
+ */
+const CLIENT_VERSION_MAX_LENGTH = 200;
+
+/**
+ * The product runner: an ASYNC spawn, not `spawnSync`.
+ *
+ * `probeInstalledRuntimes`' docblock records the cost of the synchronous
+ * kind: it blocks the event loop, so the timeout timer that is meant to
+ * cut a hung probe off cannot fire behind it. This probe's version ask is
+ * exactly the kind of subprocess a hung binary would wedge, so it runs on
+ * the promise machinery the per-probe budget already covers. Read-only and
+ * fail-soft: the child inherits the environment and writes nothing.
+ *
+ * The ask carries a child-level budget of its own (defaulting to the
+ * per-probe budget, {@link DEFAULT_READINESS_TIMEOUT_MS}): the probe-level
+ * wrapper can only abandon the promise it awaits, so a hung `--version`
+ * child would otherwise survive the cut as an orphan. The child's exit is
+ * raced against the timer here, and the child itself is killed when the
+ * timer wins - SIGTERM first, then SIGKILL after a short grace
+ * ({@link CLIENT_KILL_GRACE_MS}), because a client that traps or ignores
+ * TERM would otherwise outlive doctor together with everything it
+ * spawned. stderr is ignored, not piped: nothing observes it, and a pipe
+ * a chatty child fills unread would block the child on write.
+ *
+ * stdout is drained INCREMENTALLY, never as one await of EOF: a client
+ * whose `--version` forks a background helper that inherits stdout (an
+ * update checker, a daemon) prints its version and exits 0 while the
+ * helper keeps the pipe open, so an EOF-await would time out an ask that
+ * was actually answered. The drain settles at the first newline - the
+ * only thing the grader reads - or at EOF, or, once the child has
+ * exited, at a short bounded window ({@link STDOUT_DRAIN_WINDOW_MS})
+ * over whatever stdout has already buffered.
+ */
+export async function spawnClientVersion(
+  argv: ReadonlyArray<string>,
+  timeoutMs: number = DEFAULT_READINESS_TIMEOUT_MS,
+): Promise<{ exitCode: number; stdout: string }> {
+  const child = Bun.spawn({ cmd: [...argv], stdout: "pipe", stderr: "ignore" });
+  let exited = false;
+  void child.exited.then(() => {
+    exited = true;
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const budget = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        /* already gone */
+      }
+      // SIGTERM can be trapped or ignored, and the escalation must
+      // outlive this function - the budget rejects now, the grace timer
+      // keeps its appointment regardless. A child that answered in
+      // between is already reaped and is left alone.
+      setTimeout(() => {
+        if (!exited) {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            /* already gone */
+          }
+        }
+      }, CLIENT_KILL_GRACE_MS);
+      reject(new ReadinessTimeoutError(`client version ${argv[0]}`, timeoutMs));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      (async () => {
+        // The drain starts immediately so a child writing past the pipe
+        // buffer is consumed rather than wedged on write, but the ask
+        // settles on the child's EXIT, not on the pipe closing.
+        const drained = drainVersionStdout(child.stdout, child.exited);
+        const exitCode = await child.exited;
+        const stdout = await drained;
+        return { exitCode, stdout };
+      })(),
+      budget,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * How long the drain keeps reading past the child's exit before
+ * returning what stdout has buffered: a helper holding the pipe can keep
+ * EOF from ever arriving, and the buffered bytes are already there - the
+ * window is the bound that turns them into an answer instead of a
+ * timeout. Long enough to be a rounding error on a real spawn, short
+ * enough to never matter against the ask's budget.
+ */
+const STDOUT_DRAIN_WINDOW_MS = 250;
+
+/** The gap between the budget's SIGTERM and its SIGKILL follow-up. */
+const CLIENT_KILL_GRACE_MS = 250;
+
+/**
+ * Read the child's stdout incrementally, settling at the first newline
+ * (the version is graded from the raw first line and nothing beyond it),
+ * at EOF, or - once `exited` resolves - at the bounded window, returning
+ * whatever has buffered by then. A read that rejects (the stream erroring
+ * while a helper still holds the pipe) returns what buffered too, never
+ * rejects the ask.
+ */
+async function drainVersionStdout(
+  stream: ReadableStream<Uint8Array>,
+  exited: Promise<unknown>,
+): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  // Armed once per ask: the window opens when the child exits, not when
+  // the drain starts, so a child that answers late is not penalized.
+  const windowCloses: Promise<null> = exited
+    .then(
+      () => Bun.sleep(STDOUT_DRAIN_WINDOW_MS),
+      () => Bun.sleep(STDOUT_DRAIN_WINDOW_MS),
+    )
+    .then(() => null);
+  for (;;) {
+    const read = reader.read().then(
+      (chunk) => ({ chunk }),
+      () => null,
+    );
+    const settled = await Promise.race([read, windowCloses]);
+    if (settled === null) return text;
+    if (settled.chunk.done || settled.chunk.value === undefined) return text;
+    text += decoder.decode(settled.chunk.value, { stream: true });
+    if (text.includes("\n")) return text;
+  }
+}
+
+/**
+ * The ask's own budget, derived from the probe's: the normal ask keeps a
+ * fifth of the probe budget in reserve (the 80% share), floored at 50 ms
+ * so a real spawn never answers against nothing. The floor is capped at
+ * the probe budget minus a margin, less whatever the probe already
+ * spent, so the ask's timer expires strictly BEFORE the probe-level
+ * wrapper's - which was armed first and expires at a fixed point - even
+ * though each ask's timer is armed later, one spawn at a time. The
+ * wrapper can then only ever fire on a child that ignored its own
+ * (earlier) budget, and the verdict that carries the rows wins the race.
+ * Under the floor the ask dies the margin before the wrapper, so the
+ * verdict still carries its rows, each naming its own timeout; a
+ * degenerate budget clamps at zero instead of going negative, and the
+ * row says timed out after 0ms - a measurement that had no budget, never
+ * a negative one.
+ */
+export function clientAskBudgetMs(probeBudgetMs: number, elapsedMs: number = 0): number {
+  return Math.max(
+    0,
+    Math.min(
+      probeBudgetMs - CLIENT_ASK_MARGIN_MS - Math.max(0, elapsedMs),
+      Math.max(50, Math.floor(probeBudgetMs * 0.8)),
+    ),
+  );
+}
+
+/** First stdout line, trimmed and length-capped - the raw line, never parsed. */
+function firstVersionLine(stdout: string): string | null {
+  const line = stdout.split("\n")[0]?.trim() ?? "";
+  if (line === "") return null;
+  return line.length > CLIENT_VERSION_MAX_LENGTH ? line.slice(0, CLIENT_VERSION_MAX_LENGTH) : line;
+}
+
+/**
+ * One manifest target's version answer, graded pass/unknown/skipped and
+ * never `fail`: "the client answered with a version" is the only measured
+ * fact here, and no version row proves a surface broken - resolvability
+ * itself is `registered_commands`' finding, and a client this doctor's
+ * PATH cannot see may still resolve for the host that spawns it. An
+ * unanswered row therefore points at that probe's finding rather than
+ * raising this one's own alarm.
+ */
+async function clientVersionRow(
+  target: string,
+  runner: (argv: ReadonlyArray<string>) => Promise<{ exitCode: number; stdout: string }>,
+): Promise<ReadinessVersionRow> {
+  const argv = CLIENT_VERSION_COMMANDS[target];
+  if (argv === undefined) {
+    // Loud, never silent: a manifest target the table does not know is a
+    // table that lags the adapter registry, and the row names the fix.
+    return {
+      target,
+      status: READINESS_STATUS.unknown,
+      version: null,
+      detail: `no version command is known for target '${target}' - extend CLIENT_VERSION_COMMANDS`,
+    };
+  }
+  if (argv === null) {
+    return {
+      target,
+      status: READINESS_STATUS.skipped,
+      version: null,
+      detail: "no client binary of its own (it writes a user-named config) - nothing to ask",
+    };
+  }
+  let answered: { exitCode: number; stdout: string };
+  try {
+    answered = await runner(argv);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    const pointer = "resolvability is 'registered_commands' finding, so this row is not a fail";
+    return {
+      target,
+      status: READINESS_STATUS.unknown,
+      version: null,
+      detail:
+        code === "ENOENT"
+          ? `${argv[0]} is not on the doctor's PATH (ENOENT; the host may still resolve it); ${pointer}`
+          : `the version ask failed (${code ?? "unknown error"}): ${flattenReason((err as Error).message)}; ${pointer}`,
+    };
+  }
+  if (answered.exitCode !== 0) {
+    return {
+      target,
+      status: READINESS_STATUS.unknown,
+      version: null,
+      detail: `${argv[0]} exited ${answered.exitCode} with no version; ${argv.join(" ")} did not answer`,
+    };
+  }
+  const version = firstVersionLine(answered.stdout);
+  if (version === null) {
+    return {
+      target,
+      status: READINESS_STATUS.unknown,
+      version: null,
+      detail: `${argv[0]} answered with no version output; ${argv.join(" ")} exited 0 but printed nothing`,
+    };
+  }
+  return {
+    target,
+    status: READINESS_STATUS.pass,
+    version,
+    detail: `${argv.join(" ")} answered: ${version}`,
+  };
+}
+
+/**
+ * The wall-clock headroom the ask's own timer keeps below the probe-level
+ * wrapper's fixed expiry: timers carry millisecond precision and the
+ * asks' timers are armed one spawn after another, so the margin - not a
+ * one-millisecond subtraction - is what keeps every ask's expiry strictly
+ * earlier than the wrapper's.
+ */
+const CLIENT_ASK_MARGIN_MS = 5;
+
+/**
+ * Which version of each detected agent client answered (t_8e49ec96).
+ *
+ * Slot beside `registered_commands` and read the SAME detection source -
+ * the install manifest - because "which clients are here" is a question
+ * that must not grow two answers. Read-only, fail-soft, and graded
+ * pass/unknown/skipped with no `fail`: a version row never proves a
+ * surface broken, so a fully-unknown probe keeps the doctor exit at
+ * `DOCTOR_EXIT.probeIncomplete` (6), never 1.
+ *
+ * There is deliberately no minimum-version table in v1: no `minVersion`
+ * column, no config surface. Adding one is a design decision (what a
+ * below-minimum row should DO to the exit code) to settle when a consumer
+ * exists, not a column to ship half-decided.
+ */
+export async function probeClientVersions(opts: ReadinessOptions): Promise<ReadinessVerdict> {
+  // The probe's own start, before anything is read: the wrapper's timer
+  // was armed just before this call, so every ask's budget is measured
+  // against this instant - the manifest read and the earlier spawns spend
+  // the asks' shared share, never the wrapper's margin.
+  const startedAtMs = Date.now();
+  let manifest;
+  try {
+    manifest = readManifest(opts.vault);
+  } catch (err) {
+    return {
+      status: READINESS_STATUS.unknown,
+      detail:
+        "install manifest could not be read, so no client version could be asked: " +
+        flattenReason((err as Error).message),
+    };
+  }
+  const installs = Object.values(manifest.installs);
+  if (installs.length === 0) {
+    return {
+      status: READINESS_STATUS.skipped,
+      detail: "install manifest records no installs; no client version to ask",
+    };
+  }
+  // The asks run TOGETHER, and each child's own budget stays below the
+  // probe's, so a verdict that carries the rows always wins the race
+  // against the probe-level cutoff. Sequential asks could spend the
+  // whole probe budget on the first slow client - the cutoff would then
+  // replace every answered row with a bare timeout while the loop kept
+  // spawning children nobody awaited any more.
+  const probeBudgetMs = opts.perCheckTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
+  // Each ask's budget is read at ask time against the probe's own start,
+  // so the manifest read and the time spawning the earlier children took
+  // come off the later asks' share, never off the wrapper's margin. A
+  // budget with nothing left spawns nothing: a child started only to be
+  // killed on a zero timer would race its own first tick.
+  const ask =
+    opts.clientVersionRunner ??
+    ((argv: ReadonlyArray<string>) => {
+      const budgetMs = clientAskBudgetMs(probeBudgetMs, Date.now() - startedAtMs);
+      return budgetMs <= 0
+        ? Promise.reject(new ReadinessTimeoutError(`client version ${argv[0]}`, 0))
+        : spawnClientVersion(argv, budgetMs);
+    });
+  // Promise.all preserves the manifest's order, whichever ask settles first.
+  const rows: ReadinessVersionRow[] = await Promise.all(
+    installs.map((entry) => clientVersionRow(entry.target, ask)),
+  );
+  const counts = countByStatus(rows.map((row) => row.status));
+  // The rows carry every client's own answer on every surface that reads
+  // this verdict - the human renderer prints one line per row, and the
+  // JSON report carries the rows array - so the detail stays the census
+  // and never repeats what the rows already say.
+  const census = `(${counts.pass} pass, ${counts.unknown} unknown, ${counts.skipped} skipped)`;
+  const base = { rows: Object.freeze(rows) };
+  if (counts.unknown > 0) {
+    return {
+      ...base,
+      status: READINESS_STATUS.unknown,
+      detail: `could not read ${counts.unknown} client version(s) ${census} - each row names its own`,
+    };
+  }
+  if (counts.skipped > 0) {
+    return {
+      ...base,
+      status: READINESS_STATUS.skipped,
+      detail: `nothing to ask of ${counts.skipped} of ${rows.length} target(s) ${census}`,
+    };
+  }
+  return {
+    ...base,
+    status: READINESS_STATUS.pass,
+    detail: `${counts.pass} client version(s) answered ${census}`,
+  };
+}
+
 function extractRegisteredCommands(raw: string): CommandExtraction {
   const fromJson = extractFromJsonConfig(raw);
   if (fromJson !== null) return fromJson;
@@ -1390,6 +1803,7 @@ export const DEFAULT_PROBES: ReadonlyArray<NamedProbe> = [
   { name: READINESS_PROBE.runtimeAdapterWiring, fn: probeRuntimeAdapterWiring },
   { name: READINESS_PROBE.installedRuntimes, fn: probeInstalledRuntimes },
   { name: READINESS_PROBE.registeredCommands, fn: probeRegisteredCommands },
+  { name: READINESS_PROBE.clientVersions, fn: probeClientVersions },
   { name: READINESS_PROBE.writebackContract, fn: probeWritebackContract },
   { name: READINESS_PROBE.decisionModel, fn: probeDecisionModel },
 ];

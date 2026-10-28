@@ -29,6 +29,7 @@ import { gatedOwnerScopeView } from "../../core/brain/owner-scope-view.ts";
 import type { DoctorIssue } from "../../core/brain/types.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { coerceBool, coerceFormat } from "../coerce.ts";
+import { redactErrorForCaller } from "../error-redaction.ts";
 import { vaultRelativeSafe } from "./shared.ts";
 import { readableAtContextReach, readableAtContextReachOrUndefined } from "./reach-readable.ts";
 import { findingRefs } from "./hygiene-tools.ts";
@@ -396,7 +397,42 @@ async function toolBrainStatus(
       ? {}
       : { keepFinding: (finding) => findingView.row(...findingRefs(ctx.vault, finding)) }),
   });
-  return { format, ...snapshot };
+  // Below local reach the lock PATH is withheld while every state field
+  // stays: the path is a resolved host path (the index may live outside
+  // the vault), and `state_files.search_index` already answers presence
+  // without it - the same split the collect errors above make between a
+  // local message and a closed one. The refusal REASON goes through the
+  // same split: a probe that threw embeds the stat'd host path in its
+  // message (proper-lockfile's fs errors carry it verbatim), so below
+  // local reach the message is redacted the way every error leaving the
+  // process is (server.ts's `redactedErrorMessage`, which the core
+  // snapshot layer cannot import) - the errno keeps, the path becomes a
+  // placeholder.
+  const local = contextReach(ctx) === TRANSPORT_REACH.local;
+  const store = local
+    ? snapshot.store
+    : {
+        ...snapshot.store,
+        writerLockPath: null,
+        ...(snapshot.store.writerLockReason !== null
+          ? {
+              writerLockReason: redactErrorForCaller(
+                snapshot.store.writerLockReason,
+                ctx.vault,
+                contextReach(ctx),
+                // The resolved index path may sit outside every root the
+                // redactor knows (a custom index location) - the fs error
+                // embeds its `.lock` spelling verbatim, and the path is
+                // already resolved here, so it goes to the scrubber as a
+                // literal beside the roots.
+                snapshot.store.writerLockPath !== null
+                  ? [snapshot.store.writerLockPath, `${snapshot.store.writerLockPath}.lock`]
+                  : [],
+              ),
+            }
+          : {}),
+      };
+  return { format, ...snapshot, store };
 }
 
 // ----- Serializers ---------------------------------------------------------

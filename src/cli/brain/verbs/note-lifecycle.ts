@@ -1,11 +1,15 @@
 /**
  * `o2b brain note-lifecycle <action> <path> [<to>]` - rename, move,
- * archive and delete for note FILES (B2).
+ * archive and delete for note FILES (B2), plus the folder actions
+ * `move-folder` and `rename-folder` (t_9571a47f).
  *
- * CLI mirror of the `brain_note_lifecycle` MCP tool; both delegate to
- * `core/brain/notes/lifecycle.ts`, so the path envelope, the
+ * CLI mirror of the `brain_note_lifecycle` MCP tool. The file actions
+ * delegate to `core/brain/notes/lifecycle.ts`; the folder actions
+ * delegate to `core/brain/notes/folder-lifecycle.ts`, the module that
+ * runs them - the vocabulary is one constant, but the machinery is two
+ * modules, and the surface owns the dispatch. The path envelope, the
  * confirmation ladder, the count guard and the recoverability verdict
- * cannot come to mean two different things on two surfaces.
+ * therefore cannot come to mean two different things on two surfaces.
  *
  * Distinct from `o2b brain lifecycle`, which is the BELIEF lifecycle and
  * moves no bytes. The two verbs sit beside each other on purpose rather
@@ -22,14 +26,28 @@
  * mentions it in prose is reported, never deleted. The receipt then
  * prints two lists rather than a count: what will go, and what is
  * reported and stays.
+ *
+ * A folder action moves MARKDOWN ONLY - the move set is the same note
+ * population every lifecycle surface addresses - and the folder receipt
+ * says what that honestly costs: attachments and other non-Notes files
+ * are named in `left_behind`, and a moved note's relative Markdown links
+ * or images whose target stayed behind are named in
+ * `dangling_relative_links` (rendered on the human receipt beside the
+ * residue, with the "only Markdown moves" statement in the line).
  */
 
 import { defaultConfigPath } from "../../../core/config.ts";
+import {
+  folderLifecycle,
+  isFolderLifecycleAction,
+  type FolderLifecycleResult,
+} from "../../../core/brain/notes/folder-lifecycle.ts";
 import {
   isNoteLifecycleAction,
   noteLifecycle,
   NOTE_LIFECYCLE_ACTIONS,
   type NoteLifecycleResult,
+  type NoteReferenceReport,
 } from "../../../core/brain/notes/lifecycle.ts";
 import { normalizeFlagString, ok, okJson, parse, resolveBrainVault } from "../helpers.ts";
 
@@ -38,6 +56,40 @@ const USAGE_ERROR_EXIT = 2;
 function usageError(message: string): number {
   process.stderr.write(`error: ${message}\n`);
   return USAGE_ERROR_EXIT;
+}
+
+/**
+ * The reference report, identical on both lifecycle machines - the folder
+ * result carries the same {@link NoteReferenceReport} the file result
+ * does, so the projection is written once.
+ */
+function renderReferences(refs: NoteReferenceReport): Record<string, unknown> {
+  return {
+    files_scanned: refs.filesScanned,
+    inbound_files: [...refs.inboundFiles],
+    files_rewritten: refs.filesRewritten,
+    rewritten_spellings: refs.rewrittenSpellings.map((s) => ({
+      from: s.from,
+      to: s.to,
+    })),
+    rewrite_failures: refs.rewriteFailures.map((f) => ({
+      path: f.path,
+      reason: f.reason,
+    })),
+    basename: refs.basename,
+    index: {
+      state: refs.index.state,
+      last_indexed_at: refs.index.lastIndexedAt,
+      next_command: refs.index.nextCommand,
+    },
+    // `claimed` says a detached refresh run is IN FLIGHT, never that it
+    // has landed; every other value names why nothing was started, and
+    // `refresh_reason` spells that reason - the freshen machinery's own
+    // skip token, or the error it raised - so `not_claimed` is never
+    // the whole answer a caller receives.
+    refresh: refs.refresh,
+    refresh_reason: refs.refreshReason,
+  };
 }
 
 /** The receipt, snake_cased exactly as the MCP tool renders it. */
@@ -54,32 +106,7 @@ function renderJson(res: NoteLifecycleResult): Record<string, unknown> {
     },
     snapshot:
       res.snapshot === null ? null : { run_id: res.snapshot.runId, path: res.snapshot.path },
-    references: {
-      files_scanned: res.references.filesScanned,
-      inbound_files: [...res.references.inboundFiles],
-      files_rewritten: res.references.filesRewritten,
-      rewritten_spellings: res.references.rewrittenSpellings.map((s) => ({
-        from: s.from,
-        to: s.to,
-      })),
-      rewrite_failures: res.references.rewriteFailures.map((f) => ({
-        path: f.path,
-        reason: f.reason,
-      })),
-      basename: res.references.basename,
-      index: {
-        state: res.references.index.state,
-        last_indexed_at: res.references.index.lastIndexedAt,
-        next_command: res.references.index.nextCommand,
-      },
-      // `claimed` says a detached refresh run is IN FLIGHT, never that it
-      // has landed; every other value names why nothing was started, and
-      // `refresh_reason` spells that reason - the freshen machinery's own
-      // skip token, or the error it raised - so `not_claimed` is never
-      // the whole answer a caller receives.
-      refresh: res.references.refresh,
-      refresh_reason: res.references.refreshReason,
-    },
+    references: renderReferences(res.references),
     cascade:
       res.cascade === null
         ? null
@@ -88,6 +115,44 @@ function renderJson(res: NoteLifecycleResult): Record<string, unknown> {
             reported_files: [...res.cascade.reportedFiles],
             scanned_scope: res.cascade.scannedScope,
           },
+  };
+}
+
+/** The folder receipt, snake_cased exactly as the MCP tool renders it. */
+function renderFolderJson(res: FolderLifecycleResult): Record<string, unknown> {
+  return {
+    action: res.action,
+    from: res.from,
+    to: res.to,
+    applied: res.applied,
+    // The report style the folder module answers in: the list of what
+    // relocated, and the per-file list of what did not and why.
+    moved: res.moved.map((m) => ({ from: m.from, to: m.to })),
+    move_failures: res.moveFailures.map((f) => ({ path: f.path, reason: f.reason })),
+    // Absent-when-empty: a move that emptied its source folder carried
+    // nothing through, so the key's presence is the signal.
+    ...(res.leftBehind.length > 0 ? { left_behind: [...res.leftBehind] } : {}),
+    // Absent-when-empty: the relative Markdown links and images the move
+    // left pointing at nothing, named per note and target - a folder move
+    // is a MARKDOWN move, and without this a `files_rewritten: 0` would
+    // read as "nothing broke" while every relative embed dangled.
+    ...(res.danglingRelativeLinks.length > 0
+      ? {
+          dangling_relative_links: res.danglingRelativeLinks.map((l) => ({
+            note: l.note,
+            target: l.target,
+          })),
+        }
+      : {}),
+    recoverability: {
+      state: res.recoverability.state,
+      coverage: [...res.recoverability.coverage],
+      blockers: [...res.recoverability.blockers],
+    },
+    // Always null on this surface: a relocation destroys nothing, so no
+    // recovery point is taken (the rewrite's risk is the verdict's).
+    snapshot: null,
+    references: renderReferences(res.references),
   };
 }
 
@@ -143,6 +208,64 @@ function renderText(res: NoteLifecycleResult): string {
   );
 }
 
+/**
+ * The folder receipt's human line, in the same shape the file receipt
+ * uses - the shared evidence tail rendered identically, with the move
+ * report in the folder module's own style: the moved list printed IN
+ * FULL (a dry run's preview IS this list, so an empty set is printed as
+ * a measurement, never omitted) and a mid-set failure named per file,
+ * never counted.
+ */
+function renderFolderText(res: FolderLifecycleResult): string {
+  const mode = res.applied ? res.action : `${res.action} (plan)`;
+  const refs = res.references;
+  const moved =
+    `  moved (${res.moved.length}):\n` +
+    (res.moved.length === 0
+      ? "    (none)\n"
+      : res.moved.map((m) => `    ${m.from} -> ${m.to}\n`).join(""));
+  // A half-applied move is the one outcome an operator must not scroll
+  // past, so it gets its own line naming every file that kept its old
+  // path - not a count, because the remedy is per file.
+  const split =
+    res.moveFailures.length === 0
+      ? ""
+      : `  NOT moved (still at their old paths):\n` +
+        res.moveFailures.map((f) => `    ${f.path}: ${f.reason}\n`).join("");
+  // Non-Markdown residue is not a failure and not a count - it is named,
+  // in place, so a receipt that reads clean really is clean.
+  const residue =
+    res.leftBehind.length === 0
+      ? ""
+      : `  left behind (still in ${res.from}):\n` +
+        res.leftBehind.map((p) => `    ${p}\n`).join("");
+  // A relative embed the move broke is named in full, not counted - and
+  // the line says what a folder move IS, so the residue reads as the
+  // settled cost of a Markdown-only move rather than as an omission.
+  const dangling =
+    res.danglingRelativeLinks.length === 0
+      ? ""
+      : `  relative links now dangling (only Markdown moves; the target stayed behind):\n` +
+        res.danglingRelativeLinks.map((l) => `    ${l.note}: ${l.target}\n`).join("");
+  return (
+    `${mode}: ${res.from} -> ${res.to}\n` +
+    moved +
+    split +
+    residue +
+    dangling +
+    `  inbound references: ${refs.inboundFiles.length} file(s) of ${refs.filesScanned} scanned, ` +
+    `${refs.filesRewritten} rewritten (basename: ${refs.basename})\n` +
+    `  recoverability: ${res.recoverability.state}` +
+    (res.recoverability.blockers.length > 0 ? ` (${res.recoverability.blockers.join(", ")})` : "") +
+    "\n" +
+    `  search index: ${refs.index.state}` +
+    (refs.index.lastIndexedAt === null ? "" : ` since ${refs.index.lastIndexedAt}`) +
+    `; refresh: ${refs.refresh}` +
+    (refs.refreshReason === null ? "" : ` (${refs.refreshReason})`) +
+    `; next: ${refs.index.nextCommand}`
+  );
+}
+
 export async function cmdBrainNoteLifecycle(argv: string[]): Promise<number> {
   const { flags, positional } = parse(argv, {
     vault: { type: "string" },
@@ -177,6 +300,36 @@ export async function cmdBrainNoteLifecycle(argv: string[]): Promise<number> {
   const vault = resolveBrainVault(flags["vault"] as string | undefined, config);
 
   try {
+    // The surface owns the dispatch: one vocabulary, two machines. A
+    // folder action sent to the file module would be refused
+    // `wrong_action` - the action exists and the caller named it
+    // correctly, so it runs where it lives.
+    if (isFolderLifecycleAction(action)) {
+      // Refused rather than dropped, the file surface's own rule for a
+      // flag its action cannot honour: a folder action is never a
+      // delete, so neither flag has anything to extend.
+      if (flags["confirm"] !== undefined || flags["delete-linked"] !== undefined) {
+        return usageError(
+          `brain note-lifecycle ${action} takes neither --confirm nor --delete-linked: ` +
+            "a folder action is never a delete",
+        );
+      }
+      const res = await folderLifecycle(vault, {
+        action,
+        path,
+        ...(to !== undefined ? { to } : {}),
+        apply: flags["apply"] === true,
+        expect: expectCount,
+        strict: flags["strict"] === true,
+        // The post-write refresh resolves through the config file this
+        // invocation already resolved the vault from, the same rule the
+        // file arm below reads.
+        refreshConfigPath: config,
+      });
+      if (flags["json"] === true) okJson(renderFolderJson(res));
+      else ok(renderFolderText(res));
+      return 0;
+    }
     const res = await noteLifecycle(vault, {
       action,
       path,

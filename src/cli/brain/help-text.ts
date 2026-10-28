@@ -49,7 +49,7 @@ Brain verbs (observing memory):
   note             Append a one-line narrative milestone to Brain/log/today
   lifecycle        Tombstone/supersede a memory, correct one record, resolve chain tips, curator slices
   expire           Set, change or clear a signal's or preference's expiration date
-  note-lifecycle   Note FILES: rename/move/archive/delete one, rewriting inbound links
+  note-lifecycle   Note FILES or FOLDERS: rename/move/archive/delete a file, move/rename a folder, rewriting inbound links
   scaffold-stub    Unresolved wikilink targets: list them, or materialise a stub
   claims           Claim-graph query: current truth, truth-at-T, replaced-by, contested-by
   decision         Decisions: record/outcome/show/list/similar + open questions: open/list_open/show_open/resolve/discard
@@ -165,6 +165,7 @@ Brain verbs (observing memory):
                       the adaptive topic-budget report)
   session-expand      Expand a session recall node to source turns
   lint                Self-healing structural checks (--consolidate); --apply to write
+  validate            Validation gate over --paths or --dirty notes; errors exit 1, --strict warnings exit 2
   actions             Ranked maintenance action list (dedup + lint + footprint)
   summary             Operator dashboard: trust verdict, doctor/dream counts, actions
   unlinked            Raw-text mentions of an artifact's title/aliases outside [[...]]
@@ -185,6 +186,7 @@ Brain verbs (observing memory):
   deep-synthesis      Topic dossier: notes, agreements, contradictions, stale claims, gaps
   diarize             Subject profile: document set, stated-vs-evidenced gap, needs-llm-step skeleton
   extract-signals     Mine taste signals from an imported session's user turns (two-phase, needs-llm-step)
+  dead-letters        Dead extraction writes: list (default) | show <id> | recover <id> (dry-run; --apply --yes to write)
   design-note         One-shot design note grounded in tensions, decisions and truth records
   ideas               Ranked next-direction candidates from open loops (--triggers to enqueue)
   continuity          Export ATOF/ATIF trajectories, rank records by usage decay, promote host memory writes (export and rank are read-only; promote is dry-run by default)
@@ -327,7 +329,7 @@ export const VERB_HELP: Record<string, string> = {
     "memory. An unparseable date, or an id naming no artifact, exits 2 by name.\n" +
     "Create-time expirations come from `o2b brain feedback --expires` instead.\n",
   "note-lifecycle":
-    "usage: o2b brain note-lifecycle <rename|move|archive|delete> <path> [<to>]\n" +
+    "usage: o2b brain note-lifecycle <rename|move|archive|delete|move-folder|rename-folder> <path> [<to>]\n" +
     "  [--apply] [--confirm] [--delete-linked] [--expect <n>] [--strict] [--vault <path>]\n" +
     "  [--config <path>] [--json]\n" +
     "Note FILES, not memories: rename changes the filename in place, move changes the\n" +
@@ -343,6 +345,15 @@ export const VERB_HELP: Record<string, string> = {
     "as is a page citing a second source, as is every user note; the receipt prints\n" +
     "the deletion set and the reported set separately, names the scope it scanned,\n" +
     "and --expect then counts the deletion set.\n" +
+    "The folder actions move a WHOLE folder: move-folder relocates it under a\n" +
+    "destination parent, rename-folder renames it within its parent - the same\n" +
+    "rename/move split as the file actions, so a caller that meant one and spells\n" +
+    "the other is refused wrong_action rather than moved by accident. Every\n" +
+    "destination is checked free before the first rename, so an occupied destination\n" +
+    "refuses with nothing moved and the source untouched; the move set's inbound\n" +
+    "path-spelled links are rewritten in one pass over the successfully moved set,\n" +
+    "and a mid-set failure is named per file (the move_failures response keys, with\n" +
+    "left_behind naming what stayed in the source) with no rollback.\n" +
     "Inbound [[wikilinks]] are rewritten across the vault, minus what vault scope\n" +
     "excludes, minus code fences, and minus Brain/log, which is append-only. The\n" +
     "receipt names how stale the search index now is and the command that fixes it.\n" +
@@ -956,6 +967,24 @@ export const VERB_HELP: Record<string, string> = {
     "The note must weigh named alternatives and mark EXACTLY ONE recommended:\n" +
     "zero and two-plus are both refused, and the refusal states the count.\n" +
     "A note for the same topic on the same day is refused, never overwritten.\n",
+  "dead-letters":
+    "usage: o2b brain dead-letters [list] [--vault <path>] [--json]\n" +
+    "       o2b brain dead-letters show <id> [--vault <path>] [--json]\n" +
+    "       o2b brain dead-letters recover <id> [--dry-run] [--apply] [--yes]\n" +
+    "                        [--agent <name>] [--vault <path>] [--json]\n" +
+    "The exit for a dead letter - the durable record of a multi-artifact\n" +
+    "extraction write that failed part way. `list` (the default) renders\n" +
+    "every letter with its classification - recover, pending, re-extract,\n" +
+    "not_recoverable, resolved - and the exact copy-paste command that\n" +
+    "resolves it; `show <id>` prints one letter in full, missing keys and\n" +
+    "frozen payload named; `recover <id>` re-runs a schema-2 letter's\n" +
+    "frozen payload through the extraction commit at CURRENT vault state,\n" +
+    "so already-written items dedup away and nothing stale is replayed.\n" +
+    "Recover is dry-run by default and previews the per-item verdicts;\n" +
+    "--apply performs the re-run and requires --yes under --json or a\n" +
+    "non-TTY stdin. A frozen vault refuses. NOTHING here deletes a letter:\n" +
+    "a recovered letter is retained, and removing it stays an operator's\n" +
+    "hand action on the named file.\n",
   "extract-signals":
     "usage: o2b brain extract-signals <session-ref> [--vault <vault>] [--agent <name>]\n" +
     "                                  [--payload <json> | --payload-file <path>] [--json]\n" +
@@ -1317,6 +1346,19 @@ export const VERB_HELP: Record<string, string> = {
     "                        older than 180 days with no recent\n" +
     "                        evidence to `_lifecycle: draft`.\n" +
     "Requires --yes in non-interactive mode (--json or non-TTY).\n",
+  validate:
+    "usage: o2b brain validate --paths <path> [--paths <path>...] [--strict] [--vault <path>] [--json]\n" +
+    "       o2b brain validate --dirty [--strict] [--vault <path>] [--json]\n" +
+    "The standalone validation gate for hook-less writers. Runs the exact\n" +
+    "write-receipt page lint over exactly one caller-named page set -\n" +
+    "--paths (vault-relative, repeatable, one flag per page) or --dirty\n" +
+    "(every git-dirty Markdown note, modified, added and untracked) - and\n" +
+    "nothing else, so it is safe inside any gate. The exit code is the\n" +
+    "product, byte-for-byte the doctor contract: an error finding exits 1,\n" +
+    "warnings exit 2 under --strict, a named page the lint could not read\n" +
+    "exits 1, clean exits 0. Report-only: the fixes stay with `brain doctor\n" +
+    "--repair --apply` and `brain lint --consolidate --apply`, which every\n" +
+    "finding's next_command names.\n",
   actions:
     "usage: o2b brain actions [--top-n <n>] [--vault <path>] [--json]\n" +
     "Ranked maintenance action list. Aggregates page-dedup, lint\n" +

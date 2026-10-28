@@ -283,3 +283,200 @@ test("--delete-linked on a rename is a refusal, not a silently ignored flag", as
   expect(res.stderr).toContain("delete-linked");
   expect(existsSync(join(vault, "Projects/Old.md"))).toBe(true);
 });
+
+test("move-folder relocates the folder and renders the move report as JSON", async () => {
+  note("Projects/Old/a.md", "alpha\n");
+  note("Projects/Old/b.md", "beta\n");
+  note("Notes/Ref.md", "pathed [[Projects/Old/a]]\n");
+
+  const res = await runCli([
+    "brain",
+    "note-lifecycle",
+    "move-folder",
+    "Projects/Old",
+    "Archive",
+    "--vault",
+    vault,
+    "--apply",
+    "--json",
+  ]);
+  expect(res.returncode).toBe(0);
+  const body = JSON.parse(res.stdout) as {
+    action: string;
+    from: string;
+    to: string;
+    applied: boolean;
+    moved: Array<{ from: string; to: string }>;
+    move_failures: Array<{ path: string; reason: string }>;
+    snapshot: null;
+    references: { files_rewritten: number; files_scanned: number };
+  };
+  expect(body.action).toBe("move-folder");
+  expect(body.applied).toBe(true);
+  expect(body.from).toBe("Projects/Old");
+  expect(body.to).toBe("Archive/Old");
+  // The moved list, per file, and the per-file failure list - the report
+  // style the folder module's result is read in.
+  expect(body.moved).toEqual([
+    { from: "Projects/Old/a.md", to: "Archive/Old/a.md" },
+    { from: "Projects/Old/b.md", to: "Archive/Old/b.md" },
+  ]);
+  expect(body.move_failures).toEqual([]);
+  // A relocation destroys nothing, so no snapshot rides the receipt.
+  expect(body.snapshot).toBeNull();
+  // Absent-when-empty: a clean move left nothing behind, so the key is
+  // not on the receipt at all - its presence is the signal.
+  expect("left_behind" in body).toBe(false);
+  // No relative link broke either: every target the moved notes name is
+  // a note that moved with the folder.
+  expect("dangling_relative_links" in body).toBe(false);
+  expect(body.references.files_rewritten).toBe(1);
+  expect(existsSync(join(vault, "Archive/Old/a.md"))).toBe(true);
+  expect(existsSync(join(vault, "Archive/Old/b.md"))).toBe(true);
+  expect(existsSync(join(vault, "Projects/Old/a.md"))).toBe(false);
+});
+
+test("a folder action refuses --confirm and --delete-linked instead of dropping them", async () => {
+  note("Projects/Old/a.md", "alpha\n");
+  for (const flag of ["--confirm", "--delete-linked"]) {
+    const res = await runCli([
+      "brain",
+      "note-lifecycle",
+      "move-folder",
+      "Projects/Old",
+      "Archive",
+      flag,
+      "--vault",
+      vault,
+      "--json",
+    ]);
+    expect(res.returncode).toBe(2);
+    expect(res.stderr).toContain("takes neither");
+    expect(res.stderr).toContain("never a delete");
+  }
+  // The refusal answered instead of the move: nothing was applied.
+  expect(existsSync(join(vault, "Projects/Old/a.md"))).toBe(true);
+  expect(existsSync(join(vault, "Archive"))).toBe(false);
+});
+
+test("move-folder names non-Markdown residue and omits the field when clean", async () => {
+  note("Projects/Old/a.md", "alpha\n");
+  writeFileSync(join(vault, "Projects/Old/img.png"), "png\n");
+
+  const res = await runCli([
+    "brain",
+    "note-lifecycle",
+    "move-folder",
+    "Projects/Old",
+    "Archive",
+    "--vault",
+    vault,
+    "--apply",
+    "--json",
+  ]);
+  expect(res.returncode).toBe(0);
+  const body = JSON.parse(res.stdout) as { left_behind?: string[] };
+  expect(body.left_behind).toEqual(["img.png"]);
+
+  // The human receipt names the residue too, in place. The folder holds
+  // a note as well, so there is a move set; only the image stays.
+  note("Projects/Ignored/a.md", "alpha\n");
+  note("Projects/Ignored/keep.png", "png\n");
+  const residueRun = await runCli([
+    "brain",
+    "note-lifecycle",
+    "move-folder",
+    "Projects/Ignored",
+    "Archive",
+    "--vault",
+    vault,
+    "--apply",
+  ]);
+  expect(residueRun.returncode).toBe(0);
+  expect(residueRun.stdout).toContain("left behind (still in Projects/Ignored):");
+  expect(residueRun.stdout).toContain("keep.png");
+});
+
+test("move-folder renders the moved list and failures on the human receipt too", async () => {
+  note("Projects/Old/a.md", "alpha\n");
+  const res = await runCli([
+    "brain",
+    "note-lifecycle",
+    "move-folder",
+    "Projects/Old",
+    "Archive",
+    "--vault",
+    vault,
+    "--apply",
+  ]);
+  expect(res.returncode).toBe(0);
+  expect(res.stdout).toContain("move-folder: Projects/Old -> Archive/Old");
+  expect(res.stdout).toContain("moved (1):");
+  expect(res.stdout).toContain("Projects/Old/a.md -> Archive/Old/a.md");
+});
+
+test("move-folder names the relative embeds a Markdown-only move leaves dangling", async () => {
+  note("Projects/Old/a.md", "![pic](diagram.png)\n");
+  writeFileSync(join(vault, "Projects/Old/diagram.png"), "png\n");
+
+  const res = await runCli([
+    "brain",
+    "note-lifecycle",
+    "move-folder",
+    "Projects/Old",
+    "Archive",
+    "--vault",
+    vault,
+    "--apply",
+    "--json",
+  ]);
+  expect(res.returncode).toBe(0);
+  const body = JSON.parse(res.stdout) as {
+    dangling_relative_links?: Array<{ note: string; target: string }>;
+    left_behind?: string[];
+  };
+  // The JSON receipt names the pair, and the attachment is in the
+  // residue: only Markdown moves, and the receipt says what that cost.
+  expect(body.dangling_relative_links).toEqual([
+    { note: "Archive/Old/a.md", target: "diagram.png" },
+  ]);
+  expect(body.left_behind).toEqual(["diagram.png"]);
+
+  // The human receipt names the dangling spelling in place too.
+  note("Projects/Embedded/a.md", "![pic](diagram.png)\n");
+  writeFileSync(join(vault, "Projects/Embedded/diagram.png"), "png\n");
+  const text = await runCli([
+    "brain",
+    "note-lifecycle",
+    "move-folder",
+    "Projects/Embedded",
+    "Archive",
+    "--vault",
+    vault,
+    "--apply",
+  ]);
+  expect(text.returncode).toBe(0);
+  expect(text.stdout).toContain("relative links now dangling");
+  expect(text.stdout).toContain("Archive/Embedded/a.md: diagram.png");
+});
+
+test("rename-folder runs in the folder lifecycle through the same verb", async () => {
+  note("Projects/Old/a.md", "alpha\n");
+  const res = await runCli([
+    "brain",
+    "note-lifecycle",
+    "rename-folder",
+    "Projects/Old",
+    "New",
+    "--vault",
+    vault,
+    "--apply",
+    "--json",
+  ]);
+  expect(res.returncode).toBe(0);
+  const body = JSON.parse(res.stdout) as { action: string; to: string; moved: unknown[] };
+  expect(body.action).toBe("rename-folder");
+  expect(body.to).toBe("Projects/New");
+  expect(body.moved).toEqual([{ from: "Projects/Old/a.md", to: "Projects/New/a.md" }]);
+  expect(existsSync(join(vault, "Projects/New/a.md"))).toBe(true);
+});

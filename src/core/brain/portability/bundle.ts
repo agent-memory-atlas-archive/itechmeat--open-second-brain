@@ -3,11 +3,16 @@
  * Unit A).
  *
  * `exportBankBundle` composes the existing exporters - preferences
- * (`collectExportRows`), the page link-graph (`exportVaultGraph`), the
+ * (`collectSharedExportRows`, the shared lanes' denying detail of
+ * `collectExportRows`), the page link-graph (`exportVaultGraph`), the
  * page interchange contract (`projectPageContracts`), and the read-only
  * sources dashboard (`aggregateSources`) - into one schema-versioned
  * envelope for backup, cross-instance migration, or downstream-tool
- * ingest. It forks no serialisation path; it only assembles.
+ * ingest. It forks no serialisation path; it only assembles. Reserved
+ * preference rows stay out of the shared composition and are named;
+ * `includeReserved` is the personal-backup override that carries them
+ * into the operator's own copy, where a reservation about shared
+ * readers does not bind.
  *
  * `importBankBundle` reconstructs the two sections that round-trip: the
  * page graph, delegated to `importVaultGraph` under a conflict mode, and
@@ -41,7 +46,12 @@
  * nodes through `graph.rejected[]`.
  */
 
-import { collectExportRows, type ExportedPreferenceRow } from "../export.ts";
+import {
+  collectExportRowsWithDenials,
+  collectSharedExportRows,
+  type ExportedPreferenceRow,
+  type PreferenceDenial,
+} from "../export.ts";
 import { isoSecond } from "../time.ts";
 import { vaultDisplayName } from "../templates.ts";
 import {
@@ -63,6 +73,17 @@ export interface BankBundle {
   readonly generated_at: string;
   readonly vault_basename: string;
   readonly preferences: ReadonlyArray<ExportedPreferenceRow>;
+  /**
+   * The preferences the privacy deny markers kept out of this bundle,
+   * each named with its id, the reason class and the key that denied it.
+   * Absent when empty, so a vault with no reservation serialises with
+   * exactly the keys it always carried (the schema stays "1" - additive,
+   * the module's own versioning rule). Absent under
+   * `includeReserved` too, for the same reason in reverse: nothing was
+   * withheld, so there is nothing to report. The bank-export verb turns
+   * the field into its stderr omission notice.
+   */
+  readonly preferences_omitted?: ReadonlyArray<PreferenceDenial>;
   readonly graph: VaultGraph;
   readonly pages: ReadonlyArray<PageContract>;
   readonly sources: SourcesReport;
@@ -72,16 +93,73 @@ export interface BankBundle {
  * Export a whole-vault bank bundle. The content sections are
  * deterministic (each underlying exporter sorts); only `generated_at`
  * varies between runs. Pure and read-only on the vault.
+ *
+ * Preference rows the privacy deny markers reserve are left out of the
+ * preferences section and named in `preferences_omitted` - the same
+ * report the json preference export carries, so no two exporters
+ * disagree about the same directory. `opts.includeReserved` is the
+ * personal-backup override: the operator's own copy of their own vault,
+ * where a reservation about shared readers does not bind, so the
+ * reserved rows ride the section whole and the report is absent because
+ * nothing was withheld.
  */
-export function exportBankBundle(vault: string): BankBundle {
+export function exportBankBundle(vault: string, opts: BankBundleExportOptions = {}): BankBundle {
+  return exportBankBundleDetailed(vault, opts).bundle;
+}
+
+/** Options for {@link exportBankBundle}, stated beside the report. */
+export interface BankBundleExportOptions {
+  /**
+   * Carry the reserved preference rows into the bundle's preferences
+   * section. The personal-backup override, spelled
+   * `--include-reserved` on the verb: a reservation is a statement about
+   * shared readers, and a bundle the operator keeps for restore is not
+   * one. Default (false): reserved rows stay out and are named in
+   * `preferences_omitted`.
+   */
+  readonly includeReserved?: boolean;
+}
+
+/**
+ * The bundle beside the reservation report, whatever the override
+ * decided: `reserved` names the preferences the privacy deny markers
+ * hold, on an override run (where they rode the section IN and the run
+ * must say so) exactly as on a default run (where they stayed out and
+ * the report rides the bundle).
+ */
+export interface BankBundleExport {
+  readonly bundle: BankBundle;
+  readonly reserved: ReadonlyArray<PreferenceDenial>;
+}
+
+/**
+ * The one-walk composition behind {@link exportBankBundle}: callers that
+ * must say on stderr what the reservation did - in either direction -
+ * read `reserved` here instead of walking the directory a second time.
+ */
+export function exportBankBundleDetailed(
+  vault: string,
+  opts: BankBundleExportOptions = {},
+): BankBundleExport {
+  const includeReserved = opts.includeReserved === true;
+  const { rows, denied } = includeReserved
+    ? collectExportRowsWithDenials(vault)
+    : collectSharedExportRows(vault);
   return {
-    schema: BANK_BUNDLE_SCHEMA_VERSION,
-    generated_at: isoSecond(),
-    vault_basename: vaultDisplayName(vault),
-    preferences: collectExportRows(vault),
-    graph: exportVaultGraph(vault),
-    pages: projectPageContracts(vault),
-    sources: aggregateSources(vault),
+    bundle: {
+      schema: BANK_BUNDLE_SCHEMA_VERSION,
+      generated_at: isoSecond(),
+      vault_basename: vaultDisplayName(vault),
+      preferences: rows,
+      // Absent-when-empty keeps a reservation-free vault's bytes exactly
+      // what they always were; absent under the override because nothing
+      // was withheld.
+      ...(denied.length > 0 && !includeReserved ? { preferences_omitted: denied } : {}),
+      graph: exportVaultGraph(vault),
+      pages: projectPageContracts(vault),
+      sources: aggregateSources(vault),
+    },
+    reserved: denied,
   };
 }
 

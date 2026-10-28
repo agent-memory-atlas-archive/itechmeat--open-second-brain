@@ -120,6 +120,7 @@ import {
   cmdBrainDeepSynthesis,
   cmdBrainDiarize,
   cmdBrainExtractSignals,
+  cmdBrainDeadLetters,
   cmdBrainDesignNote,
   cmdBrainIdeas,
   cmdBrainSessionHook,
@@ -156,6 +157,7 @@ import {
   cmdBrainSessionExpand,
   cmdBrainSessionGrep,
   cmdBrainLint,
+  cmdBrainValidate,
   cmdBrainActions,
   cmdBrainSummary,
   cmdBrainUnlinked,
@@ -434,6 +436,8 @@ export async function handleBrainSubcommand(argv: ReadonlyArray<string>): Promis
         return await cmdBrainDiarize(rest);
       case "extract-signals":
         return await cmdBrainExtractSignals(rest);
+      case "dead-letters":
+        return await cmdBrainDeadLetters(rest);
       case "design-note":
         return await cmdBrainDesignNote(rest);
       case "ideas":
@@ -520,6 +524,8 @@ export async function handleBrainSubcommand(argv: ReadonlyArray<string>): Promis
         return await cmdBrainSessionExpand(rest);
       case "lint":
         return await cmdBrainLint(rest);
+      case "validate":
+        return await cmdBrainValidate(rest);
       case "actions":
         return await cmdBrainActions(rest);
       case "summary":

@@ -270,11 +270,13 @@ const APPEND_PRIMITIVES: ReadonlyArray<string> = Object.freeze([
 
 /**
  * A payload stamp written unconditionally, from a required binding.
- * `session_id: sessionId`, `session_id: input.sessionId`, ...
- * (`session_id?: string` in an interface is not a stamp; a read of
- * `payload["session_id"]` is not one either.)
+ * `session_id: sessionId`, `session_id: input.sessionId`, or the same
+ * stamp under the shared key constant the hook writers use
+ * (`[CONTINUITY_SESSION_ID_KEY]: sessionId`). (`session_id?: string` in
+ * an interface is not a stamp; a read of `payload["session_id"]` is not
+ * one either.)
  */
-const UNCONDITIONAL_STAMP_RE = /session_id: [A-Za-z$_]/;
+const UNCONDITIONAL_STAMP_RE = /(?:session_id|\[CONTINUITY_SESSION_ID_KEY\]): [A-Za-z$_]/;
 
 /**
  * The conditional-spread shape the sessionless lanes stamp with:
@@ -282,6 +284,9 @@ const UNCONDITIONAL_STAMP_RE = /session_id: [A-Za-z$_]/;
  * either spelling of the key.
  */
 const CONDITIONAL_STAMP_RE = /\? \{ (?:\[CONTINUITY_SESSION_ID_KEY\]|session_id\b)/;
+
+/** The Stop hook that writes `reply_presence`, outside src. */
+const HOOK_WRITER = "../hooks/answer-quote-check.ts";
 
 /**
  * Every kind the census classifies, with the module(s) whose code shapes
@@ -386,6 +391,19 @@ const KIND_WRITERS: ReadonlyArray<{
     sessionScoped: false,
     writers: ["core/brain/receipts/compact.ts"],
   },
+  {
+    // The verified-delivery wave's additive kind (t_f8510c55): the
+    // answer-quote-check Stop hook's per-turn fold of per-injected-note
+    // verdicts. Written ONLY by the Stop hook, outside src - the one
+    // kind whose writer lives past the src root, named with its root so
+    // the writer-shape check reads it where it lives. The hook appends
+    // the record only when the host names a session, and stamps the key
+    // on every payload it appends, so a record never exists without one:
+    // session-scoped, exactly like the session_turn lane.
+    kind: "reply_presence",
+    sessionScoped: true,
+    writers: [HOOK_WRITER],
+  },
 ]);
 
 /**
@@ -482,8 +500,13 @@ describe("blank-session-identity classification census", () => {
     // Any module that binds an append primitive writes SOME kind's
     // payload; if it is not classified above, its kinds are counted (or
     // spared) by a writer this census never read. Exempted: the bench
-    // fixture, which writes throwaway ledgers for timing runs.
-    const writers = new Set(KIND_WRITERS.flatMap((row) => row.writers));
+    // fixture, which writes throwaway ledgers for timing runs, and the
+    // Stop hook, which writes `reply_presence` from outside the src
+    // tree this population walks - both named writers above, never
+    // silent ones.
+    const writers = new Set(
+      KIND_WRITERS.flatMap((row) => row.writers).filter((writer) => writer !== HOOK_WRITER),
+    );
     const population = srcModulePaths().filter((path) => {
       const code = lexSource(readFileSync(join(SRC_ROOT, path), "utf8")).code;
       return APPEND_PRIMITIVES.some((primitive) => code.includes(primitive));

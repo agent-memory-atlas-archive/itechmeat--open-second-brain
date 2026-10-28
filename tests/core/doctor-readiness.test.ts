@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -10,7 +10,9 @@ import {
   READINESS_STATUS,
   READINESS_STATUSES,
   ReadinessTimeoutError,
+  clientAskBudgetMs,
   isReadinessStatus,
+  probeClientVersions,
   probeEmbeddingProvider,
   probeInstalledRuntimes,
   probeLlmKey,
@@ -18,8 +20,10 @@ import {
   probeRuntimeAdapterWiring,
   probeWritebackContract,
   runReadinessProbes,
+  spawnClientVersion,
   withReadinessTimeout,
 } from "../../src/core/doctor-readiness.ts";
+import { DOCTOR_EXIT, doctorExitCode } from "../../src/cli/main.ts";
 import { buildPayload } from "../../src/core/install/payload.ts";
 import { serializeMcpServerTable } from "../../src/core/install/grok-config.ts";
 import { registerAllAdapters } from "../../src/core/install/adapters/all.ts";
@@ -875,8 +879,13 @@ describe("probeWritebackContract", () => {
   test("the probe is registered in DEFAULT_PROBES beside registered_commands", () => {
     const names = DEFAULT_PROBES.map((p) => p.name);
     expect(names).toContain(READINESS_PROBE.writebackContract);
-    expect(names.indexOf(READINESS_PROBE.writebackContract)).toBe(
+    // client_versions (t_8e49ec96) slots in after registered_commands;
+    // writeback_contract follows it.
+    expect(names.indexOf(READINESS_PROBE.clientVersions)).toBe(
       names.indexOf(READINESS_PROBE.registeredCommands) + 1,
+    );
+    expect(names.indexOf(READINESS_PROBE.writebackContract)).toBe(
+      names.indexOf(READINESS_PROBE.clientVersions) + 1,
     );
   });
 
@@ -891,5 +900,352 @@ describe("probeWritebackContract", () => {
     const probe = report.probes.find((p) => p.name === READINESS_PROBE.writebackContract);
     expect(probe).toBeDefined();
     expect(probe!.status).toBe(READINESS_STATUS.skipped);
+  });
+});
+
+describe("probeClientVersions", () => {
+  /**
+   * The probe reads the install manifest and asks each recorded target's
+   * client its version through the injected `clientVersionRunner` seam,
+   * so no test spawns a real client binary and a developer shell cannot
+   * flip a verdict.
+   */
+  function versionsOpts(
+    runner: (argv: ReadonlyArray<string>) => Promise<{ exitCode: number; stdout: string }>,
+  ) {
+    return { ...installedRuntimeOpts(), clientVersionRunner: runner };
+  }
+
+  function codexManifest(): void {
+    writeManifestEntries({ codex: manifestEntry("codex", null, "codex-toml") });
+  }
+
+  /**
+   * Poll a pid's liveness by signal 0 until it is gone, bounded - the
+   * kill a timeout issues is asynchronous, so the reap lands a tick
+   * after the runner's promise rejects.
+   */
+  async function pollUntilGone(pid: number, deadlineMs: number): Promise<boolean> {
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+    }
+    if (!alive) return true;
+    if (Date.now() > deadlineMs) return false;
+    await Bun.sleep(25);
+    return pollUntilGone(pid, deadlineMs);
+  }
+
+  test("an answered spawn passes with the raw first stdout line, never semver-parsed", async () => {
+    writeConfig("");
+    codexManifest();
+    const v = await probeClientVersions(
+      versionsOpts(async () => ({
+        exitCode: 0,
+        stdout: "codex-cli 0.9.0 (2026-10-01)\n",
+      })),
+    );
+    expect(v.status).toBe(READINESS_STATUS.pass);
+    expect(v.rows).toBeDefined();
+    expect(v.rows).toHaveLength(1);
+    expect(v.rows![0]).toMatchObject({
+      target: "codex",
+      status: READINESS_STATUS.pass,
+      version: "codex-cli 0.9.0 (2026-10-01)",
+    });
+  });
+
+  test("a runner throw yields an unknown row pointing at registered_commands, never a fail", async () => {
+    writeConfig("");
+    codexManifest();
+    const v = await probeClientVersions(
+      versionsOpts(async () => {
+        throw Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" });
+      }),
+    );
+    expect(v.status).toBe(READINESS_STATUS.unknown);
+    expect(v.status).not.toBe(READINESS_STATUS.fail);
+    expect(v.rows![0]!.status).toBe(READINESS_STATUS.unknown);
+    expect(v.rows![0]!.version).toBeNull();
+    expect(v.rows![0]!.detail).toContain("ENOENT");
+    // Resolvability is registered_commands' finding, not this row's.
+    expect(v.rows![0]!.detail).toContain("registered_commands");
+  });
+
+  test("a non-zero exit yields an unknown row naming the exit code", async () => {
+    writeConfig("");
+    codexManifest();
+    const v = await probeClientVersions(
+      versionsOpts(async () => ({
+        exitCode: 1,
+        stdout: "",
+      })),
+    );
+    expect(v.status).toBe(READINESS_STATUS.unknown);
+    expect(v.rows![0]!.status).toBe(READINESS_STATUS.unknown);
+    expect(v.rows![0]!.version).toBeNull();
+    // The runner contract carries exit code and stdout only - stderr is
+    // ignored - so the row's reason names the exit it saw.
+    expect(v.rows![0]!.detail).toContain("exited 1");
+  });
+
+  test("an empty stdout with exit 0 yields an unknown row - no answer is not a version", async () => {
+    writeConfig("");
+    codexManifest();
+    const v = await probeClientVersions(
+      versionsOpts(async () => ({
+        exitCode: 0,
+        stdout: "   \n",
+      })),
+    );
+    expect(v.status).toBe(READINESS_STATUS.unknown);
+    expect(v.rows![0]!.status).toBe(READINESS_STATUS.unknown);
+    expect(v.rows![0]!.detail.toLowerCase()).toContain("no version output");
+  });
+
+  test("a runner sleeping past the per-probe budget is cut off as unknown", async () => {
+    writeConfig("");
+    codexManifest();
+    const small = await runReadinessProbes(
+      { ...versionsOpts(() => new Promise(() => {})), perCheckTimeoutMs: 50 },
+      [{ name: READINESS_PROBE.clientVersions, fn: probeClientVersions }],
+    );
+    expect(small.failed).toBe(0);
+    const probe = small.probes[0]!;
+    expect(probe.status).toBe(READINESS_STATUS.unknown);
+    expect(probe.detail).toContain("timed out");
+  });
+
+  test("a hung version child is killed at its ask's budget, never orphaned", async () => {
+    writeConfig("");
+    codexManifest();
+    const pidFile = join(tmp, "version-child.pid");
+    // The production runner itself, through the same seam every other
+    // row is graded by, at a test-sized budget, against a child that
+    // would sleep far past it: `exec` replaces the shell with the
+    // sleeper in place, so the pid the script wrote is the one process
+    // that must die when the budget cuts the ask off.
+    const v = await probeClientVersions(
+      versionsOpts(() =>
+        spawnClientVersion(["sh", "-c", `echo $$ > '${pidFile}'; exec sleep 30`], 150),
+      ),
+    );
+    expect(v.rows![0]!.status).toBe(READINESS_STATUS.unknown);
+    expect(v.rows![0]!.detail).toContain("timed out");
+    const pid = Number.parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+    expect(Number.isInteger(pid)).toBe(true);
+    // The kill is issued asynchronously: poll until the pid is gone,
+    // bounded, rather than sleeping a fixed grace period.
+    const gone = await pollUntilGone(pid, Date.now() + 5_000);
+    expect(gone).toBe(true);
+  }, 20000);
+
+  test("a client whose helper holds stdout still delivers the version it printed", async () => {
+    writeConfig("");
+    codexManifest();
+    // The M9 shape: a client whose `--version` prints the answer, forks a
+    // background helper that INHERITS stdout (an update checker, a
+    // daemon), and exits 0. The pipe's write end stays open in the
+    // helper, so an await of stdout EOF never returns even though the
+    // child answered - the ask must settle on the child's exit and read
+    // what stdout buffered, not on the pipe closing.
+    const v = await probeClientVersions(
+      versionsOpts(() =>
+        spawnClientVersion(["sh", "-c", "printf 'codex-cli 9.9.9\\n'; sleep 5 &"], 1000),
+      ),
+    );
+    expect(v.status).toBe(READINESS_STATUS.pass);
+    expect(v.rows![0]!.status).toBe(READINESS_STATUS.pass);
+    expect(v.rows![0]!.version).toBe("codex-cli 9.9.9");
+  }, 20000);
+
+  test("a TERM-ignoring version child is escalated to SIGKILL and reaped", async () => {
+    writeConfig("");
+    codexManifest();
+    const pidFile = join(tmp, "term-child.pid");
+    // The M10 shape: a client that ignores SIGTERM (`trap "" TERM` keeps
+    // the disposition across `exec`, so the sleeper itself never dies of
+    // the first kill) outlived doctor together with its children, because
+    // the budget's cut was one SIGTERM with no follow-up. The sleeper is
+    // bounded at 8s so a regression cannot leak an unbounded orphan.
+    const v = await probeClientVersions(
+      versionsOpts(() =>
+        spawnClientVersion(["sh", "-c", `echo $$ > '${pidFile}'; trap "" TERM; exec sleep 8`], 150),
+      ),
+    );
+    expect(v.rows![0]!.status).toBe(READINESS_STATUS.unknown);
+    expect(v.rows![0]!.detail).toContain("timed out");
+    const pid = Number.parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+    expect(Number.isInteger(pid)).toBe(true);
+    // The escalation lands a grace period after the SIGTERM: poll until
+    // the pid is gone, bounded, rather than sleeping a fixed window.
+    const gone = await pollUntilGone(pid, Date.now() + 5_000);
+    expect(gone).toBe(true);
+  }, 20000);
+
+  test("a manifest recording no installs is skipped", async () => {
+    writeConfig("");
+    const v = await probeClientVersions(versionsOpts(async () => ({ exitCode: 0, stdout: "x\n" })));
+    expect(v.status).toBe(READINESS_STATUS.skipped);
+    expect(v.detail).toContain("no installs");
+  });
+
+  test("the version asks run together, not one per wait", async () => {
+    writeConfig("");
+    writeManifestEntries({
+      codex: manifestEntry("codex", null, "codex-toml"),
+      cursor: manifestEntry("cursor", null, "json-merge"),
+    });
+    let inFlight = 0;
+    let peak = 0;
+    const v = await probeClientVersions(
+      versionsOpts(async (argv) => {
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        inFlight -= 1;
+        return { exitCode: 0, stdout: `${String(argv[0])} 1.0\n` };
+      }),
+    );
+    expect(v.status).toBe(READINESS_STATUS.pass);
+    expect(peak).toBe(2);
+  });
+
+  test("slow asks inside one probe budget deliver their rows, not a bare timeout", async () => {
+    writeConfig("");
+    writeManifestEntries({
+      codex: manifestEntry("codex", null, "codex-toml"),
+      cursor: manifestEntry("cursor", null, "json-merge"),
+    });
+    // Two asks of 300ms each inside a 500ms probe budget: asked one at a
+    // time they overrun the budget and the probe-level cutoff replaces
+    // every row with a bare timeout; asked together they settle inside
+    // it and the verdict carries both rows.
+    const report = await runReadinessProbes(
+      {
+        ...versionsOpts(
+          (argv) =>
+            new Promise((resolve) =>
+              setTimeout(() => resolve({ exitCode: 0, stdout: `${String(argv[0])} 1.0\n` }), 300),
+            ),
+        ),
+        perCheckTimeoutMs: 500,
+      },
+      [{ name: READINESS_PROBE.clientVersions, fn: probeClientVersions }],
+    );
+    const probe = report.probes[0]!;
+    expect(probe.detail).not.toContain("timed out after 500");
+    expect(probe.rows).toBeDefined();
+    expect(probe.rows).toHaveLength(2);
+    expect(probe.status).toBe(READINESS_STATUS.pass);
+  });
+
+  test("the ask's own budget stays strictly below the probe's, at every budget", () => {
+    // The 50 ms floor once clamped the child budget ABOVE a probe budget
+    // under ~63 ms: the wrapper's cutoff then fired first and replaced
+    // the rows with a bare timeout - the exact loss asking together
+    // exists to prevent. The cap at the probe budget minus a margin,
+    // less whatever the probe already spent, keeps the ask's timer ahead
+    // of the wrapper's at every budget - the wrapper armed first and
+    // each ask's timer is armed one spawn later, so the headroom is a
+    // real margin, not a one-millisecond subtraction - and the verdict
+    // always carries its rows, each naming its own timeout.
+    for (const probeBudgetMs of [1, 2, 5, 40, 50, 62, 63, 64, 100, DEFAULT_READINESS_TIMEOUT_MS]) {
+      expect(clientAskBudgetMs(probeBudgetMs)).toBeLessThan(probeBudgetMs);
+    }
+    // Normal budgets keep the 80% share's headroom between the two
+    // timers, and the 50 ms floor stands whenever the probe budget
+    // allows it.
+    expect(clientAskBudgetMs(DEFAULT_READINESS_TIMEOUT_MS)).toBe(
+      Math.floor(DEFAULT_READINESS_TIMEOUT_MS * 0.8),
+    );
+    expect(clientAskBudgetMs(500)).toBe(400);
+    // A budget under the floor: the ask dies the margin before the
+    // wrapper, and time the probe already spent comes off the ask's
+    // share first.
+    expect(clientAskBudgetMs(40)).toBe(35);
+    expect(clientAskBudgetMs(40, 4)).toBe(31);
+    // A degenerate budget clamps at zero instead of going negative: the
+    // row reads timed out after 0ms, never after -1ms.
+    expect(clientAskBudgetMs(0)).toBe(0);
+    expect(clientAskBudgetMs(1)).toBe(0);
+  });
+
+  test("the generic target has no client binary of its own and is skipped by name", async () => {
+    writeConfig("");
+    writeManifestEntries({ generic: manifestEntry("generic", null, "manual") });
+    const v = await probeClientVersions(versionsOpts(async () => ({ exitCode: 0, stdout: "x\n" })));
+    expect(v.status).toBe(READINESS_STATUS.skipped);
+    expect(v.rows).toBeDefined();
+    expect(v.rows![0]).toMatchObject({
+      target: "generic",
+      status: READINESS_STATUS.skipped,
+      version: null,
+    });
+    // The row, not the census detail, names the target and why.
+    expect(v.rows![0]!.detail).toContain("no client binary of its own");
+    expect(v.detail).toContain("1 of 1");
+  });
+
+  test("a mixed pass/unknown aggregate reads unknown with the census", async () => {
+    writeConfig("");
+    writeManifestEntries({
+      codex: manifestEntry("codex", null, "codex-toml"),
+      cursor: manifestEntry("cursor", null, "json-merge"),
+    });
+    const v = await probeClientVersions(
+      versionsOpts(async (argv) =>
+        argv[0] === "codex"
+          ? { exitCode: 0, stdout: "codex-cli 0.9.0\n" }
+          : { exitCode: 1, stdout: "" },
+      ),
+    );
+    expect(v.status).toBe(READINESS_STATUS.unknown);
+    expect(v.detail).toContain("1 pass");
+    expect(v.detail).toContain("1 unknown");
+    // The detail is the census; the rows name each client and its answer.
+    expect(v.rows!.map((row) => row.target)).toEqual(["codex", "cursor"]);
+    expect(v.rows!.find((row) => row.target === "cursor")!.detail).toContain("exited 1");
+  });
+
+  test("an unreadable manifest is unknown, like registered_commands", async () => {
+    writeConfig("");
+    writeInstallManifest("{ this is not json");
+    const v = await probeClientVersions(versionsOpts(async () => ({ exitCode: 0, stdout: "x\n" })));
+    expect(v.status).toBe(READINESS_STATUS.unknown);
+    expect(v.detail).toContain("manifest");
+  });
+
+  test("rows ride this probe only, and a fully-unknown probe keeps the exit at 6", async () => {
+    writeConfig("");
+    codexManifest();
+    const report = await runReadinessProbes(
+      { ...versionsOpts(async () => ({ exitCode: 1, stdout: "" })), perCheckTimeoutMs: 2_000 },
+      [
+        { name: READINESS_PROBE.clientVersions, fn: probeClientVersions },
+        {
+          name: "sibling_probe",
+          fn: async () => ({ status: READINESS_STATUS.pass, detail: "sibling answered" }),
+        },
+      ],
+    );
+    const versions = report.probes.find((p) => p.name === READINESS_PROBE.clientVersions)!;
+    const sibling = report.probes.find((p) => p.name === "sibling_probe")!;
+    expect(versions.rows).toBeDefined();
+    expect(sibling.rows).toBeUndefined();
+
+    // A fully-unknown version probe is an unmeasured surface, not a broken
+    // one: the doctor exit contract keeps it at 6 (probeIncomplete), never 1.
+    // The report is fabricated because `doctorExitCode` reads only the two
+    // counts - the shape cast names exactly what is being faked.
+    const fabricated = {
+      probes: [versions],
+      failed: 0,
+      unknown: 1,
+    } as Parameters<typeof doctorExitCode>[1];
+    expect(doctorExitCode(0, fabricated)).toBe(DOCTOR_EXIT.probeIncomplete);
+    expect(doctorExitCode(0, fabricated)).not.toBe(DOCTOR_EXIT.failed);
   });
 });

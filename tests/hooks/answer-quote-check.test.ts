@@ -31,6 +31,8 @@ import {
   recordSubagentDeliveredId,
 } from "../../hooks/lib/injection-ledger.ts";
 import { hookStateFilePath } from "../../hooks/lib/session-state.ts";
+import { listContinuityRecords } from "../../src/core/brain/continuity/store.ts";
+import type { ContinuityRecord } from "../../src/core/brain/continuity/types.ts";
 import {
   ANSWER_QUOTE_MAX_CHARS,
   ANSWER_QUOTE_MAX_FINDINGS,
@@ -42,10 +44,7 @@ import {
   checkAnswerQuotes,
   type AnswerQuoteEvidence,
 } from "../../src/core/brain/answer-quotes/check.ts";
-import {
-  neutralizeUntrustedText,
-  untrustedFramingHeader,
-} from "../../src/core/brain/untrusted-source.ts";
+import { untrustedFramingHeader } from "../../src/core/brain/untrusted-source.ts";
 import { QUOTE_SPAN_PREVIEW_MAX_CHARS } from "../../src/core/brain/distill/quote-verdict.ts";
 
 const HOOK = resolve(
@@ -138,7 +137,10 @@ interface RunResult {
   readonly exit: number;
 }
 
-async function runHook(overrides: Record<string, unknown> = {}): Promise<RunResult> {
+async function runHook(
+  overrides: Record<string, unknown> = {},
+  envOverrides: Record<string, string> = {},
+): Promise<RunResult> {
   const transcriptPath =
     typeof overrides["transcript_path"] === "string"
       ? (overrides["transcript_path"] as string)
@@ -150,7 +152,12 @@ async function runHook(overrides: Record<string, unknown> = {}): Promise<RunResu
     // Bun hands a child without `env` the environment this process STARTED
     // with; pass the live one so the child keeps the hermetic defaults the
     // suite preload installed, plus this test's VAULT_DIR and recall gate.
-    env: { ...process.env, VAULT_DIR: vault, OPEN_SECOND_BRAIN_RECALL_INJECT_ENABLED: "true" },
+    env: {
+      ...process.env,
+      VAULT_DIR: vault,
+      OPEN_SECOND_BRAIN_RECALL_INJECT_ENABLED: "true",
+      ...envOverrides,
+    },
   });
   proc.stdin.write(
     JSON.stringify({
@@ -188,6 +195,11 @@ function logDays(): ReadonlyArray<string> {
   const logDir = join(vault, "Brain", "log");
   if (!existsSync(logDir)) return [];
   return readdirSync(logDir).toSorted();
+}
+
+/** The reply-presence continuity records the hook wrote to the vault. */
+function presenceRecords(): ReadonlyArray<ContinuityRecord> {
+  return listContinuityRecords(vault, { kind: "reply_presence" });
 }
 
 describe("answer-quote-check hook - output shape", () => {
@@ -1027,4 +1039,362 @@ describe("answer-quote-check hook - fail-open arms", () => {
     expect(run.stdout).toBe("");
     expect(run.stderr).toBe("");
   });
+});
+
+describe("answer-quote-check hook - reply presence records", () => {
+  test("a checked turn writes exactly one reply_presence record with a verdict per injected note", async () => {
+    writeConfig("shadow");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    writeNote("Brain/notes/elsewhere.md", "Elsewhere collects unrelated facts.\n");
+    expect(
+      recordRecallInjected(vault, SESSION, [
+        "local:Brain/notes/elsewhere.md#L1-L1",
+        "local:Brain/notes/restaking.md#L1-L1",
+      ]),
+    ).toBe(true);
+    writeTranscript([
+      ccUser("summarize"),
+      ccAssistant('As the context showed, restaking "reuses staked capital".'),
+    ]);
+    const run = await runHook();
+    expect(run.exit).toBe(0);
+    expect(run.stderr).toBe("");
+    // The span verified against `restaking.md`, so that is the only note
+    // the span reports on: `elsewhere.md` was never measured - no span
+    // was checked against it - and reads `absent`. A note that sorts
+    // before the verifier does not inherit the span's miss, and the
+    // record's verdicts cannot depend on filename order.
+    expect(annotations(run)).toEqual([]);
+    const records = presenceRecords();
+    expect(records).toHaveLength(1);
+    const payload = records[0]!.payload as {
+      session_id?: unknown;
+      checked?: unknown;
+      per_note?: unknown;
+      source_hash?: unknown;
+    };
+    expect(payload.session_id).toBe(SESSION);
+    expect(payload.checked).toBe(1);
+    expect(payload.per_note).toEqual([
+      { path: "Brain/notes/elsewhere.md", start_line: 1, end_line: 1, verdict: "absent" },
+      { path: "Brain/notes/restaking.md", start_line: 1, end_line: 1, verdict: "verified" },
+    ]);
+    // The hash binds the verdicts to the exact answer text checked; it
+    // carries no answer text itself.
+    expect(typeof payload.source_hash).toBe("string");
+    expect(payload.source_hash).toMatch(/^[0-9a-f]{64}$/);
+    // Every test here spawns a real `bun run` hook child; pin the per-test
+    // budget past bun's 5 s default so a loaded runner cannot flake it.
+  }, 20000);
+
+  test("an unrelated note reads the same verdict sorting before the verifying note", async () => {
+    // M4: for a span that verified, ONLY the verifying candidate reports
+    // an outcome. `aaa-unrelated.md` sorts before the verifier and would
+    // once have inherited the span's miss; it must read exactly what a
+    // note sorting after the verifier reads - `absent`.
+    writeConfig("shadow");
+    writeNote("Brain/notes/aaa-unrelated.md", "Unrelated collects other facts.\n");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    expect(
+      recordRecallInjected(vault, SESSION, [
+        "local:Brain/notes/aaa-unrelated.md#L1-L1",
+        "local:Brain/notes/restaking.md#L1-L1",
+      ]),
+    ).toBe(true);
+    writeTranscript([
+      ccUser("summarize"),
+      ccAssistant('As the context showed, restaking "reuses staked capital".'),
+    ]);
+    const run = await runHook();
+    expect(run.exit).toBe(0);
+    expect(run.stderr).toBe("");
+    expect(annotations(run)).toEqual([]);
+    const records = presenceRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]!.payload["per_note"]).toEqual([
+      { path: "Brain/notes/aaa-unrelated.md", start_line: 1, end_line: 1, verdict: "absent" },
+      { path: "Brain/notes/restaking.md", start_line: 1, end_line: 1, verdict: "verified" },
+    ]);
+  }, 20000);
+
+  test("an unrelated note reads the same verdict sorting after the verifying note", async () => {
+    // The mirror fixture: the same reply, the same verifying note, the
+    // unrelated name sorting after it. The verdict must be the SAME
+    // `absent` the before-sorting fixture read - a note's presence is a
+    // fact about the reply, not about its filename.
+    writeConfig("shadow");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    writeNote("Brain/notes/zzz-unrelated.md", "Unrelated collects other facts.\n");
+    expect(
+      recordRecallInjected(vault, SESSION, [
+        "local:Brain/notes/restaking.md#L1-L1",
+        "local:Brain/notes/zzz-unrelated.md#L1-L1",
+      ]),
+    ).toBe(true);
+    writeTranscript([
+      ccUser("summarize"),
+      ccAssistant('As the context showed, restaking "reuses staked capital".'),
+    ]);
+    const run = await runHook();
+    expect(run.exit).toBe(0);
+    expect(run.stderr).toBe("");
+    expect(annotations(run)).toEqual([]);
+    const records = presenceRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]!.payload["per_note"]).toEqual([
+      { path: "Brain/notes/restaking.md", start_line: 1, end_line: 1, verdict: "verified" },
+      { path: "Brain/notes/zzz-unrelated.md", start_line: 1, end_line: 1, verdict: "absent" },
+    ]);
+  }, 20000);
+
+  test("a note whose spans all miss reads its strongest miss verdict", async () => {
+    // Two candidates, one span missing from both: the whole-file
+    // subagent delivery reads the readable miss `not-in-note`; the
+    // recall range delivers only a partial view, so its miss is the
+    // degradation `source-truncated` - the ladder per note, not per
+    // turn.
+    writeConfigFor({ recall: "shadow", active: "off", subagent: "shadow" });
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    writeNote("Brain/notes/ranged.md", "Ranged note body line.\n");
+    expect(recordRecallInjected(vault, SESSION, ["local:Brain/notes/ranged.md#L1-L1"])).toBe(true);
+    expect(
+      recordSubagentDeliveredId(vault, SESSION, "agent-cccc", ["Brain/notes/restaking.md"]),
+    ).toBe(true);
+    writeTranscript([
+      ccUser("summarize"),
+      ccAssistant('The answer cites "wholly absent material" here.'),
+    ]);
+    const run = await runHook();
+    expect(run.exit).toBe(0);
+    const records = presenceRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]!.payload["per_note"]).toEqual([
+      { path: "Brain/notes/ranged.md", start_line: 1, end_line: 1, verdict: "source-truncated" },
+      { path: "Brain/notes/restaking.md", verdict: "not-in-note" },
+    ]);
+    expect(records[0]!.payload["checked"]).toBe(1);
+  }, 20000);
+
+  test("a reply with no quoted spans at all reads absent for every injected note", async () => {
+    writeConfig("shadow");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    writeNote("Brain/notes/elsewhere.md", "Elsewhere collects unrelated facts.\n");
+    expect(
+      recordRecallInjected(vault, SESSION, [
+        "local:Brain/notes/elsewhere.md#L1-L1",
+        "local:Brain/notes/restaking.md#L1-L1",
+      ]),
+    ).toBe(true);
+    writeTranscript([ccUser("summarize"), ccAssistant("A plain prose answer quoting nothing.")]);
+    const run = await runHook();
+    expect(run.exit).toBe(0);
+    expect(run.stderr).toBe("");
+    expect(annotations(run)).toEqual([]);
+    const records = presenceRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]!.payload["checked"]).toBe(0);
+    expect(records[0]!.payload["per_note"]).toEqual([
+      { path: "Brain/notes/elsewhere.md", start_line: 1, end_line: 1, verdict: "absent" },
+      { path: "Brain/notes/restaking.md", start_line: 1, end_line: 1, verdict: "absent" },
+    ]);
+  }, 20000);
+
+  test("a note the budget cut before it was measured reads note-unavailable, never absent", async () => {
+    // The note is quoted only in the SECOND message; a budget that expires
+    // before that message is scanned leaves it never-measured. The fold's
+    // invariant: a budget-cut candidate reads the transcript as UNREAD
+    // (`note-unavailable`), never the note as untouched (`absent` - the
+    // verdict reserved for a reply that quoted nothing from it).
+    writeConfig("shadow");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    expect(recordRecallInjected(vault, SESSION, ["local:Brain/notes/restaking.md#L1-L1"])).toBe(
+      true,
+    );
+    writeTranscript([
+      ccUser("summarize"),
+      ccAssistant("A first answer that quotes nothing at all."),
+      ccAssistant('As the context showed, restaking "reuses staked capital".'),
+    ]);
+    // The hook's test-only budget seam: any finite value is honored once at
+    // module load. A negative budget is already past at the FIRST deadline
+    // comparison (`Date.now() > started - 1` holds always), so the outer
+    // break fires deterministically before any span is measured.
+    const run = await runHook({}, { ANSWER_QUOTE_BUDGET_MS: "-1" });
+    expect(run.exit).toBe(0);
+    expect(run.stderr).toBe("");
+    const records = presenceRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]!.payload["checked"]).toBe(0);
+    expect(records[0]!.payload["per_note"]).toEqual([
+      { path: "Brain/notes/restaking.md", start_line: 1, end_line: 1, verdict: "note-unavailable" },
+    ]);
+  }, 20000);
+
+  test("a note the reply cites reads its check verdict, never absent", async () => {
+    // The span sits under a wikilink mark naming the injected note: the
+    // check measured the span against that note's evidence, so the note
+    // rides the outcome - citing an injected note is the most explicit
+    // way to surface it, and folding it `absent` would invert the signal
+    // the record exists to carry.
+    writeConfig("shadow");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    writeNote("Brain/notes/elsewhere.md", "Elsewhere collects unrelated facts.\n");
+    expect(
+      recordRecallInjected(vault, SESSION, [
+        "local:Brain/notes/elsewhere.md#L1-L1",
+        "local:Brain/notes/restaking.md#L1-L1",
+      ]),
+    ).toBe(true);
+    writeTranscript([
+      ccUser("summarize"),
+      ccAssistant('Per [[Brain/notes/restaking]], "reuses staked capital" holds.'),
+    ]);
+    const run = await runHook();
+    expect(run.exit).toBe(0);
+    expect(run.stderr).toBe("");
+    expect(annotations(run)).toEqual([]);
+    const records = presenceRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]!.payload["checked"]).toBe(1);
+    expect(records[0]!.payload["per_note"]).toEqual([
+      { path: "Brain/notes/elsewhere.md", start_line: 1, end_line: 1, verdict: "absent" },
+      { path: "Brain/notes/restaking.md", start_line: 1, end_line: 1, verdict: "verified" },
+    ]);
+  }, 20000);
+
+  test("a ranged citation of a whole-delivered note reads the check verdict, never absent", async () => {
+    // The ledger delivered the note whole (the subagent lane) and by
+    // range (recall); the merge folds every range of a path away once
+    // the whole view exists, so the only candidate left is the whole
+    // note. A citation that names a line range must still credit that
+    // candidate: its key is the path alone, and the path is what the
+    // reply surfaced - folding it `absent` would deny content the turn
+    // delivered and cited.
+    writeConfigFor({ recall: "shadow", active: "off", subagent: "shadow" });
+    writeNote("Brain/notes/restaking.md", "First line about staking.\nSecond line about risk.\n");
+    expect(recordRecallInjected(vault, SESSION, ["local:Brain/notes/restaking.md#L1-L1"])).toBe(
+      true,
+    );
+    expect(
+      recordSubagentDeliveredId(vault, SESSION, "agent-cccc", ["Brain/notes/restaking.md"]),
+    ).toBe(true);
+    writeTranscript([
+      ccUser("summarize"),
+      ccAssistant('The note says "First line about staking" (Brain/notes/restaking.md:L1-L1).'),
+    ]);
+    const run = await runHook();
+    expect(run.exit).toBe(0);
+    expect(run.stderr).toBe("");
+    const records = presenceRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]!.payload["checked"]).toBe(1);
+    expect(records[0]!.payload["per_note"]).toEqual([
+      { path: "Brain/notes/restaking.md", verdict: "verified" },
+    ]);
+  }, 20000);
+
+  test("a turn whose reply text never arrived reads note-unavailable, never absent", async () => {
+    // The tail window holds no assistant message after the last user
+    // boundary - the host never flushed a reply. No span was measured,
+    // and not because the notes were unused: the fold answers
+    // `note-unavailable` for every injected note instead of claiming
+    // they were never surfaced.
+    writeConfig("shadow");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    writeNote("Brain/notes/elsewhere.md", "Elsewhere collects unrelated facts.\n");
+    expect(
+      recordRecallInjected(vault, SESSION, [
+        "local:Brain/notes/elsewhere.md#L1-L1",
+        "local:Brain/notes/restaking.md#L1-L1",
+      ]),
+    ).toBe(true);
+    writeTranscript([ccUser("summarize")]);
+    const run = await runHook();
+    expect(run.exit).toBe(0);
+    expect(run.stderr).toBe("");
+    const records = presenceRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]!.payload["checked"]).toBe(0);
+    expect(records[0]!.payload["per_note"]).toEqual([
+      {
+        path: "Brain/notes/elsewhere.md",
+        start_line: 1,
+        end_line: 1,
+        verdict: "note-unavailable",
+      },
+      {
+        path: "Brain/notes/restaking.md",
+        start_line: 1,
+        end_line: 1,
+        verdict: "note-unavailable",
+      },
+    ]);
+    // No reply text was read, so the payload binds no answer hash.
+    expect(records[0]!.payload["source_hash"]).toBeUndefined();
+  }, 20000);
+
+  test("stop_hook_active silence writes no record", async () => {
+    writeConfig("shadow");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    expect(recordRecallInjected(vault, SESSION, ["local:Brain/notes/restaking.md#L1-L1"])).toBe(
+      true,
+    );
+    writeTranscript([
+      ccUser("summarize"),
+      ccAssistant('As shown, restaking "reuses staked capital".'),
+    ]);
+    const run = await runHook({ stop_hook_active: true });
+    expect(run.exit).toBe(0);
+    expect(run.stdout).toBe("");
+    expect(presenceRecords()).toEqual([]);
+  }, 20000);
+
+  test("every phase off runs no check and writes no record", async () => {
+    writeConfig("off");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    expect(recordRecallInjected(vault, SESSION, ["local:Brain/notes/restaking.md#L1-L1"])).toBe(
+      true,
+    );
+    writeTranscript([ccUser("summarize"), ccAssistant("A plain prose answer quoting nothing.")]);
+    const run = await runHook();
+    expect(run.exit).toBe(0);
+    expect(presenceRecords()).toEqual([]);
+  }, 20000);
+
+  test("a failed presence write is fail-open: one audit line, the annotation still goes out", async () => {
+    writeConfig("shadow");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    expect(recordRecallInjected(vault, SESSION, ["local:Brain/notes/restaking.md#L1-L1"])).toBe(
+      true,
+    );
+    writeTranscript([
+      ccUser("summarize"),
+      ccAssistant('The answer cites "wholly absent material" here.'),
+    ]);
+    // The continuity ledger's directory is a file: the append throws,
+    // the hook names it on stderr and still annotates.
+    mkdirSync(join(vault, "Brain", "log"), { recursive: true });
+    writeFileSync(join(vault, "Brain", "log", "continuity"), "not a directory\n");
+    const run = await runHook();
+    expect(run.exit).toBe(0);
+    const found = annotations(run);
+    expect(found.length).toBe(1);
+    const lines = run.stderr.split(/\r?\n/).filter((line) => line.length > 0);
+    expect(lines.length).toBe(1);
+    expect(lines[0]!.startsWith("answer-quote-check:")).toBe(true);
+  }, 20000);
+
+  test("an unreadable transcript writes no record", async () => {
+    writeConfig("shadow");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    expect(recordRecallInjected(vault, SESSION, ["local:Brain/notes/restaking.md#L1-L1"])).toBe(
+      true,
+    );
+    const dirAsTranscript = join(tmp, "not-a-transcript");
+    mkdirSync(dirAsTranscript);
+    const run = await runHook({ transcript_path: dirAsTranscript });
+    expect(run.exit).toBe(0);
+    expect(run.stdout).toBe("");
+    expect(presenceRecords()).toEqual([]);
+  }, 20000);
 });

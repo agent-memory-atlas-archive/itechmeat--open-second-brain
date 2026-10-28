@@ -276,8 +276,106 @@ describe("an export with nothing to redact is byte-identical", () => {
     expect(r.stdout).toBe(exportPreferencesLlmsTxt(vault));
   });
 
+  test("brain export --format json carries no omitted key when nothing is denied", async () => {
+    // The json lane has no timestamp-free byte fixture to compare against,
+    // so its byte-identity property is pinned through the envelope's
+    // shape: the `omitted` field is absent-when-empty, which is what
+    // keeps a reservation-free vault's bytes what they always were.
+    await bootstrap();
+    await seedPreference("alpha", "principle alpha");
+    const r = await runCli(["brain", "export", "--vault", vault, "--format", "json"], ENV());
+    expect(r.returncode).toBe(0);
+    const payload = JSON.parse(r.stdout) as Record<string, unknown>;
+    expect("omitted" in payload).toBe(false);
+    // And nothing was withheld, so the omission notice is silent too.
+    expect(r.stderr).not.toContain("left out");
+  });
+
   test("the byte-identity fixtures are not empty", () => {
     // A comparison over nothing passes for the wrong reason.
     expect(VENDOR_TOKEN.length).toBeGreaterThan(16);
+  });
+});
+
+describe("a visibility-reserved preference is left out and named by the shared lanes", () => {
+  /** Hand-add an informal privacy marker, the way an operator does. */
+  function stampPrefMarker(slug: string, line: string): void {
+    const abs = join(vault, "Brain", "preferences", `pref-${slug}.md`);
+    writeFileSync(abs, readFileSync(abs, "utf8").replace(/^---\n/, `---\n${line}\n`));
+  }
+
+  /** Hand-edit the frontmatter id the same way an operator does. */
+  function stampPrefId(slug: string, id: string): void {
+    const abs = join(vault, "Brain", "preferences", `pref-${slug}.md`);
+    writeFileSync(abs, readFileSync(abs, "utf8").replace(/^id: .*$/m, `id: ${id}`));
+  }
+
+  test("a reserved preference whose id carries URL credentials is named scrubbed, never raw", async () => {
+    // The frontmatter id is read verbatim, so a hand-edited one can carry
+    // a credential. The egress guard scrubs the identifier inside the
+    // payload it releases; the stderr notices must name the SAME scrubbed
+    // form on every lane, never the raw secret the vault still holds.
+    await bootstrap();
+    await seedPreference("reserved", "principle reserved");
+    stampPrefMarker("reserved", "access: private");
+    stampPrefId("reserved", "pref-https://bert:hunter2@internal.example/ops");
+
+    const bank = await runCli(["brain", "bank-export", "--vault", vault], ENV());
+    expect(bank.returncode).toBe(0);
+    const payload = JSON.parse(bank.stdout) as {
+      preferences_omitted?: ReadonlyArray<{ id: string }>;
+    };
+    expect(payload.preferences_omitted?.[0]?.id).toBe(
+      `pref-https://${REDACTION_PLACEHOLDER}@internal.example/ops`,
+    );
+    expect(bank.stderr).toContain(`${REDACTION_PLACEHOLDER}@internal.example/ops`);
+    expect(bank.stderr).toContain("left out");
+    expect(bank.stderr).not.toContain("hunter2");
+
+    const txt = await runCli(["brain", "export", "--vault", vault, "--format", "llms-txt"], ENV());
+    expect(txt.returncode).toBe(0);
+    expect(txt.stderr).toContain(`${REDACTION_PLACEHOLDER}@internal.example/ops`);
+    expect(txt.stderr).toContain("left out");
+    expect(txt.stderr).not.toContain("hunter2");
+    expect(txt.stdout).not.toContain("hunter2");
+  });
+
+  test("bank-export omits it from the bundle and names it on stderr", async () => {
+    await bootstrap();
+    await seedPreference("reserved", "principle reserved");
+    stampPrefMarker("reserved", "access: private");
+
+    const r = await runCli(["brain", "bank-export", "--vault", vault], ENV());
+    expect(r.returncode).toBe(0);
+    const payload = JSON.parse(r.stdout) as {
+      preferences: ReadonlyArray<{ id: string }>;
+      preferences_omitted?: ReadonlyArray<{
+        id: string;
+        reason: string;
+        denied_by: string;
+      }>;
+    };
+    expect(payload.preferences.map((p) => p.id)).toEqual([]);
+    expect(payload.preferences_omitted).toEqual([
+      { id: "pref-reserved", reason: "visibility", denied_by: "access" },
+    ]);
+    expect(r.stderr).toContain("pref-reserved");
+    expect(r.stderr).toContain("left out");
+    // stderr only: the bundle names the omission as data, not prose.
+    expect(r.stdout).not.toContain("left out");
+  });
+
+  test("the bank bundle carries no preferences_omitted key when nothing is denied", async () => {
+    // The bank bundle's byte-identity property, pinned through its shape:
+    // the section-scoped omission field is absent-when-empty, so a vault
+    // with no reservation serialises exactly the keys it always did.
+    await bootstrap();
+    await seedPreference("alpha", "principle alpha");
+
+    const r = await runCli(["brain", "bank-export", "--vault", vault], ENV());
+    expect(r.returncode).toBe(0);
+    const payload = JSON.parse(r.stdout) as Record<string, unknown>;
+    expect("preferences_omitted" in payload).toBe(false);
+    expect(r.stderr).not.toContain("left out");
   });
 });

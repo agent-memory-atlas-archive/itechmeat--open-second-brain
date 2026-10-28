@@ -1,13 +1,22 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { emitContextReceipt } from "../../src/core/brain/context-receipts.ts";
+import { appendContinuityRecord } from "../../src/core/brain/continuity/store.ts";
 import { emitObservedUse } from "../../src/core/brain/observed-use.ts";
 import { atomicWriteFileSync } from "../../src/core/fs-atomic.ts";
+import { TRANSPORT_REACH } from "../../src/core/graph/transport-reach.ts";
 import { JSONRPC_VERSION, MCPServer, PROTOCOL_VERSION } from "../../src/mcp/index.ts";
 import { buildToolTable } from "../../src/mcp/tools.ts";
+
+/** A plain vault page at a vault-relative path, frontmatter and all. */
+function writePage(rel: string, body: string): void {
+  const abs = join(vault, rel);
+  mkdirSync(dirname(abs), { recursive: true });
+  writeFileSync(abs, body, "utf8");
+}
 
 let tmp: string;
 let vault: string;
@@ -118,6 +127,213 @@ describe("brain_context_receipts tool", () => {
     });
     expect(show["id"]).toBe(receipt.id);
     expect((show["payload"] as Record<string, unknown>)["session_id"]).toBe("session-mcp");
+  });
+
+  test("show joins the session's reply_presence record and names unjoined honestly", async () => {
+    // The pages the hook recorded: readable and unreserved, so the join
+    // keeps their rows at the default (below-local) reach too.
+    writePage("Brain/preferences/pref-alpha.md", "Public body.\n");
+    writePage("Brain/preferences/pref-bravo.md", "Public body.\n");
+    const joined = emitContextReceipt(vault, {
+      options: {
+        host: "mcp-test",
+        trigger: "session_inject",
+        createdAt: "2026-05-20T14:00:00.000Z",
+        sessionId: "session-present",
+      },
+      finalText: "eager layer",
+      items: [{ id: "pref-alpha", path: "Brain/preferences/pref-alpha.md" }],
+    });
+    const lonely = emitContextReceipt(vault, {
+      options: {
+        host: "mcp-test",
+        trigger: "session_inject",
+        createdAt: "2026-05-20T14:05:00.000Z",
+        sessionId: "session-absent",
+      },
+      finalText: "eager layer",
+      items: [{ id: "pref-bravo", path: "Brain/preferences/pref-bravo.md" }],
+    });
+    const presence = appendContinuityRecord(vault, {
+      kind: "reply_presence",
+      createdAt: "2026-05-20T14:10:00.000Z",
+      payload: {
+        session_id: "session-present",
+        checked: 1,
+        per_note: [
+          { path: "Brain/preferences/pref-alpha.md", start_line: 2, verdict: "not-in-note" },
+        ],
+      },
+    });
+    const server = new MCPServer({ vault, configPath });
+    await initialize(server);
+
+    const showJoined = await callReceipts(server, { operation: "show", id: joined.id });
+    expect(showJoined["reply_presence"]).toEqual({
+      joined: true,
+      presence: {
+        record_id: presence.id,
+        created_at: "2026-05-20T14:10:00.000Z",
+        checked: 1,
+        per_note: [
+          { path: "Brain/preferences/pref-alpha.md", start_line: 2, verdict: "not-in-note" },
+        ],
+      },
+    });
+
+    // No reply_presence record for this receipt's session: the outcome is
+    // NAMED on the response, never a silent absence.
+    const showLonely = await callReceipts(server, { operation: "show", id: lonely.id });
+    expect(showLonely["reply_presence"]).toEqual({
+      joined: false,
+      reason: "unjoined",
+      session_id: "session-absent",
+    });
+
+    // The list summaries stay summaries: no per-row presence join.
+    const list = await callReceipts(server, { operation: "list", trigger: "session_inject" });
+    for (const entry of list["receipts"] as Array<Record<string, unknown>>) {
+      expect("reply_presence" in entry).toBe(false);
+    }
+  });
+
+  test("a note verified in the next turn reads verified through show, whatever later turns did", async () => {
+    // The review's timeline, through the tool surface: the Stop hook
+    // writes a record on every checked turn, including later turns that
+    // quote nothing, so the receipt's join must fold its own lifetime -
+    // a later all-absent turn never erases an earlier verification, and
+    // the row list stays the receipt's own injection.
+    writePage("Brain/notes/note-a.md", "Note a body.\n");
+    writePage("Brain/notes/note-b.md", "Note b body.\n");
+    const receipt = emitContextReceipt(vault, {
+      options: {
+        host: "mcp-test",
+        trigger: "session_inject",
+        createdAt: "2026-05-20T15:00:00.000Z",
+        sessionId: "session-fold",
+      },
+      finalText: "eager layer",
+      items: [{ id: "note-a", path: "Brain/notes/note-a.md" }],
+    });
+    appendContinuityRecord(vault, {
+      kind: "reply_presence",
+      createdAt: "2026-05-20T15:01:00.000Z",
+      payload: {
+        session_id: "session-fold",
+        checked: 1,
+        per_note: [
+          { path: "Brain/notes/note-a.md", start_line: 1, end_line: 1, verdict: "verified" },
+        ],
+      },
+    });
+    const last = appendContinuityRecord(vault, {
+      kind: "reply_presence",
+      createdAt: "2026-05-20T15:06:00.000Z",
+      payload: {
+        session_id: "session-fold",
+        checked: 0,
+        per_note: [
+          { path: "Brain/notes/note-a.md", verdict: "absent" },
+          { path: "Brain/notes/note-b.md", verdict: "absent" },
+        ],
+      },
+    });
+    const server = new MCPServer({ vault, configPath });
+    await initialize(server);
+
+    const show = await callReceipts(server, { operation: "show", id: receipt.id });
+    expect(show["reply_presence"]).toEqual({
+      joined: true,
+      presence: {
+        record_id: last.id,
+        created_at: "2026-05-20T15:06:00.000Z",
+        checked: 1,
+        per_note: [
+          { path: "Brain/notes/note-a.md", start_line: 1, end_line: 1, verdict: "verified" },
+        ],
+      },
+    });
+  });
+
+  test("below local reach the join withholds a reserved page's row and counts the withholding", async () => {
+    writePage("Brain/preferences/pref-open.md", "Open body.\n");
+    writePage(
+      "Brain/preferences/pref-reserved.md",
+      "---\nvisibility: private\n---\n\nReserved body.\n",
+    );
+    const receipt = emitContextReceipt(vault, {
+      options: {
+        host: "mcp-test",
+        trigger: "session_inject",
+        createdAt: "2026-05-20T14:00:00.000Z",
+        sessionId: "session-withheld-page",
+      },
+      finalText: "eager layer",
+      items: [
+        { id: "pref-open", path: "Brain/preferences/pref-open.md" },
+        { id: "pref-reserved", path: "Brain/preferences/pref-reserved.md" },
+      ],
+    });
+    appendContinuityRecord(vault, {
+      kind: "reply_presence",
+      createdAt: "2026-05-20T14:10:00.000Z",
+      payload: {
+        session_id: "session-withheld-page",
+        checked: 2,
+        per_note: [
+          { path: "Brain/preferences/pref-open.md", verdict: "verified" },
+          {
+            path: "Brain/preferences/pref-reserved.md",
+            start_line: 3,
+            end_line: 5,
+            verdict: "verified",
+          },
+        ],
+      },
+    });
+
+    // A caller that established nothing answers at the narrowest reach:
+    // the reserved page's path, range and verdict are gone, and the join
+    // says it withheld one row rather than reading as an absent note.
+    const remote = new MCPServer({ vault, configPath });
+    await initialize(remote);
+    const below = await callReceipts(remote, { operation: "show", id: receipt.id });
+    expect(below["reply_presence"]).toEqual({
+      joined: true,
+      presence: {
+        record_id: expect.any(String),
+        created_at: "2026-05-20T14:10:00.000Z",
+        checked: 2,
+        per_note: [{ path: "Brain/preferences/pref-open.md", verdict: "verified" }],
+        withheld: 1,
+      },
+    });
+    // The JOIN carries no trace of the withheld page - not its path, not
+    // its line range, not its verdict. (The receipt's own items are the
+    // record of what was injected; this pin is the join's.)
+    expect(JSON.stringify(below["reply_presence"])).not.toContain("pref-reserved");
+
+    // At local reach the operator still sees every row, and no withholding.
+    const local = new MCPServer({ vault, configPath }, { reach: TRANSPORT_REACH.local });
+    await initialize(local);
+    const above = await callReceipts(local, { operation: "show", id: receipt.id });
+    expect(above["reply_presence"]).toEqual({
+      joined: true,
+      presence: {
+        record_id: expect.any(String),
+        created_at: "2026-05-20T14:10:00.000Z",
+        checked: 2,
+        per_note: [
+          { path: "Brain/preferences/pref-open.md", verdict: "verified" },
+          {
+            path: "Brain/preferences/pref-reserved.md",
+            start_line: 3,
+            end_line: 5,
+            verdict: "verified",
+          },
+        ],
+      },
+    });
   });
 
   test("summary folds a session and joins the observed-use verdicts", async () => {

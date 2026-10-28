@@ -126,6 +126,8 @@ const TYPE_ONLY_MEMBERS = [
   "destination_forbidden",
   "destination_occupied",
   "destination_unchanged",
+  "destination_inside_source",
+  "move_set_empty",
   "wrong_action",
   "not_confirmed",
   "already_archived",

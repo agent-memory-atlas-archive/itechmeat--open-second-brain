@@ -23,19 +23,22 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { bootstrapBrain } from "../../src/core/brain/init.ts";
 import { resetVaultIdentityPins } from "../../src/core/brain/vault-identity.ts";
 import { MAINTENANCE_VERDICT, appendJournal } from "../../src/core/brain/maintenance/journal.ts";
 import { TRANSPORT_REACH, type TransportReach } from "../../src/core/graph/transport-reach.ts";
 import { atomicWriteFileSync } from "../../src/core/fs-atomic.ts";
+import { resolveSearchConfig } from "../../src/core/search/index.ts";
 import { ADMIN_TOOLS } from "../../src/mcp/brain/admin-tools.ts";
+import { HEALTH_TOOLS } from "../../src/mcp/brain/health-tools.ts";
 import type { ServerContext } from "../../src/mcp/tool-contract.ts";
 
 const maintenance = ADMIN_TOOLS.find((tool) => tool.name === "brain_maintenance")!.handler;
+const brainStatus = HEALTH_TOOLS.find((tool) => tool.name === "brain_status")!.handler;
 
 let vault: string;
 let configHome: string;
@@ -161,5 +164,72 @@ describe("brain_maintenance status journal cursor pagination", () => {
     await expect(maintenance({ ...ctx }, { operation: "status", cursor: "!!!" })).rejects.toThrow(
       /malformed cursor/,
     );
+  });
+});
+
+describe("brain_status store group at the caller's reach (t_cfe2ce5d)", () => {
+  interface StoreGroup {
+    readonly writerLock: string;
+    readonly writerLockReason: string | null;
+    readonly writerLockAgeMs: number | null;
+    readonly writerLockOwner: string | null;
+    readonly writerLockPath: string | null;
+    readonly thisCaller: string;
+  }
+
+  async function statusStore(reach: TransportReach): Promise<StoreGroup> {
+    const res = (await brainStatus({ ...ctx, reach }, {})) as Record<string, unknown>;
+    return res["store"] as StoreGroup;
+  }
+
+  test("the payload carries the store group at both reaches, with the state fields intact", async () => {
+    for (const reach of [TRANSPORT_REACH.local, TRANSPORT_REACH.remote]) {
+      const store = await statusStore(reach);
+      expect(store.writerLock).toBe("free");
+      expect(store.writerLockReason).toBeNull();
+      expect(store.writerLockOwner).toBeNull();
+      expect(store.thisCaller).toBe("read-only");
+    }
+  });
+
+  test("the lock path is withheld below local reach", async () => {
+    const local = await statusStore(TRANSPORT_REACH.local);
+    // The lock rides the resolved index path, which is inside the vault here.
+    expect(typeof local.writerLockPath).toBe("string");
+
+    const remote = await statusStore(TRANSPORT_REACH.remote);
+    // The path may live outside the vault (the resolved index path is a
+    // host path), so below local reach it reads null while every state
+    // field stays - the same split `state_files.search_index` boolean makes.
+    expect(remote.writerLockPath).toBeNull();
+    expect(remote.writerLock).toBe("free");
+  });
+
+  test("below local reach a failed lock probe keeps the errno but not the host path", async () => {
+    // A lock path that cannot even be stat'd: a symlink loop where the
+    // lock directory would sit. `isWriterLockHeld`'s contract names this
+    // throw shape (ELOOP, beside the EACCES the audit quotes) and the
+    // snapshot reads it `unknown` with the reason carrying the fs error -
+    // whose message embeds the full host path.
+    const lockPath = `${resolveSearchConfig({ vault, configPath: ctx.configPath ?? undefined }).dbPath}.lock`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    symlinkSync(lockPath, lockPath);
+
+    // At local reach the reason is the operator's own diagnostic: the
+    // errno and the path the probe failed on, verbatim.
+    const local = await statusStore(TRANSPORT_REACH.local);
+    expect(local.writerLock).toBe("unknown");
+    expect(local.writerLockReason).toContain("ELOOP");
+    expect(local.writerLockReason).toContain(lockPath);
+
+    // Below local reach the errno keeps - "I could not find out, and
+    // here is why" - while the host path goes the way every other error
+    // leaving the process goes: through the redactor.
+    const remote = await statusStore(TRANSPORT_REACH.remote);
+    expect(remote.writerLock).toBe("unknown");
+    expect(remote.writerLockReason).toContain("ELOOP");
+    expect(remote.writerLockReason).not.toContain(lockPath);
+    expect(remote.writerLockReason).not.toContain(tmpdir());
+    expect(remote.writerLockPath).toBeNull();
   });
 });

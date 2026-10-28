@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { bootstrapBrain } from "../../src/core/brain/init.ts";
 import { atomicWriteFileSync } from "../../src/core/fs-atomic.ts";
 import { INDEX_EVIDENCE, INDEX_REFRESH } from "../../src/core/brain/notes/lifecycle.ts";
+import { TRANSPORT_REACH } from "../../src/core/graph/transport-reach.ts";
 import { LIFECYCLE_FILE_TOOLS } from "../../src/mcp/brain/lifecycle-file-tools.ts";
 import { MCPError } from "../../src/mcp/protocol.ts";
 import type { ServerContext } from "../../src/mcp/tool-contract.ts";
@@ -64,7 +65,155 @@ describe("brain_note_lifecycle registration", () => {
     expect(tool).toBeDefined();
     expect(tool.inputSchema.required).toEqual(["action", "path"]);
     const properties = tool.inputSchema.properties as Record<string, { enum?: string[] }>;
-    expect(properties["action"]?.enum).toEqual(["rename", "move", "archive", "delete"]);
+    expect(properties["action"]?.enum).toEqual([
+      "rename",
+      "move",
+      "archive",
+      "delete",
+      "move-folder",
+      "rename-folder",
+    ]);
+  });
+
+  test("the description names the folder actions and where they run", () => {
+    // The enum admits the folder actions, so the description must say the
+    // same thing the refusal says: they address a whole folder and run in
+    // the folder lifecycle - and the path argument covers a folder, which
+    // carries no .md suffix.
+    expect(tool.description).toContain("move-folder");
+    expect(tool.description).toContain("rename-folder");
+    expect(tool.description).toContain("folder lifecycle");
+    const properties = tool.inputSchema.properties as Record<string, { description?: string }>;
+    expect(properties["path"]?.description).toContain("folder");
+  });
+});
+
+describe("folder actions through the tool", () => {
+  test("a folder action refuses confirm and delete_linked instead of dropping them", async () => {
+    note("Projects/Old/a.md", "alpha\n");
+    for (const extra of [{ confirm: true }, { delete_linked: true }]) {
+      await expect(
+        call({ action: "move-folder", path: "Projects/Old", to: "Archive", ...extra }),
+      ).rejects.toThrow(/takes neither confirm nor delete_linked/);
+    }
+    expect(existsSync(join(vault, "Projects/Old/a.md"))).toBe(true);
+    expect(existsSync(join(vault, "Archive"))).toBe(false);
+  });
+
+  test("a folder holding a note the caller's reach denies refuses exactly as a missing one", async () => {
+    note("Projects/Old/a.md", "alpha\n");
+    note("Projects/Old/quiet.md", "---\nvisibility: private\n---\nreserved\n");
+    const remote = { ...ctx, reach: TRANSPORT_REACH.remote };
+
+    for (const apply of [false, true]) {
+      await expect(
+        tool.handler(remote, { action: "move-folder", path: "Projects/Old", to: "Archive", apply }),
+      ).rejects.toThrow(/no note folder/);
+    }
+    // Nothing was planned, moved or renamed on either run, and the
+    // refusal never names the denied page.
+    expect(existsSync(join(vault, "Projects/Old/a.md"))).toBe(true);
+    expect(existsSync(join(vault, "Projects/Old/quiet.md"))).toBe(true);
+    expect(existsSync(join(vault, "Archive"))).toBe(false);
+  });
+
+  test("move-folder relocates the folder and renders the move report", async () => {
+    note("Projects/Old/a.md", "alpha\n");
+    note("Notes/Ref.md", "pathed [[Projects/Old/a]]\n");
+
+    const res = await call({
+      action: "move-folder",
+      path: "Projects/Old",
+      to: "Archive",
+      apply: true,
+    });
+
+    expect(res).toMatchObject({
+      action: "move-folder",
+      applied: true,
+      from: "Projects/Old",
+      to: "Archive/Old",
+    });
+    // The moved list, per file, and the per-file failure list.
+    expect(res["moved"]).toEqual([{ from: "Projects/Old/a.md", to: "Archive/Old/a.md" }]);
+    expect(res["move_failures"]).toEqual([]);
+    // A relocation destroys nothing, so no snapshot rides the response.
+    expect(res["snapshot"]).toBeNull();
+    const references = res["references"] as Record<string, unknown>;
+    expect(references["files_rewritten"]).toBe(1);
+    expect(references["inbound_files"]).toEqual(["Notes/Ref.md"]);
+    expect(readFileSync(join(vault, "Notes/Ref.md"), "utf8")).toContain("[[a]]");
+    expect(existsSync(join(vault, "Archive/Old/a.md"))).toBe(true);
+    expect(existsSync(join(vault, "Projects/Old/a.md"))).toBe(false);
+  });
+
+  test("move-folder names non-Markdown residue and omits the field when clean", async () => {
+    note("Projects/Old/a.md", "alpha\n");
+    writeFileSync(join(vault, "Projects/Old/img.png"), "png\n");
+
+    const res = await call({
+      action: "move-folder",
+      path: "Projects/Old",
+      to: "Archive",
+      apply: true,
+    });
+    expect(res["left_behind"]).toEqual(["img.png"]);
+    expect(existsSync(join(vault, "Projects/Old/img.png"))).toBe(true);
+
+    // Absent-when-empty: the rename-folder response of a move that
+    // empties its folder carries no left_behind key at all.
+    note("Other/Sub/b.md", "beta\n");
+    const clean = await call({
+      action: "move-folder",
+      path: "Other/Sub",
+      to: "Archive2",
+      apply: true,
+    });
+    expect("left_behind" in clean).toBe(false);
+  });
+
+  test("move-folder names the relative embeds whose targets stayed behind (M17)", async () => {
+    note("Projects/Old/a.md", "![pic](diagram.png)\n");
+    writeFileSync(join(vault, "Projects/Old/diagram.png"), "png\n");
+
+    const res = await call({
+      action: "move-folder",
+      path: "Projects/Old",
+      to: "Archive",
+      apply: true,
+    });
+    // The wikilink pass rewrites [[path]] spellings only; a relative
+    // image depends on the note's directory, so the response names the
+    // pair instead of letting files_rewritten: 0 read as "nothing broke".
+    expect(res["dangling_relative_links"]).toEqual([
+      { note: "Archive/Old/a.md", target: "diagram.png" },
+    ]);
+    expect(res["left_behind"]).toEqual(["diagram.png"]);
+
+    // Absent-when-empty: a move whose relative targets move with the
+    // folder carries no dangling_relative_links key at all.
+    note("Whole/Sub/b.md", "[link](kept.md)\n");
+    note("Whole/Sub/kept.md", "the target is a note; it moves too\n");
+    const clean = await call({
+      action: "move-folder",
+      path: "Whole/Sub",
+      to: "Archive3",
+      apply: true,
+    });
+    expect("dangling_relative_links" in clean).toBe(false);
+  });
+
+  test("rename-folder renames within the parent through the same tool", async () => {
+    note("Projects/Old/a.md", "alpha\n");
+    const res = await call({
+      action: "rename-folder",
+      path: "Projects/Old",
+      to: "New",
+      apply: true,
+    });
+    expect(res).toMatchObject({ action: "rename-folder", applied: true, to: "Projects/New" });
+    expect(res["moved"]).toEqual([{ from: "Projects/Old/a.md", to: "Projects/New/a.md" }]);
+    expect(existsSync(join(vault, "Projects/New/a.md"))).toBe(true);
   });
 });
 

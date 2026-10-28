@@ -4,6 +4,12 @@
  * (`confirmed | unconfirmed | quarantine`) are included; retired
  * and signal artifacts are deliberately excluded.
  *
+ * A preference the privacy deny markers reserve (`visibility: private`,
+ * or an informal `access` / `confidentiality` / `sensitivity` marker) is
+ * still collected and reported - in {@link PreferenceCollection.denied} -
+ * but the shared lanes built on this module leave it out and name the
+ * omission; there is no flag that carries a reserved rule through.
+ *
  * llms-txt follows the [llmstxt.org](https://llmstxt.org) shape;
  * empty status sections are omitted so a single-status vault
  * renders one H2 rather than three.
@@ -20,15 +26,72 @@ import { existsSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
 
 import { toPosix } from "../path-safety.ts";
+import type { FrontmatterMap } from "../types.ts";
 import { hostPathFreeReason } from "./host-path-free.ts";
 import { parsePreference } from "./preference.ts";
 import { brainDirs } from "./paths.ts";
 import { vaultDisplayName } from "./templates.ts";
 import { isoSecond } from "./time.ts";
 import { BRAIN_PREFERENCE_STATUS, type BrainPreference } from "./types.ts";
+import {
+  hasPrivacyDenyMarker,
+  PRIVACY_DENY_MARKER_VALUES,
+  PRIVACY_MARKER_KEYS,
+} from "../graph/privacy-markers.ts";
+import { REMOTE_DENY_VISIBILITY_TOKEN, normToken, pageVisibility } from "../graph/visibility.ts";
 import { parseFrontmatter } from "../vault.ts";
 
 export const BRAIN_EXPORT_SCHEMA_VERSION = 1 as const;
+
+/**
+ * Why the collector denied a preference from the shared lanes. One value
+ * today, matching `pageBlockReason`'s vocabulary in
+ * `portability/knowledge-pack.ts`: a deny here is a visibility
+ * reservation - the reserved token declared under `visibility:`, or an
+ * informal privacy marker saying the same thing - and never a content
+ * class, which this lane does not read.
+ */
+export const PREFERENCE_DENY_REASON = "visibility" as const;
+
+/**
+ * The frontmatter key whose value denied a shared lane a preference.
+ *
+ * `visibility` names the reserved token's own key; the other three are the
+ * informal marker keys of {@link PRIVACY_MARKER_KEYS} (kept in sync by
+ * construction - the runtime list below is built from that constant, and a
+ * key added there flows into the denial vocabulary with it).
+ */
+export type PreferenceDenyKey = "visibility" | "access" | "confidentiality" | "sensitivity";
+
+/** The denial keys, in the order the docs list them. */
+export const PREFERENCE_DENY_KEYS: ReadonlyArray<PreferenceDenyKey> = Object.freeze([
+  "visibility",
+  ...PRIVACY_MARKER_KEYS,
+]) as ReadonlyArray<PreferenceDenyKey>;
+
+/** One preference a shared lane leaves out, named the way the rows name them. */
+export interface PreferenceDenial {
+  /** The denied row's id (`pref-<slug>`), as it appears in `rows`. */
+  readonly id: string;
+  /**
+   * The reason CLASS, always the reserved-token class: a deny here is a
+   * visibility reservation, never a content class. Kept verbatim so the
+   * machine readers of the json envelope's `omitted`, the bundle's
+   * `preferences_omitted` and the knowledge pack's `blocked` list keep
+   * their vocabulary; the key below is the specific half.
+   */
+  readonly reason: typeof PREFERENCE_DENY_REASON;
+  /**
+   * The frontmatter key whose value made the denial, named `denied_by`
+   * rather than `key` because the egress guard redacts every value under
+   * a field name containing "key" - a denial report must survive its own
+   * boundary. `visibility` when the reserved token under `visibility:`
+   * denied, or the informal marker key (`access` / `confidentiality` /
+   * `sensitivity`) that said the same thing. Canonical lower-case
+   * spelling, whatever case the file used.
+   */
+  readonly denied_by: PreferenceDenyKey;
+}
 
 /** How many unreadable files the error names before it stops listing. */
 const MAX_NAMED_PARSE_FAILURES = 10;
@@ -166,19 +229,74 @@ export interface ExportedPreferencesJson {
   readonly generated_at: string;
   readonly vault_basename: string;
   readonly preferences: ReadonlyArray<ExportedPreferenceRow>;
+  /**
+   * The preferences the privacy deny markers kept out of this export,
+   * each named with its id and reason. Absent when empty, so a vault
+   * with no reservation serialises byte-identically to the field-less
+   * envelope and the schema stays 1 - an additive field, per the module's
+   * own versioning rule. There is no override: the field reports what a
+   * shared lane must never carry, so no flag fills it back in.
+   */
+  readonly omitted?: ReadonlyArray<PreferenceDenial>;
 }
 
 /**
- * Every row the walk produced, and every file it could not read.
+ * Every row the walk produced, every file it could not read, and every
+ * row the privacy deny markers keep out of the SHARED lanes.
  *
- * The pair, never one of them: a caller holding this has been told both
- * how much it got and how much it missed, which is the property
- * {@link collectExportRows}' refusal enforces for callers that cannot use
- * a partial answer.
+ * The triple, never one of them alone: a caller holding this has been
+ * told how much it got, how much it missed, and what it must not carry.
+ * `rows` stays complete on purpose - the import-side topic maps
+ * (`preference-restore.ts`, `knowledge-pack.ts`) read the DESTINATION
+ * vault to learn which topics existing rules claim, and a marker on a
+ * rule does not unmake the rule - so denial is a report beside the rows,
+ * not a filter inside the collector. The shared lanes filter at their
+ * own composition seam and name what they leave out.
  */
 export interface PreferenceCollection {
   readonly rows: ReadonlyArray<ExportedPreferenceRow>;
   readonly failures: ReadonlyArray<PreferenceParseFailure>;
+  readonly denied: ReadonlyArray<PreferenceDenial>;
+}
+
+/**
+ * Which frontmatter key, if any, denies this preference a shared lane?
+ *
+ * The same judgment `pageBlockReason` makes for pages in the knowledge
+ * pack, read once here from the frontmatter map the collector already
+ * parsed: a `visibility:` declaration carrying the reserved token, or an
+ * informal privacy marker (`access: private` and its siblings) saying
+ * what the reserved token says. A preference that declares only a
+ * caller-scope token is a shared decision, not a reservation, and is
+ * carried. The answer is the KEY that spoke, not just the fact of a
+ * denial, so the stderr notice can name what the docs promise - the
+ * reservation key that denied the row.
+ */
+export function deniedReservationKey(meta: FrontmatterMap): PreferenceDenyKey | null {
+  if (pageVisibility(meta).includes(REMOTE_DENY_VISIBILITY_TOKEN)) return "visibility";
+  if (!hasPrivacyDenyMarker(meta)) return null;
+  // `hasPrivacyDenyMarker` just said some informal marker denies; name the
+  // key that carries the deny value. The value reading mirrors the marker
+  // module's own (a string, or an array of strings, normalised the same
+  // way) - that reader is not exported there, and this module needs it
+  // once, to answer WHICH key spoke rather than only whether one did.
+  for (const key of Object.keys(meta)) {
+    const canonical = PRIVACY_MARKER_KEYS.find((k) => normToken(k) === normToken(key));
+    if (canonical === undefined) continue;
+    const raw = meta[key];
+    const values =
+      typeof raw === "string"
+        ? [raw]
+        : Array.isArray(raw)
+          ? raw.filter((v): v is string => typeof v === "string")
+          : [];
+    if (values.some((v) => PRIVACY_DENY_MARKER_VALUES.includes(normToken(v)))) {
+      return canonical as PreferenceDenyKey;
+    }
+  }
+  // Unreachable: `hasPrivacyDenyMarker` was true, so one of the marker
+  // keys above carries a deny value and the loop already returned it.
+  return null;
 }
 
 /**
@@ -218,12 +336,17 @@ export function collectExportRows(vault: string): ReadonlyArray<ExportedPreferen
  * The directory LISTING failure still raises: it is a permission or
  * filesystem fault over the whole directory, not a per-file parse, and no
  * partial answer exists to give.
+ *
+ * A row the privacy deny markers reserve is reported in `denied` while
+ * still parsed whole into `rows`; see {@link PreferenceCollection} for
+ * why the split lives beside the rows and not inside them.
  */
 export function collectPreferenceRows(vault: string): PreferenceCollection {
   const dir = brainDirs(vault).preferences;
-  if (!existsSync(dir)) return { rows: [], failures: [] };
+  if (!existsSync(dir)) return { rows: [], failures: [], denied: [] };
   const rows: ExportedPreferenceRow[] = [];
   const failures: PreferenceParseFailure[] = [];
+  const denied: PreferenceDenial[] = [];
   let entries: ReadonlyArray<string>;
   try {
     entries = readdirSync(dir);
@@ -264,18 +387,31 @@ export function collectPreferenceRows(vault: string): PreferenceCollection {
     // consumer wants when sharing or system-prompt-injecting the
     // rule. A read failure here is the same defect as a frontmatter
     // one: the row would go out missing what the agent wrote.
+    // The frontmatter map is already in hand at this line, so the
+    // deny judgment reads it here rather than paying a second read.
     let body = "";
+    let meta: FrontmatterMap = {};
     try {
-      const [, parsedBody] = parseFrontmatter(abs);
+      const [parsedMeta, parsedBody] = parseFrontmatter(abs);
+      meta = parsedMeta;
       body = parsedBody;
     } catch (err) {
       record(err);
       continue;
     }
+    const denyKey = deniedReservationKey(meta);
+    if (denyKey !== null) {
+      denied.push({ id: pref.id, reason: PREFERENCE_DENY_REASON, denied_by: denyKey });
+    }
     rows.push(toRow(pref, body));
   }
   rows.sort((a, b) => a.id.localeCompare(b.id));
-  return { rows, failures };
+  // The denial list sorts like the rows: it rides the json envelope's
+  // `omitted`, the bank bundle's `preferences_omitted` and the stderr
+  // notice, and a byte-deterministic export cannot leave it in
+  // readdir order.
+  denied.sort((a, b) => a.id.localeCompare(b.id));
+  return { rows, failures, denied };
 }
 
 function toRow(p: BrainPreference, body: string): ExportedPreferenceRow {
@@ -305,12 +441,66 @@ function toRow(p: BrainPreference, body: string): ExportedPreferenceRow {
   });
 }
 
+/**
+ * The denying detail path beside {@link collectExportRows}: the same
+ * walk, the same parse-failure refusal, and the denial list handed back
+ * with `rows` still complete. For a caller that must see every row to
+ * answer - the knowledge pack's selector resolution, which reports a
+ * reserved rule as a named block rather than an unmatched selector.
+ */
+export function collectExportRowsWithDenials(vault: string): {
+  readonly rows: ReadonlyArray<ExportedPreferenceRow>;
+  readonly denied: ReadonlyArray<PreferenceDenial>;
+} {
+  const { rows, failures, denied } = collectPreferenceRows(vault);
+  if (failures.length > 0) throw new PreferenceParseError(failures);
+  return { rows, denied };
+}
+
+/**
+ * The composition seam for everything handed to another reader - the
+ * json envelope, the llms-txt document, the bank bundle: the denying
+ * walk with `rows` narrowed to what a shared lane may carry. The
+ * collector keeps `rows` complete for the import topic maps; the shared
+ * lanes narrow here, where the omission is at hand to be named.
+ */
+export function collectSharedExportRows(vault: string): {
+  readonly rows: ReadonlyArray<ExportedPreferenceRow>;
+  readonly denied: ReadonlyArray<PreferenceDenial>;
+} {
+  const { rows, denied } = collectExportRowsWithDenials(vault);
+  const reserved = new Set(denied.map((d) => d.id));
+  return { rows: rows.filter((row) => !reserved.has(row.id)), denied };
+}
+
+/**
+ * The stderr note naming the preferences a shared lane left out on a
+ * visibility reservation, in the `contentClassOmissionNotice` shape:
+ * counted, each item named with the reservation key that denied it, and a
+ * remedy. The remedy names the reservation itself rather than an export
+ * flag - a reserved rule never rides a shared lane, so the only way to
+ * share it is to clear the reservation on the file, and the keys listed
+ * are the ones this module reads.
+ */
+export function preferenceDenialNotice(denied: ReadonlyArray<PreferenceDenial>): string {
+  const list = denied.map((d) => `${d.id} (${d.denied_by})`).join(", ");
+  return (
+    `note: ${denied.length} preference(s) left out on a visibility reservation: ${list}; ` +
+    "no export flag carries them - clear the reservation " +
+    "(visibility / access / confidentiality / sensitivity) on the preference file to share it\n"
+  );
+}
+
 export function exportPreferencesJson(vault: string): ExportedPreferencesJson {
+  const { rows, denied } = collectSharedExportRows(vault);
   return Object.freeze({
     schema: BRAIN_EXPORT_SCHEMA_VERSION,
     generated_at: isoSecond(),
     vault_basename: vaultDisplayName(vault),
-    preferences: collectExportRows(vault),
+    preferences: rows,
+    // Absent-when-empty keeps a reservation-free vault's bytes exactly
+    // what they always were.
+    ...(denied.length > 0 ? { omitted: denied } : {}),
   });
 }
 
@@ -326,15 +516,26 @@ const LLMS_TXT_SECTION_LABEL: Readonly<Record<BrainPreference["status"], string>
   [BRAIN_PREFERENCE_STATUS.quarantine]: "Quarantine",
 };
 
+/** The llms-txt document beside the omissions its privacy policy made. */
+export interface LlmsTxtExport {
+  readonly text: string;
+  readonly omitted: ReadonlyArray<PreferenceDenial>;
+}
+
 /**
  * Render the export as an [llmstxt.org](https://llmstxt.org) markdown
  * file: H1 title, blockquote summary, then an H2 per non-empty
  * status. Each preference becomes one bullet line of the form
  * `- <id> (topic: <topic>[, scope: <scope>]): <principle>`. Status
  * sections without any rows are omitted entirely.
+ *
+ * Reserved preferences (see {@link PreferenceCollection.denied}) appear
+ * in neither the sections nor the bullets; the detailed variant returns
+ * the omissions beside the text so a caller can name them, the same
+ * additive report the json envelope carries.
  */
-export function exportPreferencesLlmsTxt(vault: string): string {
-  const rows = collectExportRows(vault);
+export function exportPreferencesLlmsTxtDetailed(vault: string): LlmsTxtExport {
+  const { rows, denied } = collectSharedExportRows(vault);
   const name = vaultDisplayName(vault);
   const lines: string[] = [
     `# ${name} — Brain preferences`,
@@ -355,5 +556,17 @@ export function exportPreferencesLlmsTxt(vault: string): string {
     }
     lines.push("");
   }
-  return lines.join("\n");
+  return { text: lines.join("\n"), omitted: denied };
+}
+
+/**
+ * The stable string signature, kept for the SDK façade and every
+ * existing reader: the detailed variant's text, unchanged in shape and
+ * byte-for-byte identical when nothing is denied. The string variant
+ * carries no denial report - visibility-reserved rows are left out
+ * silently - so a caller that must name what stayed out uses
+ * {@link exportPreferencesLlmsTxtDetailed}.
+ */
+export function exportPreferencesLlmsTxt(vault: string): string {
+  return exportPreferencesLlmsTxtDetailed(vault).text;
 }

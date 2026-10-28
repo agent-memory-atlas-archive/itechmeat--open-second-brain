@@ -660,7 +660,7 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
         ]),
         command(
           "note-lifecycle",
-          "Note FILES: rename, move, archive or delete one, rewriting inbound wikilinks",
+          "Note FILES or whole FOLDERS: rename, move, archive or delete a file, move-folder or rename-folder a folder, rewriting inbound wikilinks",
           [
             flag("vault", "string"),
             flag("config", "string"),
@@ -759,6 +759,29 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
             flag("agent", "string"),
             flag("payload", "string"),
             flag("payload-file", "string"),
+          ],
+        ),
+        command(
+          "dead-letters",
+          "Dead extraction writes: list with each row's recovery exit, show, recover (dry-run; --apply --yes to write)",
+          [],
+          [
+            command("list", "Every dead letter with its classification and recovery command", [
+              flag("vault", "string"),
+              flag("json", "boolean"),
+            ]),
+            command("show", "One dead letter in full detail", [
+              flag("vault", "string"),
+              flag("json", "boolean"),
+            ]),
+            command("recover", "Re-run a letter's frozen payload at current vault state", [
+              flag("vault", "string"),
+              flag("agent", "string"),
+              flag("dry-run", "boolean"),
+              flag("apply", "boolean"),
+              flag("yes", "boolean"),
+              flag("json", "boolean"),
+            ]),
           ],
         ),
         command("okf-export", "Write a portable Open Knowledge Format bundle"),
@@ -870,6 +893,17 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           flag("apply", "boolean"),
           flag("yes", "boolean"),
         ]),
+        command(
+          "validate",
+          "Standalone validation gate over --paths or git-dirty notes; errors exit 1, --strict warnings exit 2",
+          [
+            flag("paths", "string-array"),
+            flag("dirty", "boolean"),
+            flag("strict", "boolean"),
+            flag("vault", "string"),
+            flag("json", "boolean"),
+          ],
+        ),
         command(
           "actions",
           "Ranked maintenance action list over dedup, lint, and footprint findings",

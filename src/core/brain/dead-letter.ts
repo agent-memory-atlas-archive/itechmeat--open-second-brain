@@ -28,6 +28,17 @@
  * first real error, so an operator reading the file knows which payload
  * to re-run and why the run stopped.
  *
+ * Since schema 2 it also carries the payload itself, frozen at failure
+ * time: the producer's validated payload, recorded so recovery can re-run
+ * the exact write that failed part way without a second model call. The
+ * freeze may redact free-text fields and keep each item's original dedup
+ * hash beside it (the extraction lane does: the letter lives forever and
+ * the dead-letters surfaces print it) - the identity a re-run dedups
+ * against survives, the raw text does not. A v1 letter names the payload
+ * but does not carry it, and still parses - it is the recovery layer's
+ * business what that means, not this module's (see
+ * `dead-letter-recovery.ts`).
+ *
  * ## Where it lives, and why nothing here deletes it
  *
  * Under `<vault>/.open-second-brain/dead-letters/`, the machine-artifact
@@ -69,8 +80,41 @@ import { DERIVED_STORE_DIR } from "./path-constants.ts";
 import { isoSecond } from "./time.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 
-/** Only schema version currently understood. Unknown versions are refused. */
-export const DEAD_LETTER_SCHEMA_VERSION = 1 as const;
+/**
+ * Only schema version currently WRITTEN. Parsing is strict per version
+ * over {@link PARSED_DEAD_LETTER_SCHEMA_VERSIONS}: schema 2 freezes the
+ * failing commit's validated payload into the record (one-command
+ * recovery, t_50794f57), schema 1 letters keep parsing - payload-less,
+ * exactly as their writer left them - and anything else is refused, so a
+ * version this build does not understand can never be read as one it
+ * does.
+ */
+export const DEAD_LETTER_SCHEMA_VERSION = 2 as const;
+
+/**
+ * Every schema version this build parses. A list rather than a range
+ * check: accepting a version is a decision per version, and the type
+ * below is derived from it so a parser branch and the record type cannot
+ * drift apart.
+ */
+export const PARSED_DEAD_LETTER_SCHEMA_VERSIONS = Object.freeze([
+  1,
+  DEAD_LETTER_SCHEMA_VERSION,
+] as const);
+
+/** A schema version a record on disk may carry. */
+export type DeadLetterSchemaVersion = (typeof PARSED_DEAD_LETTER_SCHEMA_VERSIONS)[number];
+
+/**
+ * Whether `value` is a schema version this build parses. The reader's
+ * version gate: the guard is the list itself, so a version the constant
+ * admits parses the day it lands and the gate cannot drift behind the
+ * type; what each accepted version carries is still a decision per
+ * version, made by the parser's own branches.
+ */
+function isParsedDeadLetterSchemaVersion(value: unknown): value is DeadLetterSchemaVersion {
+  return (PARSED_DEAD_LETTER_SCHEMA_VERSIONS as ReadonlyArray<unknown>).includes(value);
+}
 
 /** Subdirectory under the machine-artifact root holding one JSON per record. */
 const DEAD_LETTER_DIR = "dead-letters";
@@ -89,6 +133,20 @@ const ID_RE = new RegExp(`^[a-z][a-z0-9-]*-[0-9a-f]{${ID_DIGEST_CHARS}}$`);
  */
 export type DeadLetterLane = "extract-signals";
 
+/**
+ * The lane union at runtime, for readers of records from disk: a record's
+ * `lane` field is a string from JSON, and a lane this build does not know
+ * has to be nameable as such rather than silently treated as one it does.
+ * A new member joining {@link DeadLetterLane} is added here in the same
+ * edit.
+ */
+export const DEAD_LETTER_LANES: ReadonlyArray<DeadLetterLane> = Object.freeze(["extract-signals"]);
+
+/** Whether `value` names a lane this build commits multi-artifact writes in. */
+export function isDeadLetterLane(value: string): value is DeadLetterLane {
+  return (DEAD_LETTER_LANES as ReadonlyArray<string>).includes(value);
+}
+
 /** Which payload, from which lane, the unwritten items belonged to. */
 export interface DeadLetterEnvelopeIdentity {
   readonly lane: DeadLetterLane;
@@ -100,9 +158,23 @@ export interface DeadLetterEnvelopeIdentity {
   readonly target: string;
 }
 
+/**
+ * The frozen payload a schema-2 record carries: the producer's validated
+ * payload as the lane froze it, so recovery can re-run the exact write
+ * that failed part way without a second model call. The shape is the
+ * lane's own - this module never looks inside it, so a future lane may
+ * freeze a different envelope here without this file learning its
+ * fields. A lane whose payload carries free text redacts it at freeze
+ * time and keeps the pre-redaction dedup identity beside it; recovery
+ * reads whatever shape the lane froze.
+ */
+export interface DeadLetterPayload {
+  readonly [key: string]: unknown;
+}
+
 /** One persisted dead letter. */
 export interface DeadLetterRecord {
-  readonly schema_version: typeof DEAD_LETTER_SCHEMA_VERSION;
+  readonly schema_version: DeadLetterSchemaVersion;
   readonly id: string;
   readonly lane: DeadLetterLane;
   readonly step: string;
@@ -114,6 +186,14 @@ export interface DeadLetterRecord {
   readonly found: number;
   /** Keys naming every artifact that did NOT reach disk. */
   readonly missing: ReadonlyArray<string>;
+  /**
+   * The validated payload this commit was writing, frozen at failure
+   * time. Present only on schema-2 records whose producer recorded it:
+   * the field is optional because a v2 record from a lane that freezes
+   * nothing is still a well-formed record, and the recovery layer - not
+   * this module - decides what its absence means.
+   */
+  readonly payload?: DeadLetterPayload;
   readonly outcome: ReconciliationOutcome;
   /** Message of the first real error, verbatim. */
   readonly first_error: string;
@@ -125,6 +205,13 @@ export interface RecordDeadLetterInput {
   readonly report: ReconciliationReport;
   /** The error that stopped the commit; anything throwable. */
   readonly firstError: unknown;
+  /**
+   * The validated payload to freeze into the record. A multi-artifact
+   * lane that can be recovered by re-running its payload passes it here;
+   * the id is derived over it, so two failures differing only in what
+   * they tried to write are distinct records.
+   */
+  readonly payload?: DeadLetterPayload;
   readonly now: Date;
 }
 
@@ -169,7 +256,7 @@ export function deadLetterPath(vault: string, id: string): string {
  * write for two writers to race on.
  */
 export function recordDeadLetter(vault: string, input: RecordDeadLetterInput): DeadLetterRecord {
-  const { envelope, report, firstError, now } = input;
+  const { envelope, report, firstError, payload, now } = input;
   requireContent("step", envelope.step);
   requireContent("reference", envelope.reference);
   requireContent("target", envelope.target);
@@ -193,6 +280,7 @@ export function recordDeadLetter(vault: string, input: RecordDeadLetterInput): D
     attempted: report.attempted,
     found: report.found,
     missing: Object.freeze([...report.missing]),
+    ...(payload !== undefined ? { payload } : {}),
     outcome: deriveReconciliationOutcome(report),
     first_error: message,
   };
@@ -273,11 +361,29 @@ function parseRecord(path: string): DeadLetterRecord {
     throw new DeadLetterError(`dead letter is not an object: ${path}`);
   }
   const obj = parsed as Record<string, unknown>;
-  if (obj["schema_version"] !== DEAD_LETTER_SCHEMA_VERSION) {
+  const version = obj["schema_version"];
+  if (!isParsedDeadLetterSchemaVersion(version)) {
     throw new DeadLetterError(
-      `dead letter schema_version ${String(obj["schema_version"])} not supported ` +
-        `(expected ${DEAD_LETTER_SCHEMA_VERSION}): ${path}`,
+      `dead letter schema_version ${String(version)} not supported ` +
+        `(this build parses ${PARSED_DEAD_LETTER_SCHEMA_VERSIONS.join(" and ")}): ${path}`,
     );
+  }
+  // Strict per version: a v1 record never carried a payload, so one that
+  // claims it is not a v1 record and is refused rather than silently
+  // promoted; a v2 record may carry the frozen payload, and when it does
+  // the payload must be an object - the lane's own envelope - never a
+  // bare list, a string or null.
+  let payload: DeadLetterPayload | undefined;
+  if (version === 1) {
+    if (obj["payload"] !== undefined) {
+      throw new DeadLetterError(`dead letter schema_version 1 must not carry a payload: ${path}`);
+    }
+  } else if (obj["payload"] !== undefined) {
+    const raw = obj["payload"];
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new DeadLetterError(`dead letter payload is not an object: ${path}`);
+    }
+    payload = Object.freeze({ ...(raw as object) });
   }
   const missing = obj["missing"];
   if (!Array.isArray(missing) || missing.some((key) => typeof key !== "string")) {
@@ -288,7 +394,7 @@ function parseRecord(path: string): DeadLetterRecord {
     throw new DeadLetterError(`dead letter carries an unknown outcome: ${path}`);
   }
   return Object.freeze({
-    schema_version: DEAD_LETTER_SCHEMA_VERSION,
+    schema_version: version,
     id: requireString(obj, "id", path),
     lane: requireString(obj, "lane", path) as DeadLetterLane,
     step: requireString(obj, "step", path),
@@ -297,6 +403,7 @@ function parseRecord(path: string): DeadLetterRecord {
     attempted: requireNumber(obj, "attempted", path),
     found: requireNumber(obj, "found", path),
     missing: Object.freeze([...(missing as ReadonlyArray<string>)]),
+    ...(payload !== undefined ? { payload } : {}),
     outcome,
     first_error: requireString(obj, "first_error", path),
     recorded_at: requireString(obj, "recorded_at", path),
@@ -315,6 +422,7 @@ function serialize(record: DeadLetterRecord): Record<string, unknown> {
     attempted: record.attempted,
     found: record.found,
     missing: [...record.missing],
+    ...(record.payload !== undefined ? { payload: record.payload } : {}),
     outcome: record.outcome,
     first_error: record.first_error,
     recorded_at: record.recorded_at,
